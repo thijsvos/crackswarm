@@ -1,0 +1,21 @@
+/target
+/data
+/bin
+*.db
+*.db-journal
+*.enc
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust
+**/*.rs.bk
