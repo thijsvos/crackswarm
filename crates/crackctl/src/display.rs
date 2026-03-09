@@ -81,20 +81,18 @@ pub fn print_tasks(tasks: &[Task]) {
     }
 
     println!(
-        "{:<10} {:<24} {:<10} {:<12} {:<14} {:<16}",
+        "{:<38} {:<24} {:<10} {:<12} {:<14} {:<16}",
         "ID", "Name", "HashMode", "Status", "Progress", "Created"
     );
-    separator(86);
+    separator(114);
 
     for task in tasks {
-        let id_str = task.id.to_string();
-        let id = short_id(&id_str);
         let name = truncate(&task.name, 22);
         let progress = format!("{}/{}", task.cracked_count, task.total_hashes);
 
         println!(
-            "{:<10} {:<24} {:<10} {:<12} {:<14} {:<16}",
-            id,
+            "{:<38} {:<24} {:<10} {:<12} {:<14} {:<16}",
+            task.id,
             name,
             task.hash_mode,
             task.status,
@@ -245,19 +243,18 @@ pub fn print_files(files: &[FileRecord]) {
     }
 
     println!(
-        "{:<10} {:<28} {:<10} {:<10} {:<16}",
+        "{:<38} {:<28} {:<10} {:<10} {:<16}",
         "ID", "Filename", "Type", "Size", "Uploaded"
     );
-    separator(74);
+    separator(102);
 
     for f in files {
-        let id = short_id(&f.id);
         let filename = truncate(&f.filename, 26);
         let size = human_size(f.size_bytes);
 
         println!(
-            "{:<10} {:<28} {:<10} {:<10} {:<16}",
-            id,
+            "{:<38} {:<28} {:<10} {:<10} {:<16}",
+            f.id,
             filename,
             f.file_type,
             size,
