@@ -216,11 +216,17 @@ impl HashcatRunner {
                     })
                     .await;
             } else if let Some((hash, plaintext)) = status::parse_outfile_line(&line) {
-                // hashcat prints cracked hashes to stdout as "hash:plaintext"
-                info!(hash = %hash, "hash cracked (stdout)");
-                let _ = tx
-                    .send(RunnerEvent::HashCracked { hash, plaintext })
-                    .await;
+                // hashcat prints cracked hashes to stdout as "hash:plaintext".
+                // Filter out hashcat info lines (contain spaces/dots before ':',
+                // or the "hash" part is too short to be a real hash).
+                let is_info_line =
+                    hash.contains(' ') || hash.contains("...") || hash.len() < 16;
+                if !is_info_line {
+                    info!(hash = %hash, "hash cracked (stdout)");
+                    let _ = tx
+                        .send(RunnerEvent::HashCracked { hash, plaintext })
+                        .await;
+                }
             } else {
                 debug!(line = %line, "hashcat stdout (non-JSON)");
             }
