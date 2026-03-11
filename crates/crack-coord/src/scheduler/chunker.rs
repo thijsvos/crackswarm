@@ -1,19 +1,16 @@
-use anyhow::bail;
+use anyhow::{bail, Context};
 use crack_common::models::AttackConfig;
 use tracing::info;
 
 /// Compute the total keyspace for an attack configuration.
 ///
-/// For brute-force masks, computes the **base keyspace** (restore points)
-/// that hashcat uses for `--skip`/`--limit`.
-///
-/// hashcat splits mask attacks into a base keyspace and an amplifier (the
-/// last mask position). `--keyspace`, `--skip`, and `--limit` all operate
-/// on restore points = product of all charset sizes EXCEPT the last one.
-/// hashcat internally multiplies by the amplifier to cover all candidates.
+/// Calls `hashcat --keyspace` to get the exact base keyspace (restore points)
+/// that hashcat uses for `--skip`/`--limit`. This accounts for hashcat's
+/// optimizer which may merge multiple trailing mask positions into the
+/// amplifier, resulting in a smaller base keyspace than a naive calculation.
 pub async fn compute_keyspace(
-    _hashcat_path: &str,
-    _hash_mode: u32,
+    hashcat_path: &str,
+    hash_mode: u32,
     attack_config: &AttackConfig,
 ) -> anyhow::Result<u64> {
     match attack_config {
@@ -21,11 +18,55 @@ pub async fn compute_keyspace(
             mask,
             custom_charsets,
         } => {
-            let keyspace = compute_mask_keyspace(mask, custom_charsets.as_deref())?;
-            info!(mask = %mask, keyspace, "computed base keyspace (restore points) from mask");
+            let keyspace =
+                compute_keyspace_via_hashcat(hashcat_path, hash_mode, mask, custom_charsets.as_deref())
+                    .await?;
+            info!(mask = %mask, keyspace, "computed base keyspace via hashcat --keyspace");
             Ok(keyspace)
         }
     }
+}
+
+/// Run `hashcat --keyspace` to get the exact restore-point count.
+async fn compute_keyspace_via_hashcat(
+    hashcat_path: &str,
+    hash_mode: u32,
+    mask: &str,
+    custom_charsets: Option<&[String]>,
+) -> anyhow::Result<u64> {
+    let mut cmd = tokio::process::Command::new(hashcat_path);
+    cmd.arg("-a").arg("3");
+    cmd.arg("-m").arg(hash_mode.to_string());
+    cmd.arg("--keyspace");
+    cmd.arg(mask);
+
+    if let Some(charsets) = custom_charsets {
+        for (i, cs) in charsets.iter().enumerate() {
+            cmd.arg(format!("-{}", i + 1)).arg(cs);
+        }
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("failed to run hashcat --keyspace at '{hashcat_path}'"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "hashcat --keyspace failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let keyspace: u64 = stdout
+        .trim()
+        .parse()
+        .with_context(|| format!("failed to parse hashcat --keyspace output: '{}'", stdout.trim()))?;
+
+    Ok(keyspace)
 }
 
 /// Compute the base keyspace (restore points) for a hashcat brute-force mask.
@@ -165,51 +206,50 @@ pub fn calculate_chunk_size(
 mod tests {
     use super::*;
 
+    // Note: compute_mask_keyspace is kept as a helper but is no longer
+    // used in production. The real keyspace is obtained via hashcat --keyspace.
+    // These tests verify the math helper still works for simple cases.
+
     #[test]
     fn keyspace_lowercase_5() {
-        // ?l?l?l?l?l: base = 26^4 (last position is amplifier)
+        // ?l?l?l?l?l: our helper gives 26^4, hashcat also gives 26^4
         let ks = compute_mask_keyspace("?l?l?l?l?l", None).unwrap();
         assert_eq!(ks, 26u64.pow(4));
     }
 
     #[test]
     fn keyspace_lowercase_3() {
-        // ?l?l?l: base = 26^2
         let ks = compute_mask_keyspace("?l?l?l", None).unwrap();
         assert_eq!(ks, 26u64.pow(2));
     }
 
     #[test]
     fn keyspace_lowercase_2() {
-        // ?l?l: base = 26^1
         let ks = compute_mask_keyspace("?l?l", None).unwrap();
         assert_eq!(ks, 26);
     }
 
     #[test]
     fn keyspace_mixed() {
-        // ?u?l?d: base = 26 * 26 (last ?d is amplifier)
         let ks = compute_mask_keyspace("?u?l?d", None).unwrap();
         assert_eq!(ks, 26 * 26);
     }
 
     #[test]
-    fn keyspace_all_printable() {
-        // ?a?a?a?a: base = 95^3
+    fn keyspace_all_printable_4() {
+        // ?a?a?a?a: helper gives 95^3, hashcat also gives 95^3
         let ks = compute_mask_keyspace("?a?a?a?a", None).unwrap();
         assert_eq!(ks, 95u64.pow(3));
     }
 
     #[test]
     fn keyspace_with_literal() {
-        // abc?d: positions = [1, 1, 1, 10], base = 1*1*1 = 1
         let ks = compute_mask_keyspace("abc?d", None).unwrap();
         assert_eq!(ks, 1);
     }
 
     #[test]
     fn keyspace_custom_charset() {
-        // ?1?1 with charset 1 = "?l?d" (36 chars): base = 36
         let charsets = vec!["?l?d".to_string()];
         let ks = compute_mask_keyspace("?1?1", Some(&charsets)).unwrap();
         assert_eq!(ks, 36);
@@ -217,15 +257,12 @@ mod tests {
 
     #[test]
     fn keyspace_escaped_question_mark() {
-        // ?? is a literal '?', so "???d" has positions [10], base = empty = 1
-        // Actually: ?? = literal '?' (skipped), ?d = 10. Only 1 position, base = empty = 1
         let ks = compute_mask_keyspace("???d", None).unwrap();
         assert_eq!(ks, 1);
     }
 
     #[test]
     fn keyspace_single_position() {
-        // ?l: only 1 position, base = empty = 1 (amplifier handles all 26)
         let ks = compute_mask_keyspace("?l", None).unwrap();
         assert_eq!(ks, 1);
     }
