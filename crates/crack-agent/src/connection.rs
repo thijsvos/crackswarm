@@ -175,8 +175,22 @@ async fn connect_and_run(
             }
 
             Action::TcpReadable => {
-                // Now we can borrow stream mutably for the read
-                let cipher = read_framed(&mut stream).await?;
+                // Read with a timeout to avoid blocking forever on spurious readability.
+                let cipher = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    read_framed(&mut stream),
+                ).await {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(e)) => {
+                        // Real read error (connection closed, etc.)
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        // Timeout — no data arrived, continue loop
+                        // (heartbeat and runner events will be processed)
+                        continue;
+                    }
+                };
 
                 // Decrypt
                 let mut plain = vec![0u8; 65535];
