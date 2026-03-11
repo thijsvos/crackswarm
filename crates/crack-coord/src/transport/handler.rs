@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use base64::Engine;
 use crack_common::auth::{build_responder, encode_public_key};
 use crack_common::models::*;
 use crack_common::protocol::{CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
@@ -327,26 +328,8 @@ async fn handle_worker_message(
                 if let Some((task, new_chunk)) =
                     scheduler::assign_next_chunk(state, wid).await?
                 {
-                    let (mask, custom_charsets) = match &task.attack_config {
-                        AttackConfig::BruteForce {
-                            mask,
-                            custom_charsets,
-                        } => (mask.clone(), custom_charsets.clone()),
-                    };
-
-                    let _ = outbound_tx
-                        .send(CoordMessage::AssignChunk {
-                            chunk_id: new_chunk.id,
-                            task_id: new_chunk.task_id,
-                            hash_mode: task.hash_mode,
-                            hash_file_url: format!("/api/v1/files/{}", task.hash_file_id),
-                            skip: new_chunk.skip,
-                            limit: new_chunk.limit,
-                            mask,
-                            custom_charsets,
-                            extra_args: task.extra_args.clone(),
-                        })
-                        .await;
+                    let msg = build_assign_chunk_msg(state, &task, &new_chunk)?;
+                    let _ = outbound_tx.send(msg).await;
                 } else {
                     db::update_worker_status(&state.db, wid, WorkerStatus::Idle).await?;
                 }
@@ -494,6 +477,38 @@ async fn handle_register(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Build a CoordMessage::AssignChunk with the hash file data embedded.
+fn build_assign_chunk_msg(
+    state: &AppState,
+    task: &Task,
+    chunk: &Chunk,
+) -> anyhow::Result<CoordMessage> {
+    let (mask, custom_charsets) = match &task.attack_config {
+        AttackConfig::BruteForce {
+            mask,
+            custom_charsets,
+        } => (mask.clone(), custom_charsets.clone()),
+    };
+
+    // Read the hash file and base64-encode it for transfer over the Noise channel.
+    let file_data = crate::storage::files::read_file(&state.files_dir(), &task.hash_file_id)
+        .context("reading hash file for chunk assignment")?;
+    let hash_file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_data);
+
+    Ok(CoordMessage::AssignChunk {
+        chunk_id: chunk.id,
+        task_id: chunk.task_id,
+        hash_mode: task.hash_mode,
+        hash_file_b64,
+        hash_file_id: task.hash_file_id.clone(),
+        skip: chunk.skip,
+        limit: chunk.limit,
+        mask,
+        custom_charsets,
+        extra_args: task.extra_args.clone(),
+    })
+}
+
 /// Try to assign the next pending chunk to a worker and send it via the
 /// outbound channel.
 async fn try_assign_work(
@@ -502,26 +517,8 @@ async fn try_assign_work(
     outbound_tx: &mpsc::Sender<CoordMessage>,
 ) -> anyhow::Result<()> {
     if let Some((task, chunk)) = scheduler::assign_next_chunk(state, wid).await? {
-        let (mask, custom_charsets) = match &task.attack_config {
-            AttackConfig::BruteForce {
-                mask,
-                custom_charsets,
-            } => (mask.clone(), custom_charsets.clone()),
-        };
-
-        let _ = outbound_tx
-            .send(CoordMessage::AssignChunk {
-                chunk_id: chunk.id,
-                task_id: chunk.task_id,
-                hash_mode: task.hash_mode,
-                hash_file_url: format!("/api/v1/files/{}", task.hash_file_id),
-                skip: chunk.skip,
-                limit: chunk.limit,
-                mask,
-                custom_charsets,
-                extra_args: task.extra_args.clone(),
-            })
-            .await;
+        let msg = build_assign_chunk_msg(state, &task, &chunk)?;
+        let _ = outbound_tx.send(msg).await;
     }
     Ok(())
 }

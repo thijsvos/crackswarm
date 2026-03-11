@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use base64::Engine;
 use crack_common::auth::{self, Keypair};
 use crack_common::protocol::{CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -194,7 +195,8 @@ async fn connect_and_run(
                         chunk_id,
                         task_id,
                         hash_mode,
-                        hash_file_url,
+                        hash_file_b64,
+                        hash_file_id,
                         skip,
                         limit,
                         mask,
@@ -210,9 +212,9 @@ async fn connect_and_run(
                             "received chunk assignment"
                         );
 
-                        // Download / cache the hash file
+                        // Decode hash file from the message and cache locally
                         let hash_file_path =
-                            download_hash_file(config, &hash_file_url).await?;
+                            save_hash_file(config, &hash_file_id, &hash_file_b64).await?;
 
                         let outfile_path =
                             config.cache_dir().join(format!("out_{chunk_id}.txt"));
@@ -459,22 +461,12 @@ async fn recv_message(
     Ok(msg)
 }
 
-// ── Hash file download & caching ──
+// ── Hash file caching ──
 
-/// Download a hash file from the coordinator's REST API and cache it locally.
-///
-/// The `hash_file_url` from `AssignChunk` is a relative path like
-/// `/api/v1/files/<file_id>/download`.  We prepend the coordinator's API
-/// base URL derived from the `--server` flag.
-async fn download_hash_file(config: &RunConfig, hash_file_url: &str) -> anyhow::Result<PathBuf> {
+/// Save a base64-encoded hash file received over the Noise channel to the local cache.
+async fn save_hash_file(config: &RunConfig, file_id: &str, b64_data: &str) -> anyhow::Result<PathBuf> {
     let cache_dir = config.cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
-
-    // Extract a stable filename from the URL (last path segment)
-    let file_id = hash_file_url
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .unwrap_or("hashfile");
 
     let cached_path = cache_dir.join(file_id);
 
@@ -484,26 +476,16 @@ async fn download_hash_file(config: &RunConfig, hash_file_url: &str) -> anyhow::
         return Ok(cached_path);
     }
 
-    // Build full URL
-    let url = if hash_file_url.starts_with("http://") || hash_file_url.starts_with("https://") {
-        hash_file_url.to_string()
-    } else {
-        format!("{}{}", config.api_base_url(), hash_file_url)
-    };
+    // Decode from base64 and write to disk
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
+        .context("failed to decode hash file from base64")?;
 
-    info!(url = %url, "downloading hash file");
-    let resp = reqwest::get(&url)
-        .await
-        .with_context(|| format!("failed to GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error downloading {url}"))?;
-
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(&cached_path, &bytes).await?;
+    tokio::fs::write(&cached_path, &data).await?;
     info!(
         path = %cached_path.display(),
-        size = bytes.len(),
-        "hash file cached"
+        size = data.len(),
+        "hash file saved from coordinator"
     );
 
     Ok(cached_path)

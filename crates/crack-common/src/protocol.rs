@@ -14,7 +14,9 @@ pub enum CoordMessage {
         chunk_id: Uuid,
         task_id: Uuid,
         hash_mode: u32,
-        hash_file_url: String,
+        /// Hash file content (base64-encoded) sent over the encrypted channel.
+        hash_file_b64: String,
+        hash_file_id: String,
         skip: u64,
         limit: u64,
         mask: String,

@@ -305,13 +305,9 @@ async fn run_builtin_agent(
                         CoordMessage::AssignChunk {
                             chunk_id,
                             task_id,
-                            hash_mode,
-                            hash_file_url,
-                            skip,
-                            limit,
-                            mask,
-                            custom_charsets,
-                            extra_args,
+                            hash_file_b64: _,
+                            hash_file_id: _,
+                            ..
                         } => {
                             info!("Built-in agent received chunk {chunk_id} for task {task_id}");
                             // For now, just report the chunk as started, then spawn hashcat.
