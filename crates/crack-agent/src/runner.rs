@@ -91,7 +91,9 @@ impl HashcatRunner {
 
         // Output file
         cmd.arg("-o").arg(&config.outfile_path);
-        cmd.arg("--outfile-format=3");
+        // hashcat 7.x uses comma-separated format values (not bitmask like 6.x).
+        // 1 = hash, 2 = plain → "hash:plain" output.
+        cmd.arg("--outfile-format=1,2");
 
         // Custom charsets (-1, -2, -3, -4)
         if let Some(charsets) = &config.custom_charsets {
