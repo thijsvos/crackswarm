@@ -249,39 +249,28 @@ impl HashcatRunner {
 
         // Final read of the outfile to catch any cracked hashes the watcher missed.
         // The watcher polls every 2s, but hashcat can complete faster than that.
-        info!(
-            outfile = %self.outfile_path.display(),
-            exit_code = code,
-            "reading outfile after hashcat exit"
-        );
+        // Note: hashcat only creates the outfile when it cracks something,
+        // so a missing outfile on exit_code=1 (exhausted) is completely normal.
         match tokio::fs::read_to_string(&self.outfile_path).await {
             Ok(contents) => {
-                info!(
-                    outfile = %self.outfile_path.display(),
-                    size = contents.len(),
-                    lines = contents.lines().count(),
-                    "outfile contents read"
-                );
-                if contents.is_empty() {
-                    info!("outfile is empty (no cracked hashes)");
-                }
                 for line in contents.lines() {
-                    info!(raw_line = %line, "outfile line");
                     if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
                         info!(hash = %hash, plaintext = %plaintext, "hash cracked (final outfile read)");
                         let _ = tx
                             .send(RunnerEvent::HashCracked { hash, plaintext })
                             .await;
-                    } else {
-                        warn!(line = %line, "outfile line could not be parsed");
                     }
                 }
             }
+            Err(_) if code == 1 => {
+                // Expected: hashcat exhausted without cracking, no outfile created
+                debug!(outfile = %self.outfile_path.display(), "no outfile (exhausted)");
+            }
             Err(e) => {
-                info!(
+                warn!(
                     outfile = %self.outfile_path.display(),
                     error = %e,
-                    "outfile does not exist or could not be read"
+                    "outfile could not be read"
                 );
             }
         }
