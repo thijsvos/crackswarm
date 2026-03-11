@@ -486,6 +486,9 @@ async fn handle_register(
     )
     .await?;
 
+    // Try to immediately assign work to the newly registered worker.
+    try_assign_work(state, &wid, outbound_tx).await?;
+
     Ok(())
 }
 

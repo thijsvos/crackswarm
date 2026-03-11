@@ -899,6 +899,18 @@ pub async fn list_file_records(pool: &SqlitePool) -> Result<Vec<FileRecord>> {
     rows.iter().map(row_to_file_record).collect()
 }
 
+/// Find all pending tasks (need keyspace computation and transition to running).
+pub async fn get_pending_tasks(pool: &SqlitePool) -> Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT * FROM tasks WHERE status = 'pending' ORDER BY priority DESC, created_at ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .context("fetching pending tasks")?;
+
+    rows.iter().map(row_to_task).collect()
+}
+
 /// Find the highest-priority running task that still has undispatched keyspace.
 pub async fn find_next_dispatchable_task(pool: &SqlitePool) -> Result<Option<Task>> {
     let row = sqlx::query(
