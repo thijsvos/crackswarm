@@ -65,9 +65,9 @@ impl HashcatRunner {
         // Mask
         cmd.arg(&config.mask);
 
-        // Keyspace range
+        // Keyspace range: --limit is absolute (from start of keyspace), not relative to --skip
         cmd.arg("--skip").arg(config.skip.to_string());
-        cmd.arg("--limit").arg(config.limit.to_string());
+        cmd.arg("--limit").arg((config.skip + config.limit).to_string());
 
         // Status output
         cmd.arg("--status");
