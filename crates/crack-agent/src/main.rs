@@ -1,13 +1,9 @@
-mod config;
-mod connection;
-mod runner;
-mod status;
-
 use anyhow::Context;
 use clap::Parser;
 use tracing::{error, info};
 
-use crate::config::{Cli, Commands};
+use crack_agent::config::{Cli, Commands};
+use crack_agent::{connection, status};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,7 +68,7 @@ async fn cmd_init(coord_key_b64: &str, data_dir: &std::path::Path) -> anyhow::Re
 }
 
 /// `crack-agent run` -- connect to the coordinator and start processing work.
-async fn cmd_run(config: &config::RunConfig) -> anyhow::Result<()> {
+async fn cmd_run(config: &crack_agent::config::RunConfig) -> anyhow::Result<()> {
     info!(
         server = %config.server,
         name = %config.worker_name(),
