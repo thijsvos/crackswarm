@@ -218,10 +218,22 @@ impl HashcatRunner {
 
         let code = exit_status.code().unwrap_or(-1);
 
-        // Give the outfile watcher a moment to catch the last writes
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Stop the background watchers
         outfile_handle.abort();
         stderr_handle.abort();
+
+        // Final read of the outfile to catch any cracked hashes the watcher missed.
+        // The watcher polls every 2s, but hashcat can complete faster than that.
+        if let Ok(contents) = tokio::fs::read_to_string(&self.outfile_path).await {
+            for line in contents.lines() {
+                if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
+                    info!(hash = %hash, "hash cracked (final outfile read)");
+                    let _ = tx
+                        .send(RunnerEvent::HashCracked { hash, plaintext })
+                        .await;
+                }
+            }
+        }
 
         // Hashcat exit codes:
         //   0 = cracked / exhausted successfully
