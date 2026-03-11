@@ -63,3 +63,4 @@ dirs = "6"
 
 # Internal crates
 crack-common = { path = "crates/crack-common" }
+crack-agent = { path = "crates/crack-agent" }

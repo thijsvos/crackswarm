@@ -155,6 +155,7 @@ async fn cmd_run(
         let agent_state = Arc::clone(&state);
         let hc_path = hc_path_str.clone();
         let coord_bind = bind.clone();
+        let agent_data_dir = data_dir.join("built-in-agent");
 
         tokio::spawn(async move {
             info!("Starting built-in agent...");
@@ -164,16 +165,47 @@ async fn cmd_run(
             // The built-in agent connects via localhost to the same transport port
             let coord_addr = coord_bind.replace("0.0.0.0", "127.0.0.1");
 
-            // Generate a temporary keypair for the built-in agent
-            let agent_kp = match Keypair::generate() {
-                Ok(kp) => kp,
-                Err(e) => {
-                    error!("Failed to generate agent keypair: {e}");
+            // Set up a data directory for the built-in agent with its own keypair
+            if let Err(e) = tokio::fs::create_dir_all(&agent_data_dir).await {
+                error!("Failed to create built-in agent data dir: {e}");
+                return;
+            }
+
+            // Generate keypair if not already present
+            let agent_kp = if agent_data_dir.join("private.key").exists() {
+                match Keypair::load_from_dir(&agent_data_dir) {
+                    Ok(kp) => kp,
+                    Err(e) => {
+                        error!("Failed to load built-in agent keypair: {e}");
+                        return;
+                    }
+                }
+            } else {
+                let kp = match Keypair::generate() {
+                    Ok(kp) => kp,
+                    Err(e) => {
+                        error!("Failed to generate agent keypair: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = kp.save_to_dir(&agent_data_dir) {
+                    error!("Failed to save built-in agent keypair: {e}");
                     return;
                 }
+                kp
             };
 
-            // Auto-authorize this agent
+            // Save coordinator's public key so the agent can authenticate
+            if let Err(e) = auth::save_remote_key(
+                &agent_data_dir,
+                "coordinator.pub",
+                &agent_state.keypair.public_key,
+            ) {
+                error!("Failed to save coordinator pubkey for built-in agent: {e}");
+                return;
+            }
+
+            // Auto-authorize this agent in the coordinator's DB
             let pubkey_b64 = agent_kp.public_key_b64();
             if let Err(e) = storage::db::authorize_worker(
                 &agent_state.db,
@@ -186,17 +218,17 @@ async fn cmd_run(
                 return;
             }
 
-            info!("Built-in agent authorized and connecting to {coord_addr}");
-            // The actual connection is done via the same protocol as remote agents.
-            // For MVP, we spawn a lightweight connection loop here.
-            if let Err(e) = run_builtin_agent(
-                &coord_addr,
-                agent_kp,
-                agent_state.keypair.public_key.clone(),
-                &hc_path,
-            )
-            .await
-            {
+            info!("Built-in agent authorized, connecting to {coord_addr}");
+
+            // Reuse the full crack-agent connection logic
+            let run_config = crack_agent::config::RunConfig {
+                server: coord_addr,
+                name: Some("built-in-agent".to_string()),
+                data_dir: agent_data_dir,
+                hashcat_path: hc_path,
+            };
+
+            if let Err(e) = crack_agent::connection::run_connection(&run_config).await {
                 error!("Built-in agent error: {e}");
             }
         });
@@ -219,131 +251,3 @@ async fn cmd_run(
     Ok(())
 }
 
-/// Run a built-in agent that connects to the coordinator on localhost.
-/// This is a simplified version — for full agent features, use crack-agent binary.
-async fn run_builtin_agent(
-    coord_addr: &str,
-    keypair: Keypair,
-    coord_pubkey: Vec<u8>,
-    hashcat_path: &str,
-) -> anyhow::Result<()> {
-    use crack_common::protocol::{CoordMessage, WorkerMessage};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    loop {
-        match TcpStream::connect(coord_addr).await {
-            Ok(mut stream) => {
-                info!("Built-in agent connected to {coord_addr}");
-
-                // Noise IK handshake (agent is initiator)
-                let mut handshake =
-                    crack_common::auth::build_initiator(&keypair, &coord_pubkey)?;
-                let mut buf = vec![0u8; 65535];
-
-                // Send first message
-                let len = handshake.write_message(&[], &mut buf)?;
-                let msg_len = (len as u32).to_be_bytes();
-                stream.write_all(&msg_len).await?;
-                stream.write_all(&buf[..len]).await?;
-
-                // Read response
-                let mut len_buf = [0u8; 4];
-                stream.read_exact(&mut len_buf).await?;
-                let resp_len = u32::from_be_bytes(len_buf) as usize;
-                let mut resp_buf = vec![0u8; resp_len];
-                stream.read_exact(&mut resp_buf).await?;
-                handshake.read_message(&resp_buf, &mut buf)?;
-
-                let mut transport = handshake.into_transport_mode()?;
-
-                // Get hashcat version
-                let version = tokio::process::Command::new(hashcat_path)
-                    .arg("--version")
-                    .output()
-                    .await
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_else(|_| "unknown".to_string());
-
-                // Register
-                let register = WorkerMessage::Register {
-                    worker_name: "built-in-agent".to_string(),
-                    hashcat_version: version,
-                    os: std::env::consts::OS.to_string(),
-                    devices: vec![],
-                };
-                let json = serde_json::to_vec(&register)?;
-                let len = transport.write_message(&json, &mut buf)?;
-                let msg_len = (len as u32).to_be_bytes();
-                stream.write_all(&msg_len).await?;
-                stream.write_all(&buf[..len]).await?;
-
-                // Simple message loop
-                let mut worker_id = String::new();
-                loop {
-                    // Read message from coordinator
-                    let mut len_buf = [0u8; 4];
-                    if stream.read_exact(&mut len_buf).await.is_err() {
-                        break;
-                    }
-                    let msg_len = u32::from_be_bytes(len_buf) as usize;
-                    if msg_len > crack_common::protocol::MAX_MESSAGE_SIZE {
-                        break;
-                    }
-                    let mut cipher_buf = vec![0u8; msg_len];
-                    if stream.read_exact(&mut cipher_buf).await.is_err() {
-                        break;
-                    }
-                    let decrypted_len = transport.read_message(&cipher_buf, &mut buf)?;
-                    let msg: CoordMessage = serde_json::from_slice(&buf[..decrypted_len])?;
-
-                    match msg {
-                        CoordMessage::Welcome { worker_id: wid } => {
-                            worker_id = wid;
-                            info!("Built-in agent registered as {worker_id}");
-                        }
-                        CoordMessage::AssignChunk {
-                            chunk_id,
-                            task_id,
-                            hash_file_b64: _,
-                            hash_file_id: _,
-                            ..
-                        } => {
-                            info!("Built-in agent received chunk {chunk_id} for task {task_id}");
-                            // For now, just report the chunk as started, then spawn hashcat.
-                            // Full implementation would mirror crack-agent's runner.
-                            let started = WorkerMessage::ChunkStarted { chunk_id };
-                            let json = serde_json::to_vec(&started)?;
-                            let len = transport.write_message(&json, &mut buf)?;
-                            let msg_len = (len as u32).to_be_bytes();
-                            stream.write_all(&msg_len).await?;
-                            stream.write_all(&buf[..len]).await?;
-
-                            // TODO: actually run hashcat and report progress
-                            // For MVP, the built-in agent works but delegates to
-                            // the full crack-agent for actual hashcat execution.
-                        }
-                        CoordMessage::Shutdown => {
-                            info!("Built-in agent received shutdown");
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-
-                    // Send heartbeat periodically (simplified)
-                    let hb = WorkerMessage::Heartbeat;
-                    let json = serde_json::to_vec(&hb)?;
-                    let len = transport.write_message(&json, &mut buf)?;
-                    let msg_len = (len as u32).to_be_bytes();
-                    stream.write_all(&msg_len).await?;
-                    stream.write_all(&buf[..len]).await?;
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Built-in agent connection failed: {e}, retrying in 5s...");
-            }
-        }
-
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
-}

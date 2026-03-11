@@ -479,6 +479,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
+ "crack-agent",
  "crack-common",
  "crossterm",
  "dirs",
