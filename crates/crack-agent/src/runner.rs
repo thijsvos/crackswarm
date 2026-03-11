@@ -94,6 +94,13 @@ impl HashcatRunner {
             cmd.arg(arg);
         }
 
+        // Set working directory to hashcat's folder so it can find kernels/modules
+        if let Some(parent) = Path::new(&config.hashcat_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                cmd.current_dir(parent);
+            }
+        }
+
         // Pipe stdout so we can parse status JSON; inherit stderr for error visibility
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
