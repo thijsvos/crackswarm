@@ -102,8 +102,14 @@ async fn cmd_run(
     let db = storage::db::init_db(&data_dir).await?;
     info!("Database initialized");
 
+    // Determine hashcat path
+    let hc_path_str = hashcat_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "hashcat".to_string());
+
     // Create shared state
-    let state = state::AppState::new(db, data_dir.clone(), keypair);
+    let state = state::AppState::new(db, data_dir.clone(), keypair, hc_path_str.clone());
 
     // Audit log: coordinator started
     let _ = storage::db::insert_audit(
@@ -147,9 +153,7 @@ async fn cmd_run(
     // Optionally start a local agent
     if with_agent {
         let agent_state = Arc::clone(&state);
-        let hc_path = hashcat_path
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "hashcat".to_string());
+        let hc_path = hc_path_str.clone();
         let coord_bind = bind.clone();
 
         tokio::spawn(async move {

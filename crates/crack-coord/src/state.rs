@@ -15,6 +15,9 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub keypair: Keypair,
 
+    /// Path to the hashcat binary (for keyspace computation).
+    pub hashcat_path: String,
+
     /// Connected workers: worker_id → sender for Noise messages.
     pub worker_connections: RwLock<HashMap<String, WorkerConnection>>,
 
@@ -43,12 +46,13 @@ pub enum AppEvent {
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, data_dir: PathBuf, keypair: Keypair) -> Arc<Self> {
+    pub fn new(db: SqlitePool, data_dir: PathBuf, keypair: Keypair, hashcat_path: String) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             db,
             data_dir,
             keypair,
+            hashcat_path,
             worker_connections: RwLock::new(HashMap::new()),
             events,
         })

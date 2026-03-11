@@ -2,21 +2,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
+use crate::scheduler::chunker;
 use crate::state::{AppEvent, AppState};
-use crate::storage::db;
+use crate::storage::{db, files};
 
 const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Background task that monitors worker health and reassigns abandoned chunks.
+/// Background task that monitors worker health, prepares pending tasks, and
+/// reassigns abandoned chunks.
 pub async fn run_monitor(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(HEARTBEAT_CHECK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         interval.tick().await;
+
+        if let Err(e) = prepare_pending_tasks(&state).await {
+            warn!("task preparation error: {e}");
+        }
 
         if let Err(e) = check_worker_health(&state).await {
             warn!("health check error: {e}");
@@ -26,6 +32,75 @@ pub async fn run_monitor(state: Arc<AppState>) {
             warn!("chunk reassignment error: {e}");
         }
     }
+}
+
+/// Find pending tasks, compute their keyspace and hash count, and transition
+/// them to running so they become dispatchable.
+async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
+    let pending = db::get_pending_tasks(&state.db).await?;
+
+    for task in pending {
+        info!(task_id = %task.id, task_name = %task.name, "preparing pending task");
+
+        // 1. Count hashes in the hash file
+        let hash_file = match db::get_file_record(&state.db, &task.hash_file_id).await? {
+            Some(f) => f,
+            None => {
+                error!(task_id = %task.id, "hash file {} not found, failing task", task.hash_file_id);
+                db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+                continue;
+            }
+        };
+
+        let file_data = match files::read_file(&state.files_dir(), &task.hash_file_id) {
+            Ok(data) => data,
+            Err(e) => {
+                error!(task_id = %task.id, error = %e, "failed to read hash file");
+                db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+                continue;
+            }
+        };
+
+        let content = String::from_utf8_lossy(&file_data);
+        let total_hashes = content.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+
+        if total_hashes == 0 {
+            error!(task_id = %task.id, "hash file is empty, failing task");
+            db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+            continue;
+        }
+
+        // 2. Compute keyspace via hashcat
+        let keyspace = match chunker::compute_keyspace(
+            &state.hashcat_path,
+            task.hash_mode,
+            &task.attack_config,
+        ).await {
+            Ok(ks) => ks,
+            Err(e) => {
+                error!(task_id = %task.id, error = %e, "failed to compute keyspace");
+                db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+                continue;
+            }
+        };
+
+        info!(
+            task_id = %task.id,
+            total_hashes,
+            keyspace,
+            "task prepared, transitioning to running"
+        );
+
+        // 3. Store keyspace and hash count
+        db::set_task_keyspace(&state.db, task.id, keyspace, total_hashes).await?;
+
+        // 4. Transition to running
+        db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Running).await?;
+
+        state.emit(AppEvent::TaskUpdated { task_id: task.id });
+    }
+
+    Ok(())
 }
 
 async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
