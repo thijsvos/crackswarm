@@ -554,7 +554,7 @@ async fn check_task_completion(state: &Arc<AppState>, task_id: Uuid) -> anyhow::
         && chunks.iter().all(|c| {
             matches!(
                 c.status,
-                ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed
+                ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed | ChunkStatus::Abandoned
             )
         });
 
