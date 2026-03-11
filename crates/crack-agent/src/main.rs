@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "crack_agent=info,warn".into()),
         )
+        .with_ansi(!cfg!(windows))
         .init();
 
     let cli = Cli::parse();

@@ -215,6 +215,12 @@ impl HashcatRunner {
                         est_remaining,
                     })
                     .await;
+            } else if let Some((hash, plaintext)) = status::parse_outfile_line(&line) {
+                // hashcat prints cracked hashes to stdout as "hash:plaintext"
+                info!(hash = %hash, "hash cracked (stdout)");
+                let _ = tx
+                    .send(RunnerEvent::HashCracked { hash, plaintext })
+                    .await;
             } else {
                 debug!(line = %line, "hashcat stdout (non-JSON)");
             }
