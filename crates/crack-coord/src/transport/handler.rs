@@ -283,6 +283,12 @@ async fn handle_worker_message(
             plaintext,
         } => {
             let wid = worker_id.as_deref().unwrap_or("unknown");
+            info!(
+                task_id = %task_id,
+                hash = %hash,
+                worker_id = %wid,
+                "received HashCracked from worker"
+            );
             db::insert_cracked_hash(&state.db, *task_id, hash, plaintext, wid).await?;
             db::increment_task_cracked_count(&state.db, *task_id, 1).await?;
 
