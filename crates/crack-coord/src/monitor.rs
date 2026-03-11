@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
@@ -204,34 +205,41 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
     // Try to assign pending chunks to idle workers
     let idle_workers = crate::scheduler::assigner::find_idle_workers(state).await?;
     for worker_id in idle_workers {
-        if let Some((_task, chunk)) =
+        if let Some((task, chunk)) =
             crate::scheduler::assigner::assign_next_chunk(state, &worker_id).await?
         {
             // Send the chunk to the worker if connected
             let conns = state.worker_connections.read().await;
             if let Some(conn) = conns.get(&worker_id) {
-                let task = db::get_task(&state.db, chunk.task_id).await?;
-                if let Some(task) = task {
-                    let (mask, custom_charsets) = match &task.attack_config {
-                        crack_common::models::AttackConfig::BruteForce {
+                // Read hash file and encode for transfer
+                match crate::storage::files::read_file(&state.files_dir(), &task.hash_file_id) {
+                    Ok(file_data) => {
+                        let hash_file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_data);
+                        let (mask, custom_charsets) = match &task.attack_config {
+                            crack_common::models::AttackConfig::BruteForce {
+                                mask,
+                                custom_charsets,
+                            } => (mask.clone(), custom_charsets.clone()),
+                        };
+
+                        let msg = crack_common::protocol::CoordMessage::AssignChunk {
+                            chunk_id: chunk.id,
+                            task_id: chunk.task_id,
+                            hash_mode: task.hash_mode,
+                            hash_file_b64,
+                            hash_file_id: task.hash_file_id.clone(),
+                            skip: chunk.skip,
+                            limit: chunk.limit,
                             mask,
                             custom_charsets,
-                        } => (mask.clone(), custom_charsets.clone()),
-                    };
+                            extra_args: task.extra_args.clone(),
+                        };
 
-                    let msg = crack_common::protocol::CoordMessage::AssignChunk {
-                        chunk_id: chunk.id,
-                        task_id: chunk.task_id,
-                        hash_mode: task.hash_mode,
-                        hash_file_url: format!("/api/v1/files/{}", task.hash_file_id),
-                        skip: chunk.skip,
-                        limit: chunk.limit,
-                        mask,
-                        custom_charsets,
-                        extra_args: task.extra_args.clone(),
-                    };
-
-                    let _ = conn.tx.send(msg).await;
+                        let _ = conn.tx.send(msg).await;
+                    }
+                    Err(e) => {
+                        error!(task_id = %task.id, error = %e, "failed to read hash file for chunk dispatch");
+                    }
                 }
             }
         }
