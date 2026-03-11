@@ -4,10 +4,13 @@ use tracing::info;
 
 /// Compute the total keyspace for an attack configuration.
 ///
-/// For brute-force masks, computes mathematically from the mask charset sizes.
-/// This avoids depending on a local hashcat installation on the coordinator
-/// (which may have platform-specific bugs, e.g. macOS Homebrew hashcat
-/// returns wrong keyspace values).
+/// For brute-force masks, computes the **base keyspace** (restore points)
+/// that hashcat uses for `--skip`/`--limit`.
+///
+/// hashcat splits mask attacks into a base keyspace and an amplifier (the
+/// last mask position). `--keyspace`, `--skip`, and `--limit` all operate
+/// on restore points = product of all charset sizes EXCEPT the last one.
+/// hashcat internally multiplies by the amplifier to cover all candidates.
 pub async fn compute_keyspace(
     _hashcat_path: &str,
     _hash_mode: u32,
@@ -19,13 +22,17 @@ pub async fn compute_keyspace(
             custom_charsets,
         } => {
             let keyspace = compute_mask_keyspace(mask, custom_charsets.as_deref())?;
-            info!(mask = %mask, keyspace, "computed keyspace from mask");
+            info!(mask = %mask, keyspace, "computed base keyspace (restore points) from mask");
             Ok(keyspace)
         }
     }
 }
 
-/// Compute keyspace for a hashcat brute-force mask by multiplying charset sizes.
+/// Compute the base keyspace (restore points) for a hashcat brute-force mask.
+///
+/// hashcat splits the mask into base positions and an amplifier (last position).
+/// `--keyspace` reports the base = product of all charset sizes except the last.
+/// `--skip` and `--limit` operate on this base keyspace.
 ///
 /// Built-in charsets:
 ///   ?l = 26 (lowercase), ?u = 26 (uppercase), ?d = 10 (digits),
@@ -34,7 +41,8 @@ pub async fn compute_keyspace(
 ///
 /// Custom charsets ?1..?4 are defined via the custom_charsets parameter.
 fn compute_mask_keyspace(mask: &str, custom_charsets: Option<&[String]>) -> anyhow::Result<u64> {
-    let mut keyspace: u64 = 1;
+    // First, collect all the charset sizes for each mask position
+    let mut position_sizes: Vec<u64> = Vec::new();
     let chars: Vec<char> = mask.chars().collect();
     let mut i = 0;
 
@@ -56,21 +64,33 @@ fn compute_mask_keyspace(mask: &str, custom_charsets: Option<&[String]>) -> anyh
                 '?' => {
                     // Literal '?' character (escaped as ??)
                     i += 2;
-                    // A literal char = 1 candidate, doesn't multiply keyspace
                     continue;
                 }
                 other => {
                     bail!("unknown charset specifier '?{other}' in mask");
                 }
             };
-            keyspace = keyspace
-                .checked_mul(charset_size)
-                .ok_or_else(|| anyhow::anyhow!("keyspace overflow for mask '{mask}'"))?;
+            position_sizes.push(charset_size);
             i += 2;
         } else {
             // Literal character — exactly 1 candidate for this position
+            position_sizes.push(1);
             i += 1;
         }
+    }
+
+    if position_sizes.is_empty() {
+        return Ok(0);
+    }
+
+    // Base keyspace = product of all positions EXCEPT the last one (amplifier).
+    // This matches what hashcat --keyspace reports and what --skip/--limit use.
+    let base_positions = &position_sizes[..position_sizes.len() - 1];
+    let mut keyspace: u64 = 1;
+    for &size in base_positions {
+        keyspace = keyspace
+            .checked_mul(size)
+            .ok_or_else(|| anyhow::anyhow!("keyspace overflow for mask '{mask}'"))?;
     }
 
     Ok(keyspace)
@@ -147,45 +167,67 @@ mod tests {
 
     #[test]
     fn keyspace_lowercase_5() {
-        // ?l?l?l?l?l = 26^5
+        // ?l?l?l?l?l: base = 26^4 (last position is amplifier)
         let ks = compute_mask_keyspace("?l?l?l?l?l", None).unwrap();
-        assert_eq!(ks, 26u64.pow(5));
+        assert_eq!(ks, 26u64.pow(4));
+    }
+
+    #[test]
+    fn keyspace_lowercase_3() {
+        // ?l?l?l: base = 26^2
+        let ks = compute_mask_keyspace("?l?l?l", None).unwrap();
+        assert_eq!(ks, 26u64.pow(2));
+    }
+
+    #[test]
+    fn keyspace_lowercase_2() {
+        // ?l?l: base = 26^1
+        let ks = compute_mask_keyspace("?l?l", None).unwrap();
+        assert_eq!(ks, 26);
     }
 
     #[test]
     fn keyspace_mixed() {
-        // ?u?l?d = 26 * 26 * 10
+        // ?u?l?d: base = 26 * 26 (last ?d is amplifier)
         let ks = compute_mask_keyspace("?u?l?d", None).unwrap();
-        assert_eq!(ks, 26 * 26 * 10);
+        assert_eq!(ks, 26 * 26);
     }
 
     #[test]
     fn keyspace_all_printable() {
-        // ?a?a?a?a = 95^4
+        // ?a?a?a?a: base = 95^3
         let ks = compute_mask_keyspace("?a?a?a?a", None).unwrap();
-        assert_eq!(ks, 95u64.pow(4));
+        assert_eq!(ks, 95u64.pow(3));
     }
 
     #[test]
     fn keyspace_with_literal() {
-        // abc?d = 1*1*1*10 = 10
+        // abc?d: positions = [1, 1, 1, 10], base = 1*1*1 = 1
         let ks = compute_mask_keyspace("abc?d", None).unwrap();
-        assert_eq!(ks, 10);
+        assert_eq!(ks, 1);
     }
 
     #[test]
     fn keyspace_custom_charset() {
-        // ?1?1 with charset 1 = "?l?d" (36 chars) = 36^2
+        // ?1?1 with charset 1 = "?l?d" (36 chars): base = 36
         let charsets = vec!["?l?d".to_string()];
         let ks = compute_mask_keyspace("?1?1", Some(&charsets)).unwrap();
-        assert_eq!(ks, 36 * 36);
+        assert_eq!(ks, 36);
     }
 
     #[test]
     fn keyspace_escaped_question_mark() {
-        // ?? is a literal '?', so "???d" = 1 literal '?' + 10 digits = 10
+        // ?? is a literal '?', so "???d" has positions [10], base = empty = 1
+        // Actually: ?? = literal '?' (skipped), ?d = 10. Only 1 position, base = empty = 1
         let ks = compute_mask_keyspace("???d", None).unwrap();
-        assert_eq!(ks, 10);
+        assert_eq!(ks, 1);
+    }
+
+    #[test]
+    fn keyspace_single_position() {
+        // ?l: only 1 position, base = empty = 1 (amplifier handles all 26)
+        let ks = compute_mask_keyspace("?l", None).unwrap();
+        assert_eq!(ks, 1);
     }
 
     #[test]
