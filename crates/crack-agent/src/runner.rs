@@ -65,9 +65,18 @@ impl HashcatRunner {
         // Mask
         cmd.arg(&config.mask);
 
-        // Keyspace range: --limit is absolute (from start of keyspace), not relative to --skip
+        // Keyspace range
         cmd.arg("--skip").arg(config.skip.to_string());
-        cmd.arg("--limit").arg((config.skip + config.limit).to_string());
+        cmd.arg("--limit").arg(config.limit.to_string());
+
+        // Unique session name per chunk to prevent session file conflicts
+        let session_name = config
+            .outfile_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("crack")
+            .to_string();
+        cmd.arg("--session").arg(&session_name);
 
         // Status output
         cmd.arg("--status");
@@ -75,7 +84,9 @@ impl HashcatRunner {
         cmd.arg("--status-timer=5");
 
         // Disable potfile and restore (we manage state externally)
-        cmd.arg("--potfile-disable");
+        // Use a per-chunk potfile path to avoid reading any existing system potfile
+        let potfile_path = config.outfile_path.with_extension("potfile");
+        cmd.arg("--potfile-path").arg(&potfile_path);
         cmd.arg("--restore-disable");
 
         // Output file
@@ -157,7 +168,7 @@ impl HashcatRunner {
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim_end_matches('\r').to_string();
                 if !line.is_empty() {
-                    debug!(stderr = %line, "hashcat stderr");
+                    warn!(stderr = %line, "hashcat stderr");
                     // Check for fatal errors
                     if line.contains("No hashes loaded")
                         || line.contains("Hashfile")
