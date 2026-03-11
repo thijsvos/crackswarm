@@ -442,6 +442,13 @@ async fn handle_runner_event(
             .await?;
         }
         RunnerEvent::HashCracked { hash, plaintext } => {
+            info!(
+                chunk_id = %chunk_id,
+                task_id = %task_id,
+                hash = %hash,
+                plaintext = %plaintext,
+                "sending HashCracked to coordinator"
+            );
             send_message(
                 stream,
                 transport,
