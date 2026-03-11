@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,6 +15,13 @@ use uuid::Uuid;
 use crate::config::RunConfig;
 use crate::runner::{HashcatRunConfig, HashcatRunner, RunnerEvent};
 use crate::status;
+
+/// A chunk assignment waiting to be executed (queued because another hashcat is running).
+struct PendingChunk {
+    chunk_id: Uuid,
+    task_id: Uuid,
+    run_config: HashcatRunConfig,
+}
 
 /// Maximum Noise transport message (plaintext side). 64 KiB is well within
 /// the 65535-byte Noise limit.
@@ -131,10 +138,12 @@ async fn connect_and_run(
     let (runner_tx, mut runner_rx) = mpsc::channel::<(Uuid, Uuid, RunnerEvent)>(256);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
 
-    // Track running chunks: chunk_id -> kill signal sender
+    // Track running chunks: chunk_id -> kill signal sender (at most one at a time)
     let mut active_chunks: HashMap<Uuid, oneshot::Sender<()>> = HashMap::new();
     // Track chunk -> task mapping (reserved for future use, e.g. reconnection)
     let mut _chunk_task: HashMap<Uuid, Uuid> = HashMap::new();
+    // Queue for chunks waiting to run (serialized: only one hashcat at a time)
+    let mut pending_queue: VecDeque<PendingChunk> = VecDeque::new();
 
     loop {
         // We use `stream.readable()` in the select to detect when there is
@@ -163,6 +172,11 @@ async fn connect_and_run(
             }
 
             Action::RunnerEvent(chunk_id, task_id, event) => {
+                let is_terminal = matches!(
+                    event,
+                    RunnerEvent::Completed { .. } | RunnerEvent::Failed { .. }
+                );
+
                 handle_runner_event(
                     &mut stream,
                     &mut transport,
@@ -172,6 +186,28 @@ async fn connect_and_run(
                     event,
                 )
                 .await?;
+
+                // If the chunk finished, start the next queued chunk
+                if is_terminal {
+                    if let Some(next) = pending_queue.pop_front() {
+                        info!(
+                            chunk_id = %next.chunk_id,
+                            remaining = pending_queue.len(),
+                            "starting next queued chunk"
+                        );
+                        start_hashcat(
+                            &next.run_config,
+                            next.chunk_id,
+                            next.task_id,
+                            &mut stream,
+                            &mut transport,
+                            &mut active_chunks,
+                            &mut _chunk_task,
+                            &runner_tx,
+                        )
+                        .await?;
+                    }
+                }
             }
 
             Action::TcpReadable => {
@@ -245,58 +281,31 @@ async fn connect_and_run(
                             outfile_path,
                         };
 
-                        match HashcatRunner::start(&run_config) {
-                            Ok(runner) => {
-                                // Notify coordinator that we started
-                                send_message(
-                                    &mut stream,
-                                    &mut transport,
-                                    &WorkerMessage::ChunkStarted { chunk_id },
-                                )
-                                .await?;
-
-                                _chunk_task.insert(chunk_id, task_id);
-
-                                // Create a kill channel so AbortChunk can stop this runner
-                                let (kill_tx, kill_rx) = oneshot::channel::<()>();
-                                active_chunks.insert(chunk_id, kill_tx);
-
-                                // Spawn a dedicated task that owns the runner.
-                                // It monitors hashcat and listens for kill signals.
-                                let tx = runner_tx.clone();
-                                let cid = chunk_id;
-                                let tid = task_id;
-                                tokio::spawn(async move {
-                                    let mut runner = runner;
-                                    let event_tx = wrap_sender(tx, cid, tid);
-                                    tokio::select! {
-                                        result = runner.monitor(event_tx.clone()) => {
-                                            if let Err(e) = result {
-                                                let _ = event_tx.send(RunnerEvent::Failed {
-                                                    error: e.to_string(),
-                                                }).await;
-                                            }
-                                        }
-                                        _ = kill_rx => {
-                                            warn!(chunk_id = %cid, "received kill signal");
-                                            let _ = runner.kill().await;
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!(error = %e, chunk_id = %chunk_id, "failed to start hashcat");
-                                send_message(
-                                    &mut stream,
-                                    &mut transport,
-                                    &WorkerMessage::ChunkFailed {
-                                        chunk_id,
-                                        error: e.to_string(),
-                                        exit_code: None,
-                                    },
-                                )
-                                .await?;
-                            }
+                        // Only run one hashcat at a time to avoid GPU contention.
+                        // If one is already running, queue this chunk.
+                        if active_chunks.is_empty() {
+                            start_hashcat(
+                                &run_config,
+                                chunk_id,
+                                task_id,
+                                &mut stream,
+                                &mut transport,
+                                &mut active_chunks,
+                                &mut _chunk_task,
+                                &runner_tx,
+                            )
+                            .await?;
+                        } else {
+                            info!(
+                                chunk_id = %chunk_id,
+                                queue_len = pending_queue.len() + 1,
+                                "queuing chunk (another hashcat is running)"
+                            );
+                            pending_queue.push_back(PendingChunk {
+                                chunk_id,
+                                task_id,
+                                run_config,
+                            });
                         }
                     }
 
@@ -305,6 +314,8 @@ async fn connect_and_run(
                         if let Some(kill_tx) = active_chunks.remove(&chunk_id) {
                             let _ = kill_tx.send(());
                         }
+                        // Also remove from pending queue if queued but not yet started
+                        pending_queue.retain(|p| p.chunk_id != chunk_id);
                         _chunk_task.remove(&chunk_id);
                     }
 
@@ -338,6 +349,69 @@ async fn connect_and_run(
             }
         }
     }
+}
+
+/// Start a hashcat process for a chunk assignment.
+async fn start_hashcat(
+    run_config: &HashcatRunConfig,
+    chunk_id: Uuid,
+    task_id: Uuid,
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    active_chunks: &mut HashMap<Uuid, oneshot::Sender<()>>,
+    chunk_task: &mut HashMap<Uuid, Uuid>,
+    runner_tx: &mpsc::Sender<(Uuid, Uuid, RunnerEvent)>,
+) -> anyhow::Result<()> {
+    match HashcatRunner::start(run_config) {
+        Ok(runner) => {
+            send_message(
+                stream,
+                transport,
+                &WorkerMessage::ChunkStarted { chunk_id },
+            )
+            .await?;
+
+            chunk_task.insert(chunk_id, task_id);
+
+            let (kill_tx, kill_rx) = oneshot::channel::<()>();
+            active_chunks.insert(chunk_id, kill_tx);
+
+            let tx = runner_tx.clone();
+            let cid = chunk_id;
+            let tid = task_id;
+            tokio::spawn(async move {
+                let mut runner = runner;
+                let event_tx = wrap_sender(tx, cid, tid);
+                tokio::select! {
+                    result = runner.monitor(event_tx.clone()) => {
+                        if let Err(e) = result {
+                            let _ = event_tx.send(RunnerEvent::Failed {
+                                error: e.to_string(),
+                            }).await;
+                        }
+                    }
+                    _ = kill_rx => {
+                        warn!(chunk_id = %cid, "received kill signal");
+                        let _ = runner.kill().await;
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            error!(error = %e, chunk_id = %chunk_id, "failed to start hashcat");
+            send_message(
+                stream,
+                transport,
+                &WorkerMessage::ChunkFailed {
+                    chunk_id,
+                    error: e.to_string(),
+                    exit_code: None,
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Handle a runner event by forwarding the appropriate WorkerMessage.
