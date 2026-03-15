@@ -275,6 +275,9 @@ impl HashcatRunner {
             }
         }
 
+        // Clean up temporary files (outfile + potfile)
+        self.cleanup_temp_files().await;
+
         // Hashcat exit codes:
         //   0 = cracked / exhausted successfully
         //   1 = exhausted (no hashes cracked)
@@ -302,7 +305,25 @@ impl HashcatRunner {
     pub async fn kill(&mut self) -> anyhow::Result<()> {
         info!("killing hashcat process");
         self.child.kill().await.context("failed to kill hashcat")?;
+        self.cleanup_temp_files().await;
         Ok(())
+    }
+
+    /// Remove temporary outfile and potfile created for this chunk.
+    async fn cleanup_temp_files(&self) {
+        // Remove outfile (out_<chunk_id>.txt)
+        if let Err(e) = tokio::fs::remove_file(&self.outfile_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                debug!(path = %self.outfile_path.display(), error = %e, "failed to remove outfile");
+            }
+        }
+        // Remove potfile (out_<chunk_id>.potfile)
+        let potfile_path = self.outfile_path.with_extension("potfile");
+        if let Err(e) = tokio::fs::remove_file(&potfile_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                debug!(path = %potfile_path.display(), error = %e, "failed to remove potfile");
+            }
+        }
     }
 }
 
