@@ -19,7 +19,7 @@ Distributed hashcat orchestration tool. Splits cracking work across GPU workers 
   │        Noise IK encrypted TCP         │
   └──────────┬───────────────┬────────────┘
              │               │
-     ┌───────┴───────┐ ┌────┴──────────┐
+     ┌───────┴───────┐ ┌─────┴─────────┐
      │  crack-agent  │ │  crack-agent  │  ...
      │    hashcat    │ │    hashcat    │
      │    GPU(s)     │ │    GPU(s)     │
