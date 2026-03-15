@@ -185,25 +185,6 @@ crack-agent run         Connect and process work
 7. **Result collection** — cracked hashes reported in real-time, stored in SQLite
 8. **Campaign advancement** — when a phase exhausts, uncracked hashes roll into the next phase
 
-## Project Structure
-
-```
-crates/
-├── crack-common/     Shared types, Noise auth, protocol, hashcat helpers
-├── crack-coord/      Coordinator server
-│   ├── api/          REST endpoints (axum)
-│   ├── campaign/     Multi-phase campaign engine + templates
-│   ├── scheduler/    Keyspace chunking + chunk assignment
-│   ├── storage/      SQLite persistence + file storage
-│   ├── transport/    Noise TCP listener + handler
-│   └── tui/          Ratatui dashboard (Catppuccin Mocha theme)
-├── crack-agent/      Worker agent
-│   ├── connection    Noise TCP client + reconnect loop
-│   ├── runner        Hashcat process management
-│   └── tui           Mini dashboard
-└── crackctl/         Operator CLI
-```
-
 ## License
 
 MIT
