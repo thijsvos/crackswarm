@@ -26,3 +26,5 @@ sha2 = { workspace = true }
 zeroize = { workspace = true }
 dirs = { workspace = true }
 reqwest = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }

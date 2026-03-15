@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -52,8 +52,8 @@ pub fn render_task_list(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-/// Render task detail in the right panel.
-pub fn render_task_detail(f: &mut Frame, area: Rect, state: &TuiState) {
+/// Render task detail in the right panel (mut for chunk scroll state).
+pub fn render_task_detail(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let task = match state.selected_task() {
         Some(t) => t,
         None => {
@@ -103,6 +103,23 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &TuiState) {
         .collect::<std::collections::HashSet<_>>()
         .len();
 
+    // Compute ETA
+    let eta_str = if task.status == crack_common::models::TaskStatus::Completed {
+        "done".to_string()
+    } else if total_speed == 0 {
+        "calculating...".to_string()
+    } else if let Some(ks) = task.total_keyspace {
+        let remaining = ks.saturating_sub(task.next_skip);
+        if remaining == 0 {
+            "done".to_string()
+        } else {
+            let secs = remaining / total_speed;
+            format_eta(secs)
+        }
+    } else {
+        "unknown".to_string()
+    };
+
     let lines = vec![
         Line::from(vec![
             Span::styled("  Hash Mode:  ", Style::default().fg(Theme::SUBTEXT0)),
@@ -129,6 +146,10 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &TuiState) {
                 format!("{} ({} workers)", format_speed(total_speed), active_workers),
                 Style::default().fg(Theme::PEACH),
             ),
+        ]),
+        Line::from(vec![
+            Span::styled("  ETA:        ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled(&eta_str, Style::default().fg(Theme::YELLOW)),
         ]),
         Line::from(vec![
             Span::styled("  Keyspace:   ", Style::default().fg(Theme::SUBTEXT0)),
@@ -180,6 +201,10 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &TuiState) {
         .iter()
         .map(|chunk| {
             let chunk_status = chunk.status.to_string();
+            let is_terminal = matches!(
+                chunk.status,
+                ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed | ChunkStatus::Abandoned
+            );
             let worker = chunk
                 .assigned_worker
                 .as_deref()
@@ -187,11 +212,18 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &TuiState) {
                 .chars()
                 .take(8)
                 .collect::<String>();
+            let speed_str = if chunk.speed > 0 {
+                format_speed(chunk.speed)
+            } else if is_terminal {
+                "-".to_string()
+            } else {
+                "0 H/s".to_string()
+            };
             Row::new(vec![
                 chunk.id.to_string()[..8].to_string(),
                 worker,
                 format!("{:.0}%", chunk.progress),
-                format_speed(chunk.speed),
+                speed_str,
                 chunk_status,
             ])
             .style(Style::default().fg(Theme::TEXT))
@@ -214,12 +246,21 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &TuiState) {
     )
     .block(
         Block::default()
-            .title(" Chunks ")
+            .title(format!(" Chunks ({}) ", task_chunks.len()))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Theme::SURFACE1)),
-    );
+    )
+    .row_highlight_style(Style::default().bg(Theme::SURFACE0));
 
-    f.render_widget(chunk_table, chunks_layout[2]);
+    // Clamp scroll offset
+    let max_offset = task_chunks.len().saturating_sub(1);
+    if state.chunk_scroll_offset > max_offset {
+        state.chunk_scroll_offset = max_offset;
+    }
+
+    let mut table_state = TableState::default();
+    table_state.select(Some(state.chunk_scroll_offset));
+    f.render_stateful_widget(chunk_table, chunks_layout[2], &mut table_state);
 }
 
 fn format_speed(hps: u64) -> String {
@@ -231,6 +272,23 @@ fn format_speed(hps: u64) -> String {
         format!("{:.1} KH/s", hps as f64 / 1_000.0)
     } else {
         format!("{hps} H/s")
+    }
+}
+
+fn format_eta(total_secs: u64) -> String {
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m {secs}s")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
+    } else {
+        format!("{secs}s")
     }
 }
 

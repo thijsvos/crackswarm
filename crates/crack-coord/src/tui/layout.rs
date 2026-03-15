@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 /// Compute the main layout: header, body (split pane), and footer.
 pub struct AppLayout {
     pub header: Rect,
+    pub body: Rect,
     pub left_panel: Rect,
     pub right_panel: Rect,
     pub footer: Rect,
@@ -29,6 +30,7 @@ impl AppLayout {
 
         Self {
             header: vertical[0],
+            body: vertical[1],
             left_panel: body[0],
             right_panel: body[1],
             footer: vertical[2],

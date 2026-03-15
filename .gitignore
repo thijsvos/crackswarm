@@ -3,9 +3,22 @@
 /bin
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.enc
 *.key
 *.pem
+
+# Compiled binaries (release copies in repo root)
+/crack-agent
+/crack-coord
+/crackctl
+
+# Test artifacts
+/test-data
+/test_hashes.txt
+/test_ntlm_hashes.txt
+/test_campaign.sh
 
 # IDE
 .idea/

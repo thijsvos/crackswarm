@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::config::RunConfig;
 use crate::runner::{HashcatRunConfig, HashcatRunner, RunnerEvent};
 use crate::status;
+use crate::tui::AgentEvent;
 
 /// A chunk assignment waiting to be executed (queued because another hashcat is running).
 struct PendingChunk {
@@ -27,22 +28,35 @@ struct PendingChunk {
 /// the 65535-byte Noise limit.
 const NOISE_MAX_PLAINTEXT: usize = 65000;
 
+/// Emit an event to the TUI if the sender is present.
+fn emit(tx: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
+    if let Some(ref tx) = tx {
+        let _ = tx.send(event);
+    }
+}
+
 /// Main entry point: connect to the coordinator and run the message loop.
 ///
 /// On disconnect the function returns an `Err` so the caller can apply
 /// exponential backoff and reconnect.
-pub async fn run_connection(config: &RunConfig) -> anyhow::Result<()> {
+///
+/// When `event_tx` is `Some`, agent TUI events are emitted for live display.
+pub async fn run_connection(
+    config: &RunConfig,
+    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+) -> anyhow::Result<()> {
     let keypair = Keypair::load_from_dir(&config.data_dir)
         .map_err(|e| anyhow!("failed to load agent keypair: {e}"))?;
     let coord_pubkey = auth::load_remote_key(&config.data_dir, "coordinator.pub")
         .map_err(|e| anyhow!("failed to load coordinator public key: {e}"))?;
 
     let mut backoff = ExponentialBackoff::new();
+    let mut attempt: u32 = 0;
 
     loop {
         info!(server = %config.server, "connecting to coordinator");
 
-        match connect_and_run(config, &keypair, &coord_pubkey).await {
+        match connect_and_run(config, &keypair, &coord_pubkey, None, &event_tx).await {
             Ok(()) => {
                 // Clean shutdown requested by coordinator
                 info!("coordinator requested shutdown, exiting");
@@ -50,20 +64,90 @@ pub async fn run_connection(config: &RunConfig) -> anyhow::Result<()> {
             }
             Err(e) => {
                 error!(error = %e, "connection lost");
+                emit(&event_tx, AgentEvent::Disconnected);
+                attempt += 1;
                 let delay = backoff.next_delay();
                 info!(delay_secs = delay.as_secs(), "reconnecting after backoff");
+                emit(&event_tx, AgentEvent::Reconnecting { attempt });
                 tokio::time::sleep(delay).await;
             }
         }
     }
 }
 
+/// Connect with an enrollment token. On the first connection, sends an Enroll
+/// message to authorize. If the connection drops after enrollment succeeds,
+/// reconnects normally (the worker is now authorized).
+pub async fn run_connection_with_enroll(
+    config: &RunConfig,
+    nonce: &str,
+    worker_name: &str,
+    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+) -> anyhow::Result<()> {
+    let keypair = Keypair::load_from_dir(&config.data_dir)
+        .map_err(|e| anyhow!("failed to load agent keypair: {e}"))?;
+    let coord_pubkey = auth::load_remote_key(&config.data_dir, "coordinator.pub")
+        .map_err(|e| anyhow!("failed to load coordinator public key: {e}"))?;
+
+    let enroll_info = Some(EnrollInfo {
+        nonce: nonce.to_string(),
+        worker_name: worker_name.to_string(),
+    });
+
+    info!(server = %config.server, "connecting to coordinator for enrollment");
+
+    // First connection: send Enroll message
+    match connect_and_run(config, &keypair, &coord_pubkey, enroll_info, &event_tx).await {
+        Ok(()) => {
+            info!("coordinator requested shutdown, exiting");
+            return Ok(());
+        }
+        Err(e) => {
+            error!(error = %e, "connection lost after enrollment");
+            emit(&event_tx, AgentEvent::Disconnected);
+        }
+    }
+
+    // Subsequent reconnections: the worker is now authorized, use normal flow
+    let mut backoff = ExponentialBackoff::new();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let delay = backoff.next_delay();
+        info!(delay_secs = delay.as_secs(), "reconnecting after backoff");
+        emit(&event_tx, AgentEvent::Reconnecting { attempt });
+        tokio::time::sleep(delay).await;
+
+        info!(server = %config.server, "reconnecting to coordinator");
+
+        match connect_and_run(config, &keypair, &coord_pubkey, None, &event_tx).await {
+            Ok(()) => {
+                info!("coordinator requested shutdown, exiting");
+                return Ok(());
+            }
+            Err(e) => {
+                error!(error = %e, "connection lost");
+                emit(&event_tx, AgentEvent::Disconnected);
+            }
+        }
+    }
+}
+
+/// Enrollment info passed to connect_and_run for the first connection.
+struct EnrollInfo {
+    nonce: String,
+    worker_name: String,
+}
+
 /// Perform handshake, register, and run the message loop for a single
-/// connection lifetime.
+/// connection lifetime. If `enroll_info` is provided, sends an Enroll
+/// message before Register.
 async fn connect_and_run(
     config: &RunConfig,
     keypair: &Keypair,
     coord_pubkey: &[u8],
+    enroll_info: Option<EnrollInfo>,
+    event_tx: &Option<mpsc::UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(&config.server)
         .await
@@ -97,6 +181,17 @@ async fn connect_and_run(
         .map_err(|e| anyhow!("failed to enter transport mode: {e}"))?;
     info!("Noise handshake complete, channel encrypted");
 
+    // ── Enrollment (if token provided) ──
+
+    if let Some(ref enroll) = enroll_info {
+        let enroll_msg = WorkerMessage::Enroll {
+            nonce: enroll.nonce.clone(),
+            worker_name: enroll.worker_name.clone(),
+        };
+        send_message(&mut stream, &mut transport, &enroll_msg).await?;
+        info!("sent Enroll message, waiting for handshake to be accepted");
+    }
+
     // ── Registration ──
 
     let hashcat_version = status::detect_hashcat(&config.hashcat_path).await?;
@@ -117,6 +212,7 @@ async fn connect_and_run(
     let _worker_id = match welcome {
         CoordMessage::Welcome { ref worker_id } => {
             info!(worker_id = %worker_id, "registered with coordinator");
+            emit(event_tx, AgentEvent::Connected { worker_id: worker_id.clone() });
             worker_id.clone()
         }
         other => {
@@ -184,6 +280,7 @@ async fn connect_and_run(
                     chunk_id,
                     task_id,
                     event,
+                    event_tx,
                 )
                 .await?;
 
@@ -261,6 +358,13 @@ async fn connect_and_run(
                             skip, limit,
                             "received chunk assignment"
                         );
+
+                        emit(event_tx, AgentEvent::ChunkAssigned {
+                            task_id,
+                            chunk_id,
+                            hash_mode,
+                            mask: mask.clone(),
+                        });
 
                         // Decode hash file from the message and cache locally
                         let hash_file_path =
@@ -422,6 +526,7 @@ async fn handle_runner_event(
     chunk_id: Uuid,
     task_id: Uuid,
     event: RunnerEvent,
+    event_tx: &Option<mpsc::UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<()> {
     match event {
         RunnerEvent::StatusUpdate {
@@ -429,6 +534,11 @@ async fn handle_runner_event(
             speed,
             est_remaining,
         } => {
+            emit(event_tx, AgentEvent::ChunkProgress {
+                progress_pct,
+                speed,
+                est_remaining,
+            });
             send_message(
                 stream,
                 transport,
@@ -449,6 +559,10 @@ async fn handle_runner_event(
                 plaintext = %plaintext,
                 "sending HashCracked to coordinator"
             );
+            emit(event_tx, AgentEvent::HashCracked {
+                hash: hash.clone(),
+                plaintext: plaintext.clone(),
+            });
             send_message(
                 stream,
                 transport,
@@ -464,6 +578,7 @@ async fn handle_runner_event(
         RunnerEvent::Completed { exit_code } => {
             info!(chunk_id = %chunk_id, exit_code, "chunk completed");
             active_chunks.remove(&chunk_id);
+            emit(event_tx, AgentEvent::ChunkCompleted { exit_code });
             send_message(
                 stream,
                 transport,
@@ -478,6 +593,7 @@ async fn handle_runner_event(
         RunnerEvent::Failed { error } => {
             error!(chunk_id = %chunk_id, error = %error, "chunk failed");
             active_chunks.remove(&chunk_id);
+            emit(event_tx, AgentEvent::ChunkFailed { error: error.clone() });
             send_message(
                 stream,
                 transport,

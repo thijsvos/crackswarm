@@ -62,20 +62,8 @@ async fn run_connection(
         .await
         .context("failed to check worker authorization")?;
 
-    if !authorized {
-        warn!(%peer_addr, pubkey = %pubkey_b64, "unauthorized worker connection rejected");
-        db::insert_audit(
-            &state.db,
-            "auth_rejected",
-            &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64}"),
-            Some(&peer_addr.to_string()),
-            None,
-        )
-        .await
-        .ok();
-        // Close without sending a response.
-        return Ok(());
-    }
+    // Always complete the Noise handshake so unauthorized workers can
+    // attempt enrollment over the encrypted channel.
 
     // Send the responder's reply message (e, ee, se).
     let len = handshake
@@ -90,6 +78,111 @@ async fn run_connection(
         .context("failed to enter noise transport mode")?;
 
     info!(%peer_addr, pubkey = %pubkey_b64, "noise handshake complete");
+
+    // If not authorized, wait for an Enroll message (with timeout).
+    if !authorized {
+        info!(%peer_addr, pubkey = %pubkey_b64, "worker not pre-authorized, waiting for enrollment");
+
+        let enroll_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_noise_frame(stream),
+        )
+        .await;
+
+        let ciphertext = match enroll_result {
+            Ok(Ok(ct)) => ct,
+            Ok(Err(e)) => {
+                warn!(%peer_addr, error = %e, "enrollment read error");
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(%peer_addr, pubkey = %pubkey_b64, "enrollment timeout, disconnecting");
+                db::insert_audit(
+                    &state.db,
+                    "auth_rejected",
+                    &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
+                    Some(&peer_addr.to_string()),
+                    None,
+                )
+                .await
+                .ok();
+                return Ok(());
+            }
+        };
+
+        // Decrypt the message
+        let mut enroll_buf = vec![0u8; 65535];
+        let plaintext_len = match transport.read_message(&ciphertext, &mut enroll_buf) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(%peer_addr, error = %e, "enrollment decrypt failed");
+                return Ok(());
+            }
+        };
+
+        let msg: WorkerMessage = match serde_json::from_slice(&enroll_buf[..plaintext_len]) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(%peer_addr, error = %e, "invalid enrollment message");
+                return Ok(());
+            }
+        };
+
+        match msg {
+            WorkerMessage::Enroll { nonce, worker_name } => {
+                info!(%peer_addr, %worker_name, "received enrollment request");
+
+                // Validate the nonce
+                let valid_name = db::validate_enrollment_nonce(&state.db, &nonce).await?;
+                match valid_name {
+                    Some(token_name) => {
+                        // Mark nonce as used, authorize the worker
+                        db::mark_nonce_used(&state.db, &nonce, &pubkey_b64).await?;
+                        db::authorize_worker(&state.db, &pubkey_b64, &token_name).await?;
+
+                        db::insert_audit(
+                            &state.db,
+                            "worker_enrolled",
+                            &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
+                            Some(&peer_addr.to_string()),
+                            None,
+                        )
+                        .await
+                        .ok();
+
+                        info!(%peer_addr, name = %token_name, "worker enrolled successfully via token");
+                        // Fall through to the normal message loop
+                    }
+                    None => {
+                        warn!(%peer_addr, "invalid or expired enrollment nonce");
+                        db::insert_audit(
+                            &state.db,
+                            "enroll_rejected",
+                            &format!("Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"),
+                            Some(&peer_addr.to_string()),
+                            None,
+                        )
+                        .await
+                        .ok();
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {
+                warn!(%peer_addr, pubkey = %pubkey_b64, "unauthorized worker sent non-Enroll message, disconnecting");
+                db::insert_audit(
+                    &state.db,
+                    "auth_rejected",
+                    &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
+                    Some(&peer_addr.to_string()),
+                    None,
+                )
+                .await
+                .ok();
+                return Ok(());
+            }
+        }
+    }
 
     // ── 2. Message loop ─────────────────────────────────────────────────
 
@@ -309,6 +402,13 @@ async fn handle_worker_message(
 
                     // Abort all running chunks on this task across all workers.
                     abort_task_chunks(state, *task_id).await?;
+
+                    // Advance campaign if this task is campaign-owned
+                    if task.campaign_id.is_some() {
+                        if let Err(e) = crate::campaign::on_task_completed(state, *task_id).await {
+                            error!(task_id = %task_id, error = %e, "campaign advance error");
+                        }
+                    }
                 }
             }
             Ok(())
@@ -324,6 +424,10 @@ async fn handle_worker_message(
             } else {
                 ChunkStatus::Completed
             };
+
+            // Mark progress as 100% without clobbering the last-reported speed —
+            // for fast hashes, hashcat may finish before any status update is sent.
+            db::finalize_chunk_progress(&state.db, *chunk_id).await?;
             db::update_chunk_status(&state.db, *chunk_id, status).await?;
 
             let chunk = db::get_chunk(&state.db, *chunk_id).await?;
@@ -407,6 +511,13 @@ async fn handle_worker_message(
                     worker_id: wid.to_string(),
                 });
             }
+            Ok(())
+        }
+
+        WorkerMessage::Enroll { .. } => {
+            // Enrollment is handled before the message loop. If we get here,
+            // the worker is already authorized, so we just ignore it.
+            debug!(%peer_addr, "ignoring Enroll message in message loop (already authorized)");
             Ok(())
         }
     }
@@ -568,6 +679,15 @@ async fn check_task_completion(state: &Arc<AppState>, task_id: Uuid) -> anyhow::
         db::update_task_status(&state.db, task_id, TaskStatus::Completed).await?;
         state.emit(AppEvent::TaskCompleted { task_id });
         state.emit(AppEvent::TaskUpdated { task_id });
+
+        // Advance campaign if this task is campaign-owned
+        if let Some(task) = db::get_task(&state.db, task_id).await? {
+            if task.campaign_id.is_some() {
+                if let Err(e) = crate::campaign::on_task_completed(state, task_id).await {
+                    error!(task_id = %task_id, error = %e, "campaign advance error after chunk completion");
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -180,8 +180,8 @@ fn custom_charset_size(idx: usize, custom_charsets: Option<&[String]>) -> anyhow
 /// Strategy:
 /// - If the worker has a known benchmark speed, target 10 minutes of work per chunk:
 ///   `worker_speed * 600`.
-/// - Otherwise, divide the keyspace evenly across workers with a 20x multiplier for
-///   granularity: `total_keyspace / (num_workers * 20)`.
+/// - Otherwise, divide the keyspace evenly across workers with a 4x multiplier for
+///   granularity: `total_keyspace / (num_workers * 4)`.
 /// - The result is clamped to `[10_000, total_keyspace]`.
 pub fn calculate_chunk_size(
     worker_speed: Option<u64>,
@@ -193,7 +193,7 @@ pub fn calculate_chunk_size(
     let raw = if let Some(speed) = worker_speed {
         speed.saturating_mul(600)
     } else {
-        total_keyspace / (num_workers.max(1) as u64 * 20)
+        total_keyspace / (num_workers.max(1) as u64 * 4)
     };
 
     // Clamp: at least MIN_CHUNK but never exceed total_keyspace.
@@ -276,9 +276,9 @@ mod tests {
 
     #[test]
     fn chunk_size_without_speed() {
-        // 1_000_000 / (4 * 20) = 12_500
+        // 1_000_000 / (4 * 4) = 62_500
         let size = calculate_chunk_size(None, 1_000_000, 4);
-        assert_eq!(size, 12_500);
+        assert_eq!(size, 62_500);
     }
 
     #[test]
@@ -300,23 +300,23 @@ mod tests {
     fn chunk_size_zero_workers_no_speed() {
         // num_workers = 0, should be treated as 1 via max(1)
         let size = calculate_chunk_size(None, 1_000_000, 0);
-        // 1_000_000 / (1 * 20) = 50_000
-        assert_eq!(size, 50_000);
+        // 1_000_000 / (1 * 4) = 250_000
+        assert_eq!(size, 250_000);
     }
 
     #[test]
     fn chunk_size_small_keyspace_no_speed() {
         // total_keyspace smaller than MIN_CHUNK: result is total_keyspace
         let size = calculate_chunk_size(None, 5_000, 10);
-        // 5_000 / (10 * 20) = 25, min = min(10_000, 5_000) = 5_000
-        // clamp(25, 5_000, 5_000) = 5_000
+        // 5_000 / (10 * 4) = 125, min = min(10_000, 5_000) = 5_000
+        // clamp(125, 5_000, 5_000) = 5_000
         assert_eq!(size, 5_000);
     }
 
     #[test]
     fn chunk_size_exact_boundary() {
         // Exactly 10_000 total keyspace, no speed, 1 worker
-        // 10_000 / (1 * 20) = 500, clamp(10_000, 10_000) = 10_000
+        // 10_000 / (1 * 4) = 2_500, clamp(10_000, 10_000) = 10_000
         let size = calculate_chunk_size(None, 10_000, 1);
         assert_eq!(size, 10_000);
     }

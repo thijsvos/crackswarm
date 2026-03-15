@@ -10,13 +10,29 @@ use super::chunker::calculate_chunk_size;
 
 /// Find the next available work and assign a chunk to the given worker.
 ///
+/// First tries to claim an existing pending chunk (from abandoned chunk recovery).
+/// If none exist, creates a new chunk from the task cursor.
 /// Returns `Some((task, chunk))` if work was assigned, or `None` if there is no
 /// remaining work across all running tasks.
 pub async fn assign_next_chunk(
     state: &AppState,
     worker_id: &str,
 ) -> anyhow::Result<Option<(Task, Chunk)>> {
-    // Find the highest-priority running task with remaining keyspace.
+    // First: try to pick up an existing pending chunk (from recovery/reassignment)
+    if let Some((task, chunk)) = db::claim_pending_chunk(&state.db, worker_id).await? {
+        db::update_worker_status(&state.db, worker_id, WorkerStatus::Working).await?;
+        info!(
+            task_id = %task.id,
+            chunk_id = %chunk.id,
+            worker_id,
+            skip = chunk.skip,
+            limit = chunk.limit,
+            "assigned pending chunk to worker"
+        );
+        return Ok(Some((task, chunk)));
+    }
+
+    // Second: create a new chunk from the task cursor
     let task = match db::find_next_dispatchable_task(&state.db).await? {
         Some(t) => t,
         None => {
@@ -73,6 +89,9 @@ pub async fn assign_next_chunk(
 
     // Persist the chunk.
     db::insert_chunk(&state.db, &chunk).await?;
+
+    // Mark the worker as working.
+    db::update_worker_status(&state.db, worker_id, WorkerStatus::Working).await?;
 
     // Advance the task cursor.
     let new_skip = task.next_skip + limit;
