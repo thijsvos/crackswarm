@@ -12,9 +12,9 @@ Distributed hashcat orchestration tool. Splits cracking work across GPU workers 
   ┌───────────────────┴───────────────────┐
   │            crack-coord                │
   │                                       │
-  │  ┌──────────┐ ┌────────┐ ┌─────────┐ │
+  │  ┌───────────┐ ┌────────┐ ┌─────────┐ │
   │  │ Scheduler │ │ SQLite │ │   TUI   │ │
-  │  └──────────┘ └────────┘ └─────────┘ │
+  │  └───────────┘ └────────┘ └─────────┘ │
   │                                       │
   │        Noise IK encrypted TCP         │
   └──────────┬───────────────┬────────────┘
