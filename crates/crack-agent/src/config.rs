@@ -23,13 +23,31 @@ pub enum Commands {
     },
     /// Start the agent and connect to the coordinator
     Run(RunConfig),
+    /// Enroll using a token from the coordinator
+    Enroll {
+        /// Enrollment token from `crackctl worker enroll`
+        #[arg(long)]
+        token: String,
+
+        /// Override the server address from the token
+        #[arg(long, env = "CRACK_AGENT_SERVER")]
+        server: Option<String>,
+
+        /// Data directory for keys and cache
+        #[arg(long, env = "CRACK_AGENT_DATA_DIR", default_value_os_t = crack_common::auth::agent_data_dir())]
+        data_dir: PathBuf,
+
+        /// Path to the hashcat binary
+        #[arg(long, default_value = "hashcat")]
+        hashcat_path: String,
+    },
 }
 
 /// Configuration for the `run` subcommand.
 #[derive(Debug, Clone, clap::Args)]
 pub struct RunConfig {
     /// Coordinator Noise transport address (host:port)
-    #[arg(long)]
+    #[arg(long, env = "CRACK_AGENT_SERVER")]
     pub server: String,
 
     /// Worker name (defaults to hostname)
@@ -37,12 +55,16 @@ pub struct RunConfig {
     pub name: Option<String>,
 
     /// Data directory for keys and cache
-    #[arg(long, default_value_os_t = crack_common::auth::agent_data_dir())]
+    #[arg(long, env = "CRACK_AGENT_DATA_DIR", default_value_os_t = crack_common::auth::agent_data_dir())]
     pub data_dir: PathBuf,
 
     /// Path to the hashcat binary
     #[arg(long, default_value = "hashcat")]
     pub hashcat_path: String,
+
+    /// Run without TUI (log output only)
+    #[arg(long)]
+    pub headless: bool,
 }
 
 impl RunConfig {

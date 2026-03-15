@@ -42,6 +42,10 @@ pub enum WorkerMessage {
         os: String,
         devices: Vec<DeviceInfo>,
     },
+    Enroll {
+        nonce: String,
+        worker_name: String,
+    },
     Heartbeat,
     ChunkStarted {
         chunk_id: Uuid,

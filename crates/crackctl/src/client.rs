@@ -32,10 +32,46 @@ pub struct CreateTaskPayload {
     pub extra_args: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CampaignDetailResponse {
+    #[serde(flatten)]
+    pub campaign: Campaign,
+    pub phases: Vec<CampaignPhase>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateCampaignPayload {
+    pub name: String,
+    pub hash_mode: u32,
+    pub hash_file_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    pub priority: u8,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateCampaignPayload {
+    pub status: CampaignStatus,
+}
+
 #[derive(Debug, Serialize)]
 struct AuthorizeWorkerPayload {
     pub public_key: String,
     pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrollWorkerPayload {
+    pub name: String,
+    pub expires_minutes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnrollWorkerResponse {
+    pub token: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +207,116 @@ impl Client {
         Ok(results)
     }
 
+    // ── Campaigns ──
+
+    pub async fn create_campaign(&self, req: CreateCampaignPayload) -> Result<Campaign> {
+        let resp = self
+            .http
+            .post(self.url("/api/v1/campaigns"))
+            .json(&req)
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let campaign: Campaign = resp.json().await.context("failed to parse campaign response")?;
+        Ok(campaign)
+    }
+
+    pub async fn list_campaigns(&self) -> Result<Vec<Campaign>> {
+        let resp = self
+            .http
+            .get(self.url("/api/v1/campaigns"))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let campaigns: Vec<Campaign> = resp.json().await.context("failed to parse campaigns")?;
+        Ok(campaigns)
+    }
+
+    pub async fn get_campaign(&self, id: &str) -> Result<CampaignDetailResponse> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/api/v1/campaigns/{id}")))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let detail: CampaignDetailResponse = resp.json().await.context("failed to parse campaign detail")?;
+        Ok(detail)
+    }
+
+    pub async fn start_campaign(&self, id: &str) -> Result<Campaign> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/api/v1/campaigns/{id}/start")))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let campaign: Campaign = resp.json().await.context("failed to parse campaign")?;
+        Ok(campaign)
+    }
+
+    pub async fn cancel_campaign(&self, id: &str) -> Result<()> {
+        let payload = UpdateCampaignPayload {
+            status: CampaignStatus::Cancelled,
+        };
+
+        let resp = self
+            .http
+            .patch(self.url(&format!("/api/v1/campaigns/{id}")))
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    pub async fn delete_campaign(&self, id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/api/v1/campaigns/{id}")))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    pub async fn get_campaign_results(&self, id: &str) -> Result<Vec<CrackedHash>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/api/v1/campaigns/{id}/results")))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let results: Vec<CrackedHash> = resp.json().await.context("failed to parse results")?;
+        Ok(results)
+    }
+
+    pub async fn list_templates(&self) -> Result<Vec<CampaignTemplate>> {
+        let resp = self
+            .http
+            .get(self.url("/api/v1/campaigns/templates"))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let templates: Vec<CampaignTemplate> = resp.json().await.context("failed to parse templates")?;
+        Ok(templates)
+    }
+
     // ── Files ──
 
     pub async fn upload_file(&self, path: &Path, file_type: &str) -> Result<FileRecord> {
@@ -249,6 +395,25 @@ impl Client {
 
         Self::check(resp).await?;
         Ok(())
+    }
+
+    pub async fn enroll_worker(&self, name: &str, expires_minutes: u64) -> Result<EnrollWorkerResponse> {
+        let payload = EnrollWorkerPayload {
+            name: name.to_string(),
+            expires_minutes,
+        };
+
+        let resp = self
+            .http
+            .post(self.url("/api/v1/workers/enroll"))
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+
+        let resp = Self::check(resp).await?;
+        let enroll_resp: EnrollWorkerResponse = resp.json().await.context("failed to parse enroll response")?;
+        Ok(enroll_resp)
     }
 
     // ── System / Potfile ──

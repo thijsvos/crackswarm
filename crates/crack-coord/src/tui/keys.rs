@@ -18,11 +18,15 @@ pub enum KeyAction {
     Tab2,
     Tab3,
     Tab4,
+    Tab5,
     Escape,
+    EnterCommand,
+    EnterSearch,
     None,
 }
 
 /// Map a key event to a key action (vim-style keybindings).
+/// Only used in Normal mode — Command/Search modes handle keys directly.
 pub fn map_key(key: KeyEvent) -> KeyAction {
     match key.code {
         KeyCode::Char('q') if key.modifiers.is_empty() => KeyAction::Quit,
@@ -41,6 +45,9 @@ pub fn map_key(key: KeyEvent) -> KeyAction {
         KeyCode::Char('2') => KeyAction::Tab2,
         KeyCode::Char('3') => KeyAction::Tab3,
         KeyCode::Char('4') => KeyAction::Tab4,
+        KeyCode::Char('5') => KeyAction::Tab5,
+        KeyCode::Char(':') => KeyAction::EnterCommand,
+        KeyCode::Char('/') => KeyAction::EnterSearch,
         KeyCode::Esc => KeyAction::Escape,
         _ => KeyAction::None,
     }

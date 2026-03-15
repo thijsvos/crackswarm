@@ -18,6 +18,9 @@ pub struct AppState {
     /// Path to the hashcat binary (for keyspace computation).
     pub hashcat_path: String,
 
+    /// Worker Noise transport bind address (included in enrollment tokens).
+    pub bind_addr: String,
+
     /// Connected workers: worker_id → sender for Noise messages.
     pub worker_connections: RwLock<HashMap<String, WorkerConnection>>,
 
@@ -43,16 +46,20 @@ pub enum AppEvent {
     HashCracked { task_id: Uuid, hash: String },
     TaskCompleted { task_id: Uuid },
     AuditEntry { event_type: String, details: String },
+    CampaignCreated { campaign_id: Uuid },
+    CampaignPhaseAdvanced { campaign_id: Uuid, phase_index: u32 },
+    CampaignCompleted { campaign_id: Uuid },
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, data_dir: PathBuf, keypair: Keypair, hashcat_path: String) -> Arc<Self> {
+    pub fn new(db: SqlitePool, data_dir: PathBuf, keypair: Keypair, hashcat_path: String, bind_addr: String) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             db,
             data_dir,
             keypair,
             hashcat_path,
+            bind_addr,
             worker_connections: RwLock::new(HashMap::new()),
             events,
         })

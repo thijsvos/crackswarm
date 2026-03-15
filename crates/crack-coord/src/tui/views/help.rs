@@ -11,7 +11,7 @@ use crate::tui::theme::Theme;
 /// Render the help overlay.
 pub fn render_help(f: &mut Frame, area: Rect) {
     // Center the help popup
-    let popup = centered_rect(60, 70, area);
+    let popup = centered_rect(65, 80, area);
 
     let help_text = vec![
         Line::from(Span::styled(
@@ -21,6 +21,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::default(),
+        section_header("Navigation"),
         help_line("j / ↓", "Move down"),
         help_line("k / ↑", "Move up"),
         help_line("g", "Go to top"),
@@ -28,17 +29,25 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         help_line("Ctrl+d", "Page down"),
         help_line("Ctrl+u", "Page up"),
         Line::default(),
+        section_header("Panels & Tabs"),
         help_line("Tab", "Switch panel focus"),
         help_line("Shift+Tab", "Switch panel focus (reverse)"),
+        help_line("1-5", "Jump to tab"),
         help_line("Enter", "Select item"),
         Line::default(),
-        help_line("1", "Tasks tab"),
-        help_line("2", "Workers tab"),
-        help_line("3", "Results tab"),
-        help_line("4", "Audit Log tab"),
+        section_header("Search & Commands"),
+        help_line("/", "Search / filter current list"),
+        help_line(":", "Enter command mode"),
+        help_line("Esc", "Cancel search/command, clear filter"),
         Line::default(),
+        section_header("Commands (via :)"),
+        help_line(":cancel", "Cancel selected task/campaign"),
+        help_line(":start", "Start selected campaign"),
+        help_line(":delete", "Delete selected task"),
+        help_line(":quit", "Quit"),
+        Line::default(),
+        section_header("Other"),
         help_line("?", "Toggle help"),
-        help_line("Esc", "Close help / back"),
         help_line("q", "Quit"),
     ];
 
@@ -52,6 +61,15 @@ pub fn render_help(f: &mut Frame, area: Rect) {
 
     let paragraph = Paragraph::new(help_text).block(block);
     f.render_widget(paragraph, popup);
+}
+
+fn section_header(title: &str) -> Line<'_> {
+    Line::from(Span::styled(
+        format!("  {title}"),
+        Style::default()
+            .fg(Theme::LAVENDER)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn help_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {

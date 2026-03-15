@@ -32,6 +32,10 @@ pub async fn run_monitor(state: Arc<AppState>) {
         if let Err(e) = reassign_abandoned_chunks(&state).await {
             warn!("chunk reassignment error: {e}");
         }
+
+        if let Err(e) = crate::campaign::check_campaign_progress(&state).await {
+            warn!("campaign progress check error: {e}");
+        }
     }
 }
 
@@ -162,7 +166,7 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
-    let abandoned = db::get_abandoned_chunks(&state.db, 120).await?;
+    let abandoned = db::get_abandoned_chunks(&state.db, 45).await?;
 
     for chunk in abandoned {
         // Calculate remaining work

@@ -20,7 +20,20 @@ pub fn render_results(f: &mut Frame, area: Rect, state: &TuiState) {
                 r.hash.clone()
             };
             let time = r.cracked_at.format("%Y-%m-%d %H:%M").to_string();
+            let task_name = state
+                .tasks
+                .iter()
+                .find(|t| t.id == r.task_id)
+                .map(|t| {
+                    if t.name.len() > 16 {
+                        format!("{}...", &t.name[..13])
+                    } else {
+                        t.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| r.task_id.to_string()[..8].to_string());
             Row::new(vec![
+                task_name,
                 hash_display,
                 r.plaintext.clone(),
                 r.worker_id.chars().take(8).collect::<String>(),
@@ -33,14 +46,15 @@ pub fn render_results(f: &mut Frame, area: Rect, state: &TuiState) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(35),
-            Constraint::Percentage(25),
             Constraint::Percentage(15),
-            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
+            Constraint::Percentage(12),
+            Constraint::Percentage(23),
         ],
     )
     .header(
-        Row::new(vec!["Hash", "Plaintext", "Worker", "Cracked At"])
+        Row::new(vec!["Task", "Hash", "Plaintext", "Worker", "Cracked At"])
             .style(
                 Style::default()
                     .fg(Theme::MAUVE)

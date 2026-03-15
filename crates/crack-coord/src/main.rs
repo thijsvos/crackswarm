@@ -1,4 +1,5 @@
 mod api;
+mod campaign;
 mod config;
 mod monitor;
 mod scheduler;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::{error, info};
 
-use config::{Cli, Commands};
+use config::{Cli, Commands, RunConfig};
 use crack_common::auth::{self, Keypair};
 
 #[tokio::main]
@@ -29,8 +30,8 @@ async fn main() -> anyhow::Result<()> {
             headless,
             hashcat_path,
         } => {
-            cmd_run(data_dir, bind, api_bind, with_agent, headless, hashcat_path)
-                .await
+            let config = RunConfig::from_cli(data_dir, bind, api_bind, with_agent, headless, hashcat_path);
+            cmd_run(config).await
         }
     }
 }
@@ -63,14 +64,9 @@ async fn cmd_init(data_dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_run(
-    data_dir: std::path::PathBuf,
-    bind: String,
-    api_bind: String,
-    with_agent: bool,
-    headless: bool,
-    hashcat_path: Option<std::path::PathBuf>,
-) -> anyhow::Result<()> {
+async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
+    let RunConfig { data_dir, bind, api_bind, with_agent, headless, hashcat_path } = config;
+
     // Init logging (to stderr so it doesn't interfere with TUI)
     if headless {
         tracing_subscriber::fmt()
@@ -80,21 +76,39 @@ async fn cmd_run(
             )
             .init();
     } else {
-        // When TUI is active, only log errors to stderr to avoid interference
+        // When TUI is active, log to a file to avoid corrupting the terminal
+        let log_file = std::fs::File::create(data_dir.join("crack-coord.log"))
+            .expect("failed to create log file");
         tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("error"))
-            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
             .init();
     }
 
-    // Load keypair
-    let keypair = Keypair::load_from_dir(&data_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load keypair from {}: {}. Run 'crack-coord init' first.",
-            data_dir.display(),
-            e
-        )
-    })?;
+    // Auto-init: generate keypair + files dir if not present
+    let keypair = if data_dir.join("private.key").exists() {
+        Keypair::load_from_dir(&data_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load keypair from {}: {}",
+                data_dir.display(),
+                e
+            )
+        })?
+    } else {
+        info!("No keypair found, auto-initializing coordinator in {}...", data_dir.display());
+        let kp = Keypair::generate()?;
+        kp.save_to_dir(&data_dir)?;
+        std::fs::create_dir_all(data_dir.join("files"))?;
+        info!("Auto-initialized. Public key: {}", kp.public_key_b64());
+        kp
+    };
+
+    // Ensure files directory exists
+    std::fs::create_dir_all(data_dir.join("files"))?;
 
     info!("Coordinator public key: {}", keypair.public_key_b64());
 
@@ -109,7 +123,7 @@ async fn cmd_run(
         .unwrap_or_else(|| "hashcat".to_string());
 
     // Create shared state
-    let state = state::AppState::new(db, data_dir.clone(), keypair, hc_path_str.clone());
+    let state = state::AppState::new(db, data_dir.clone(), keypair, hc_path_str.clone(), bind.clone());
 
     // Audit log: coordinator started
     let _ = storage::db::insert_audit(
@@ -150,8 +164,20 @@ async fn cmd_run(
         monitor::run_monitor(monitor_state).await;
     });
 
-    // Optionally start a local agent
+    // Optionally start a local agent (pre-check hashcat availability)
     if with_agent {
+        match crack_agent::status::detect_hashcat(&hc_path_str).await {
+            Ok(version) => {
+                info!("Built-in agent hashcat: {version}");
+            }
+            Err(e) => {
+                eprintln!("WARNING: --with-agent requires hashcat but it was not found.");
+                eprintln!("  {e}");
+                eprintln!("  Install hashcat or specify: --hashcat-path /path/to/hashcat");
+                eprintln!("  The coordinator will still run (remote workers can connect).");
+                eprintln!();
+            }
+        }
         let agent_state = Arc::clone(&state);
         let hc_path = hc_path_str.clone();
         let coord_bind = bind.clone();
@@ -226,9 +252,10 @@ async fn cmd_run(
                 name: Some("built-in-agent".to_string()),
                 data_dir: agent_data_dir,
                 hashcat_path: hc_path,
+                headless: true,
             };
 
-            if let Err(e) = crack_agent::connection::run_connection(&run_config).await {
+            if let Err(e) = crack_agent::connection::run_connection(&run_config, None).await {
                 error!("Built-in agent error: {e}");
             }
         });
