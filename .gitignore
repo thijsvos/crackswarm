@@ -14,11 +14,13 @@
 /crack-coord
 /crackctl
 
-# Test artifacts
+# Test artifacts and hash files
 /test-data
 /test_hashes.txt
 /test_ntlm_hashes.txt
 /test_campaign.sh
+/testdata.txt
+*.example.txt
 
 # IDE
 .idea/
