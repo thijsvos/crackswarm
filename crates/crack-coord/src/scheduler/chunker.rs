@@ -183,6 +183,8 @@ fn custom_charset_size(idx: usize, custom_charsets: Option<&[String]>) -> anyhow
 /// - Otherwise, divide the keyspace evenly across workers with a 4x multiplier for
 ///   granularity: `total_keyspace / (num_workers * 4)`.
 /// - The result is clamped to `[10_000, total_keyspace]`.
+/// - Additionally, when the speed-based chunk exceeds the remaining keyspace divided
+///   by the number of workers, we cap it to ensure all workers get a share.
 pub fn calculate_chunk_size(
     worker_speed: Option<u64>,
     total_keyspace: u64,
@@ -194,6 +196,16 @@ pub fn calculate_chunk_size(
         speed.saturating_mul(600)
     } else {
         total_keyspace / (num_workers.max(1) as u64 * 4)
+    };
+
+    // When multiple workers are available, cap the chunk so each worker gets
+    // a fair share of the remaining keyspace rather than one worker consuming
+    // it all in a single chunk.
+    let fair_share = total_keyspace / num_workers.max(1) as u64;
+    let raw = if num_workers > 1 && raw > fair_share && fair_share >= MIN_CHUNK {
+        fair_share
+    } else {
+        raw
     };
 
     // Clamp: at least MIN_CHUNK but never exceed total_keyspace.
@@ -270,8 +282,32 @@ mod tests {
     #[test]
     fn chunk_size_with_speed() {
         // 1 million hashes/sec * 600 = 600 million
+        // total_keyspace = 10B, 4 workers → fair_share = 2.5B > 600M, so speed wins
         let size = calculate_chunk_size(Some(1_000_000), 10_000_000_000, 4);
         assert_eq!(size, 600_000_000);
+    }
+
+    #[test]
+    fn chunk_size_fair_share_caps_fast_worker() {
+        // Speed-based: 15 GH/s * 600 = 9 trillion — way more than total keyspace
+        // With 2 workers, fair_share = 50M, which is >= MIN_CHUNK
+        // So chunk should be 50M, not 100M
+        let size = calculate_chunk_size(Some(15_000_000_000), 100_000_000, 2);
+        assert_eq!(size, 50_000_000);
+    }
+
+    #[test]
+    fn chunk_size_fair_share_not_applied_single_worker() {
+        // With only 1 worker, fair_share logic doesn't kick in
+        let size = calculate_chunk_size(Some(15_000_000_000), 100_000_000, 1);
+        assert_eq!(size, 100_000_000);
+    }
+
+    #[test]
+    fn chunk_size_fair_share_too_small_skipped() {
+        // fair_share = 2500, below MIN_CHUNK, so we fall back to normal clamping
+        let size = calculate_chunk_size(Some(1_000_000), 5_000, 2);
+        assert_eq!(size, 5_000);
     }
 
     #[test]

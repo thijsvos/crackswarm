@@ -67,6 +67,9 @@ async fn cmd_init(data_dir: &std::path::Path) -> anyhow::Result<()> {
 async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     let RunConfig { data_dir, bind, api_bind, with_agent, headless, hashcat_path } = config;
 
+    // Ensure data directory exists before anything else
+    std::fs::create_dir_all(&data_dir)?;
+
     // Init logging (to stderr so it doesn't interfere with TUI)
     if headless {
         tracing_subscriber::fmt()
