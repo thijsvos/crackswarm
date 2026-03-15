@@ -5,24 +5,25 @@ Distributed hashcat orchestration tool. Splits cracking work across GPU workers 
 ## Architecture
 
 ```
-                    crackctl (CLI)
-                        |
-                    REST API (127.0.0.1)
-                        |
-  ┌─────────────────────┴─────────────────────┐
-  │            crack-coord                     │
-  │  ┌────────┐ ┌──────────┐ ┌─────────────┐  │
-  │  │Scheduler│ │ SQLite DB│ │ TUI Dashboard│  │
-  │  └────┬───┘ └──────────┘ └─────────────┘  │
-  │       │                                    │
-  │    Noise IK encrypted TCP                  │
-  └───────┼────────────────┬───────────────────┘
-          │                │
-    ┌─────┴─────┐    ┌─────┴─────┐
-    │crack-agent│    │crack-agent│    ...
-    │  hashcat  │    │  hashcat  │
-    │  GPU(s)   │    │  GPU(s)   │
-    └───────────┘    └───────────┘
+                 crackctl (CLI)
+                      |
+              REST API (127.0.0.1)
+                      |
+  ┌───────────────────┴───────────────────┐
+  │            crack-coord                │
+  │                                       │
+  │  ┌──────────┐ ┌────────┐ ┌─────────┐ │
+  │  │ Scheduler │ │ SQLite │ │   TUI   │ │
+  │  └──────────┘ └────────┘ └─────────┘ │
+  │                                       │
+  │        Noise IK encrypted TCP         │
+  └──────────┬───────────────┬────────────┘
+             │               │
+     ┌───────┴───────┐ ┌────┴──────────┐
+     │  crack-agent  │ │  crack-agent  │  ...
+     │    hashcat    │ │    hashcat    │
+     │    GPU(s)     │ │    GPU(s)     │
+     └───────────────┘ └───────────────┘
 ```
 
 | Binary | Role |
