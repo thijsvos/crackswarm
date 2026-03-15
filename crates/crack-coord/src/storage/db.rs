@@ -619,11 +619,15 @@ pub async fn get_pending_chunks(pool: &SqlitePool, task_id: Uuid, limit: u32) ->
 pub async fn get_abandoned_chunks(pool: &SqlitePool, timeout_secs: i64) -> Result<Vec<Chunk>> {
     let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
 
+    // Only consider chunks abandoned if the assigned worker is disconnected.
+    // Active workers with long-running chunks should not have their work stolen.
     let rows = sqlx::query(
-        "SELECT * FROM chunks
-         WHERE status IN ('dispatched', 'running')
-           AND assigned_at < ?1
-         ORDER BY assigned_at ASC"
+        "SELECT c.* FROM chunks c
+         JOIN workers w ON c.assigned_worker = w.id
+         WHERE c.status IN ('dispatched', 'running')
+           AND c.assigned_at < ?1
+           AND w.status = 'disconnected'
+         ORDER BY c.assigned_at ASC"
     )
     .bind(&cutoff)
     .fetch_all(pool)
