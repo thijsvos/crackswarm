@@ -140,3 +140,480 @@ pub fn decode_message<T: for<'de> Deserialize<'de>>(
     let msg: T = serde_json::from_slice(&buf[4..4 + len])?;
     Ok(Some((msg, 4 + len)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::DeviceInfo;
+    use uuid::Uuid;
+
+    // ── CoordMessage round-trips ──
+
+    #[test]
+    fn roundtrip_welcome() {
+        let msg = CoordMessage::Welcome {
+            worker_id: "test-123".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::Welcome { worker_id } => assert_eq!(worker_id, "test-123"),
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_transfer_file_chunk() {
+        let msg = CoordMessage::TransferFileChunk {
+            file_id: "file-abc".to_string(),
+            filename: "rockyou.txt".to_string(),
+            chunk_index: 3,
+            total_chunks: 10,
+            data_b64: "SGVsbG8gV29ybGQ=".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::TransferFileChunk {
+                file_id,
+                filename,
+                chunk_index,
+                total_chunks,
+                data_b64,
+            } => {
+                assert_eq!(file_id, "file-abc");
+                assert_eq!(filename, "rockyou.txt");
+                assert_eq!(chunk_index, 3);
+                assert_eq!(total_chunks, 10);
+                assert_eq!(data_b64, "SGVsbG8gV29ybGQ=");
+            }
+            other => panic!("expected TransferFileChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_assign_chunk_brute_force() {
+        let chunk_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let msg = CoordMessage::AssignChunk {
+            chunk_id,
+            task_id,
+            hash_mode: 1000,
+            hash_file_b64: "aGFzaGVz".to_string(),
+            hash_file_id: "hf-001".to_string(),
+            skip: 0,
+            limit: 50000,
+            attack: AssignChunkAttack::BruteForce {
+                mask: "?a?a?a?a".to_string(),
+                custom_charsets: Some(vec!["?l?d".to_string()]),
+            },
+            extra_args: vec!["--force".to_string()],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::AssignChunk {
+                chunk_id: cid,
+                task_id: tid,
+                hash_mode,
+                hash_file_b64,
+                hash_file_id,
+                skip,
+                limit,
+                attack,
+                extra_args,
+            } => {
+                assert_eq!(cid, chunk_id);
+                assert_eq!(tid, task_id);
+                assert_eq!(hash_mode, 1000);
+                assert_eq!(hash_file_b64, "aGFzaGVz");
+                assert_eq!(hash_file_id, "hf-001");
+                assert_eq!(skip, 0);
+                assert_eq!(limit, 50000);
+                match attack {
+                    AssignChunkAttack::BruteForce {
+                        mask,
+                        custom_charsets,
+                    } => {
+                        assert_eq!(mask, "?a?a?a?a");
+                        assert_eq!(custom_charsets, Some(vec!["?l?d".to_string()]));
+                    }
+                    other => panic!("expected BruteForce, got {other:?}"),
+                }
+                assert_eq!(extra_args, vec!["--force".to_string()]);
+            }
+            other => panic!("expected AssignChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_assign_chunk_dictionary() {
+        let chunk_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let msg = CoordMessage::AssignChunk {
+            chunk_id,
+            task_id,
+            hash_mode: 0,
+            hash_file_b64: "dGVzdA==".to_string(),
+            hash_file_id: "hf-002".to_string(),
+            skip: 100,
+            limit: 200,
+            attack: AssignChunkAttack::Dictionary {
+                wordlist_file_id: "wl-001".to_string(),
+            },
+            extra_args: vec![],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::AssignChunk { attack, .. } => match attack {
+                AssignChunkAttack::Dictionary { wordlist_file_id } => {
+                    assert_eq!(wordlist_file_id, "wl-001");
+                }
+                other => panic!("expected Dictionary, got {other:?}"),
+            },
+            other => panic!("expected AssignChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_assign_chunk_dict_rules() {
+        let chunk_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let msg = CoordMessage::AssignChunk {
+            chunk_id,
+            task_id,
+            hash_mode: 1000,
+            hash_file_b64: "cnVsZXM=".to_string(),
+            hash_file_id: "hf-003".to_string(),
+            skip: 0,
+            limit: 999,
+            attack: AssignChunkAttack::DictionaryWithRules {
+                wordlist_file_id: "wl-002".to_string(),
+                rules_file_id: "rl-001".to_string(),
+            },
+            extra_args: vec![],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::AssignChunk { attack, .. } => match attack {
+                AssignChunkAttack::DictionaryWithRules {
+                    wordlist_file_id,
+                    rules_file_id,
+                } => {
+                    assert_eq!(wordlist_file_id, "wl-002");
+                    assert_eq!(rules_file_id, "rl-001");
+                }
+                other => panic!("expected DictionaryWithRules, got {other:?}"),
+            },
+            other => panic!("expected AssignChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_abort_chunk() {
+        let id = Uuid::new_v4();
+        let msg = CoordMessage::AbortChunk { chunk_id: id };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::AbortChunk { chunk_id } => assert_eq!(chunk_id, id),
+            other => panic!("expected AbortChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shutdown() {
+        let msg = CoordMessage::Shutdown;
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(matches!(decoded, CoordMessage::Shutdown));
+    }
+
+    // ── WorkerMessage round-trips ──
+
+    #[test]
+    fn roundtrip_register() {
+        let msg = WorkerMessage::Register {
+            worker_name: "gpu-node-1".to_string(),
+            hashcat_version: "6.2.6".to_string(),
+            os: "Linux".to_string(),
+            devices: vec![DeviceInfo {
+                id: 1,
+                name: "RTX 4090".to_string(),
+                device_type: "GPU".to_string(),
+                speed: Some(100_000_000),
+            }],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::Register {
+                worker_name,
+                hashcat_version,
+                os,
+                devices,
+            } => {
+                assert_eq!(worker_name, "gpu-node-1");
+                assert_eq!(hashcat_version, "6.2.6");
+                assert_eq!(os, "Linux");
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].name, "RTX 4090");
+                assert_eq!(devices[0].speed, Some(100_000_000));
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_enroll() {
+        let msg = WorkerMessage::Enroll {
+            nonce: "abcdef0123456789".to_string(),
+            worker_name: "worker-1".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::Enroll { nonce, worker_name } => {
+                assert_eq!(nonce, "abcdef0123456789");
+                assert_eq!(worker_name, "worker-1");
+            }
+            other => panic!("expected Enroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_heartbeat() {
+        let msg = WorkerMessage::Heartbeat;
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(matches!(decoded, WorkerMessage::Heartbeat));
+    }
+
+    #[test]
+    fn roundtrip_chunk_progress() {
+        let id = Uuid::new_v4();
+        let msg = WorkerMessage::ChunkProgress {
+            chunk_id: id,
+            progress_pct: 45.7,
+            speed: 500_000,
+            estimated_remaining_secs: Some(120),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::ChunkProgress {
+                chunk_id,
+                progress_pct,
+                speed,
+                estimated_remaining_secs,
+            } => {
+                assert_eq!(chunk_id, id);
+                assert!((progress_pct - 45.7).abs() < f64::EPSILON);
+                assert_eq!(speed, 500_000);
+                assert_eq!(estimated_remaining_secs, Some(120));
+            }
+            other => panic!("expected ChunkProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_hash_cracked() {
+        let chunk_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let msg = WorkerMessage::HashCracked {
+            chunk_id,
+            task_id,
+            hash: "5f4dcc3b5aa765d61d8327deb882cf99".to_string(),
+            plaintext: "password".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::HashCracked {
+                chunk_id: cid,
+                task_id: tid,
+                hash,
+                plaintext,
+            } => {
+                assert_eq!(cid, chunk_id);
+                assert_eq!(tid, task_id);
+                assert_eq!(hash, "5f4dcc3b5aa765d61d8327deb882cf99");
+                assert_eq!(plaintext, "password");
+            }
+            other => panic!("expected HashCracked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_chunk_completed() {
+        let id = Uuid::new_v4();
+        let msg = WorkerMessage::ChunkCompleted {
+            chunk_id: id,
+            exit_code: 0,
+            total_cracked: 42,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::ChunkCompleted {
+                chunk_id,
+                exit_code,
+                total_cracked,
+            } => {
+                assert_eq!(chunk_id, id);
+                assert_eq!(exit_code, 0);
+                assert_eq!(total_cracked, 42);
+            }
+            other => panic!("expected ChunkCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_chunk_failed_with_exit_code() {
+        let id = Uuid::new_v4();
+        let msg = WorkerMessage::ChunkFailed {
+            chunk_id: id,
+            error: "GPU memory error".to_string(),
+            exit_code: Some(-1),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::ChunkFailed {
+                chunk_id,
+                error,
+                exit_code,
+            } => {
+                assert_eq!(chunk_id, id);
+                assert_eq!(error, "GPU memory error");
+                assert_eq!(exit_code, Some(-1));
+            }
+            other => panic!("expected ChunkFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_chunk_failed_no_exit_code() {
+        let id = Uuid::new_v4();
+        let msg = WorkerMessage::ChunkFailed {
+            chunk_id: id,
+            error: "process killed".to_string(),
+            exit_code: None,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::ChunkFailed {
+                exit_code, error, ..
+            } => {
+                assert_eq!(exit_code, None);
+                assert_eq!(error, "process killed");
+            }
+            other => panic!("expected ChunkFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_benchmark_result() {
+        let msg = WorkerMessage::BenchmarkResult {
+            hash_mode: 1000,
+            speed: 5_000_000_000,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::BenchmarkResult { hash_mode, speed } => {
+                assert_eq!(hash_mode, 1000);
+                assert_eq!(speed, 5_000_000_000);
+            }
+            other => panic!("expected BenchmarkResult, got {other:?}"),
+        }
+    }
+
+    // ── Edge cases ──
+
+    #[test]
+    fn decode_empty_buffer() {
+        let result: crate::error::Result<Option<(CoordMessage, usize)>> = decode_message(&[]);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_partial_header() {
+        let result: crate::error::Result<Option<(CoordMessage, usize)>> =
+            decode_message(&[0, 0, 0]);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_truncated_payload() {
+        // Header says 100 bytes, but buffer only has 50 bytes after header
+        let mut buf = vec![0u8; 4 + 50];
+        buf[0..4].copy_from_slice(&100u32.to_be_bytes());
+        let result: crate::error::Result<Option<(CoordMessage, usize)>> = decode_message(&buf);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_oversized_message() {
+        let too_large = (MAX_MESSAGE_SIZE as u32) + 1;
+        let buf = too_large.to_be_bytes();
+        let result: crate::error::Result<Option<(CoordMessage, usize)>> = decode_message(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_two_messages() {
+        let msg1 = CoordMessage::Shutdown;
+        let msg2 = CoordMessage::Welcome {
+            worker_id: "w-2".to_string(),
+        };
+        let enc1 = encode_message(&msg1).unwrap();
+        let enc2 = encode_message(&msg2).unwrap();
+
+        let mut combined = enc1.clone();
+        combined.extend_from_slice(&enc2);
+
+        // Decode first message
+        let (decoded1, consumed1): (CoordMessage, usize) =
+            decode_message(&combined).unwrap().unwrap();
+        assert_eq!(consumed1, enc1.len());
+        assert!(matches!(decoded1, CoordMessage::Shutdown));
+
+        // Decode second message from remaining bytes
+        let (decoded2, consumed2): (CoordMessage, usize) =
+            decode_message(&combined[consumed1..]).unwrap().unwrap();
+        assert_eq!(consumed2, enc2.len());
+        match decoded2 {
+            CoordMessage::Welcome { worker_id } => assert_eq!(worker_id, "w-2"),
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+    }
+}
