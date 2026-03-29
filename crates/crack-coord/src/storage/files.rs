@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -66,6 +66,32 @@ pub fn read_file(files_dir: &Path, file_id: &str) -> Result<Vec<u8>> {
                 if name.starts_with(&prefix) {
                     return std::fs::read(entry.path())
                         .with_context(|| format!("reading file {}", entry.path().display()));
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("file not found: {file_id} in {}", files_dir.display())
+}
+
+/// Resolve a file_id to its full path on disk.
+///
+/// Tries the bare file_id first, then falls back to any file whose name starts with the file_id
+/// (to handle files stored with an extension).
+pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
+    // Try exact match first
+    let exact = files_dir.join(file_id);
+    if exact.is_file() {
+        return Ok(exact);
+    }
+
+    // Fall back: look for file_id.* (with extension)
+    let prefix = format!("{file_id}.");
+    if let Ok(entries) = std::fs::read_dir(files_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(&prefix) {
+                    return Ok(entry.path());
                 }
             }
         }

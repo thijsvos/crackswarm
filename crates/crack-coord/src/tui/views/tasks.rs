@@ -72,6 +72,8 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let status_str = task.status.to_string();
     let attack_str = match &task.attack_config {
         AttackConfig::BruteForce { mask, .. } => format!("Brute Force: {mask}"),
+        AttackConfig::Dictionary { wordlist_file_id } => format!("Dictionary: {}", &wordlist_file_id[..8.min(wordlist_file_id.len())]),
+        AttackConfig::DictionaryWithRules { wordlist_file_id, .. } => format!("Dict+Rules: {}", &wordlist_file_id[..8.min(wordlist_file_id.len())]),
     };
 
     let progress_pct = if let Some(ks) = task.total_keyspace {

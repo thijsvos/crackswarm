@@ -9,6 +9,8 @@ Distributed hashcat orchestration tool. Splits cracking work across GPU workers 
 ## Features
 
 - **Distributed cracking** -- coordinate hashcat across multiple GPU workers from a single dashboard
+- **Multiple attack modes** -- brute-force/mask, dictionary, and dictionary+rules attacks
+- **Bundled rules** -- includes [OneRuleToRuleThemStill](https://github.com/stealthsploit/OneRuleToRuleThemStill) (48K rules by [Will Hunt](https://github.com/stealthsploit), MIT license)
 - **Noise IK encryption** -- all worker traffic is end-to-end encrypted (WireGuard-grade, via `snow`)
 - **Live TUI dashboards** -- real-time progress on both coordinator and agents with vim keybindings
 - **Multi-phase campaigns** -- chain attack phases together; uncracked hashes roll forward automatically
@@ -110,6 +112,34 @@ crack-agent run --server <coord-ip>:8443
 
 Workers reconnect automatically with exponential backoff (1s to 60s) if the connection drops.
 
+### Dictionary Attacks
+
+Upload a wordlist and create a dictionary task:
+
+```bash
+# Upload a wordlist
+crackctl file upload rockyou.txt --type wordlist
+
+# Dictionary attack (hashcat -a 0)
+crackctl task create --name "Dict attack" --hash-mode 1000 \
+  --hash-file <hash-id> --wordlist <wordlist-id>
+```
+
+### Dictionary with Rules
+
+The `rules/` directory includes [OneRuleToRuleThemStill](https://github.com/stealthsploit/OneRuleToRuleThemStill) -- an optimized rule set of 48,439 rules by [Will Hunt (@stealthsploit)](https://github.com/stealthsploit), MIT licensed. Upload it and combine with a wordlist:
+
+```bash
+# Upload rules file
+crackctl file upload rules/OneRuleToRuleThemStill.rule --type rules
+
+# Dictionary + rules attack
+crackctl task create --name "Dict+OTRTS" --hash-mode 1000 \
+  --hash-file <hash-id> --wordlist <wordlist-id> --rules-file <rules-id>
+```
+
+Wordlist and rules files are transferred to workers over the encrypted Noise channel and cached locally. Files are sent in ~40KB chunks and only transferred once per worker.
+
 ## TUI Dashboard
 
 ### Coordinator
@@ -203,7 +233,9 @@ Tasks:
     --name <name>                  Task name (required)
     --hash-mode <mode>             Hashcat hash mode (required)
     --hash-file <id>               Hash file ID (required)
-    --mask <mask>                  Attack mask, e.g. '?a?a?a?a' (required)
+    --mask <mask>                  Attack mask for brute-force (mutually exclusive with --wordlist)
+    --wordlist <id>                Wordlist file ID for dictionary attacks
+    --rules-file <id>              Rules file ID (requires --wordlist)
     --charset1..4 <chars>          Custom charsets for ?1..?4
     --priority <1-10>              Task priority (default: 5)
     --extra-args <args>            Additional hashcat arguments

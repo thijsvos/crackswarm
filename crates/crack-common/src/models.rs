@@ -72,6 +72,13 @@ pub enum AttackConfig {
         mask: String,
         custom_charsets: Option<Vec<String>>,
     },
+    Dictionary {
+        wordlist_file_id: String,
+    },
+    DictionaryWithRules {
+        wordlist_file_id: String,
+        rules_file_id: String,
+    },
 }
 
 // ── Chunk ──

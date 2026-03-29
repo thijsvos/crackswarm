@@ -126,6 +126,15 @@ pub fn print_task_detail(task: &Task, chunks: &[Chunk]) {
                 }
             }
         }
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            println!("  Attack:      dictionary");
+            println!("  Wordlist:    {wordlist_file_id}");
+        }
+        AttackConfig::DictionaryWithRules { wordlist_file_id, rules_file_id } => {
+            println!("  Attack:      dictionary + rules");
+            println!("  Wordlist:    {wordlist_file_id}");
+            println!("  Rules:       {rules_file_id}");
+        }
     }
 
     if let Some(ks) = task.total_keyspace {

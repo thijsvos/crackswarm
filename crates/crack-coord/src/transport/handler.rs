@@ -8,14 +8,16 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use std::collections::HashSet;
+
 use base64::Engine;
 use crack_common::auth::{build_responder, encode_public_key};
 use crack_common::models::*;
-use crack_common::protocol::{CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
+use crack_common::protocol::{AssignChunkAttack, CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
 
 use crate::scheduler;
 use crate::state::{AppEvent, AppState, WorkerConnection};
-use crate::storage::db;
+use crate::storage::{db, files};
 
 /// Maximum Noise transport message payload (just under the 65535 limit to
 /// leave room for the 16-byte AEAD tag that snow appends).
@@ -191,6 +193,9 @@ async fn run_connection(
     // We track the worker_id once the Register message arrives.
     let mut worker_id: Option<String> = None;
 
+    // Track which files have been transferred to this worker so we don't re-send.
+    let mut transferred_files: HashSet<String> = HashSet::new();
+
     // Reusable buffers.
     let mut read_buf = vec![0u8; 65535];
     let mut write_buf = vec![0u8; 65535];
@@ -232,6 +237,7 @@ async fn run_connection(
                     &pubkey_b64,
                     peer_addr,
                     &mut worker_id,
+                    &mut transferred_files,
                 ).await {
                     error!(%peer_addr, error = %e, "error handling worker message");
                 }
@@ -315,6 +321,7 @@ async fn handle_worker_message(
     pubkey_b64: &str,
     peer_addr: SocketAddr,
     worker_id: &mut Option<String>,
+    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     match msg {
         WorkerMessage::Register {
@@ -333,6 +340,7 @@ async fn handle_worker_message(
                 os,
                 devices,
                 worker_id,
+                transferred_files,
             )
             .await
         }
@@ -438,6 +446,7 @@ async fn handle_worker_message(
                 if let Some((task, new_chunk)) =
                     scheduler::assign_next_chunk(state, wid).await?
                 {
+                    send_attack_files(state, &task, outbound_tx, transferred_files).await?;
                     let msg = build_assign_chunk_msg(state, &task, &new_chunk)?;
                     let _ = outbound_tx.send(msg).await;
                 } else {
@@ -479,7 +488,7 @@ async fn handle_worker_message(
 
             // Try to assign next work to keep the worker busy.
             if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx).await?;
+                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
             }
             Ok(())
         }
@@ -489,7 +498,7 @@ async fn handle_worker_message(
                 db::upsert_benchmark(&state.db, wid, *hash_mode, *speed).await?;
 
                 // If the worker was idle, try to give it work now.
-                try_assign_work(state, wid, outbound_tx).await?;
+                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
             }
             Ok(())
         }
@@ -535,6 +544,7 @@ async fn handle_register(
     os: &str,
     devices: &[DeviceInfo],
     worker_id: &mut Option<String>,
+    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     // Look up or create the worker record by public key.
     let worker = db::get_or_create_worker(&state.db, pubkey_b64, worker_name).await?;
@@ -587,7 +597,7 @@ async fn handle_register(
     .await?;
 
     // Try to immediately assign work to the newly registered worker.
-    try_assign_work(state, &wid, outbound_tx).await?;
+    try_assign_work(state, &wid, outbound_tx, transferred_files).await?;
 
     Ok(())
 }
@@ -595,20 +605,33 @@ async fn handle_register(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Build a CoordMessage::AssignChunk with the hash file data embedded.
-fn build_assign_chunk_msg(
+pub(crate) fn build_assign_chunk_msg(
     state: &AppState,
     task: &Task,
     chunk: &Chunk,
 ) -> anyhow::Result<CoordMessage> {
-    let (mask, custom_charsets) = match &task.attack_config {
+    let attack = match &task.attack_config {
         AttackConfig::BruteForce {
             mask,
             custom_charsets,
-        } => (mask.clone(), custom_charsets.clone()),
+        } => AssignChunkAttack::BruteForce {
+            mask: mask.clone(),
+            custom_charsets: custom_charsets.clone(),
+        },
+        AttackConfig::Dictionary { wordlist_file_id } => AssignChunkAttack::Dictionary {
+            wordlist_file_id: wordlist_file_id.clone(),
+        },
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id,
+            rules_file_id,
+        } => AssignChunkAttack::DictionaryWithRules {
+            wordlist_file_id: wordlist_file_id.clone(),
+            rules_file_id: rules_file_id.clone(),
+        },
     };
 
     // Read the hash file and base64-encode it for transfer over the Noise channel.
-    let file_data = crate::storage::files::read_file(&state.files_dir(), &task.hash_file_id)
+    let file_data = files::read_file(&state.files_dir(), &task.hash_file_id)
         .context("reading hash file for chunk assignment")?;
     let hash_file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_data);
 
@@ -620,24 +643,109 @@ fn build_assign_chunk_msg(
         hash_file_id: task.hash_file_id.clone(),
         skip: chunk.skip,
         limit: chunk.limit,
-        mask,
-        custom_charsets,
+        attack,
         extra_args: task.extra_args.clone(),
     })
 }
 
+/// Stream a file to a worker in ~40KB chunks via TransferFileChunk messages.
+///
+/// Skips sending if the file has already been transferred to this worker
+/// (tracked via `transferred_files`).
+async fn send_file_to_worker(
+    state: &AppState,
+    file_id: &str,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    transferred_files: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    if transferred_files.contains(file_id) {
+        return Ok(());
+    }
+
+    let file_data = files::read_file(&state.files_dir(), file_id)
+        .with_context(|| format!("reading file {file_id} for transfer"))?;
+
+    // Look up the original filename from the DB (best-effort, fall back to file_id).
+    let filename = match db::get_file_record(&state.db, file_id).await? {
+        Some(record) => record.filename,
+        None => file_id.to_string(),
+    };
+
+    const CHUNK_SIZE: usize = 40 * 1024; // ~40 KB
+    let total_chunks = ((file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1) as u32;
+
+    for (i, chunk_data) in file_data.chunks(CHUNK_SIZE).enumerate() {
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(chunk_data);
+        let msg = CoordMessage::TransferFileChunk {
+            file_id: file_id.to_string(),
+            filename: filename.clone(),
+            chunk_index: i as u32,
+            total_chunks,
+            data_b64,
+        };
+        outbound_tx
+            .send(msg)
+            .await
+            .context("sending file transfer chunk to worker")?;
+    }
+
+    transferred_files.insert(file_id.to_string());
+    info!(file_id = %file_id, filename = %filename, size = file_data.len(), chunks = total_chunks, "transferred file to worker");
+    Ok(())
+}
+
 /// Try to assign the next pending chunk to a worker and send it via the
-/// outbound channel.
+/// outbound channel. Transfers any required files first.
 async fn try_assign_work(
     state: &Arc<AppState>,
     wid: &str,
     outbound_tx: &mpsc::Sender<CoordMessage>,
+    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     if let Some((task, chunk)) = scheduler::assign_next_chunk(state, wid).await? {
+        send_attack_files(state, &task, outbound_tx, transferred_files).await?;
         let msg = build_assign_chunk_msg(state, &task, &chunk)?;
         let _ = outbound_tx.send(msg).await;
     }
     Ok(())
+}
+
+/// If the task uses a dictionary or dictionary+rules attack, transfer the
+/// wordlist and rules files to the worker before sending the chunk assignment.
+async fn send_attack_files(
+    state: &AppState,
+    task: &Task,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    transferred_files: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    match &task.attack_config {
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
+        }
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id,
+            rules_file_id,
+        } => {
+            send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
+            send_file_to_worker(state, rules_file_id, outbound_tx, transferred_files).await?;
+        }
+        AttackConfig::BruteForce { .. } => {
+            // No extra files needed for brute-force.
+        }
+    }
+    Ok(())
+}
+
+/// Transfer attack files (wordlist, rules) to a worker via a raw `Sender`.
+/// Used by the monitor which doesn't track per-worker transferred files.
+/// The agent caches files, so duplicate sends are harmless.
+pub(crate) async fn send_attack_files_via_tx(
+    state: &AppState,
+    task: &Task,
+    tx: &mpsc::Sender<CoordMessage>,
+) -> anyhow::Result<()> {
+    let mut dummy = HashSet::new();
+    send_attack_files(state, task, tx, &mut dummy).await
 }
 
 /// Send AbortChunk to every connected worker that has running chunks on the

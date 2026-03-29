@@ -10,6 +10,16 @@ pub enum CoordMessage {
     Welcome {
         worker_id: String,
     },
+    /// Stream a file to the worker in chunks. The agent reconstructs
+    /// the file from ordered chunks and caches it by file_id.
+    TransferFileChunk {
+        file_id: String,
+        filename: String,
+        chunk_index: u32,
+        total_chunks: u32,
+        /// ~40KB of raw data, base64-encoded (fits in a single Noise frame).
+        data_b64: String,
+    },
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
@@ -19,8 +29,7 @@ pub enum CoordMessage {
         hash_file_id: String,
         skip: u64,
         limit: u64,
-        mask: String,
-        custom_charsets: Option<Vec<String>>,
+        attack: AssignChunkAttack,
         extra_args: Vec<String>,
     },
     AbortChunk {
@@ -30,6 +39,23 @@ pub enum CoordMessage {
         hash_mode: u32,
     },
     Shutdown,
+}
+
+/// Attack-specific fields for chunk assignment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AssignChunkAttack {
+    BruteForce {
+        mask: String,
+        custom_charsets: Option<Vec<String>>,
+    },
+    Dictionary {
+        wordlist_file_id: String,
+    },
+    DictionaryWithRules {
+        wordlist_file_id: String,
+        rules_file_id: String,
+    },
 }
 
 /// Messages sent from worker to coordinator over the Noise-encrypted channel.

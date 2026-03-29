@@ -338,6 +338,62 @@ async fn connect_and_run(
                         info!(worker_id = %wid, "received duplicate Welcome");
                     }
 
+                    CoordMessage::TransferFileChunk {
+                        file_id,
+                        filename,
+                        chunk_index,
+                        total_chunks,
+                        data_b64,
+                    } => {
+                        use std::collections::HashMap;
+                        // Decode chunk data
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(&data_b64)
+                            .context("failed to decode file chunk")?;
+
+                        // Use a simple approach: accumulate chunks in cache dir as partial files
+                        let cache_dir = config.cache_dir();
+                        tokio::fs::create_dir_all(&cache_dir).await?;
+                        let part_path = cache_dir.join(format!("{file_id}.part{chunk_index}"));
+                        tokio::fs::write(&part_path, &data).await?;
+
+                        // Check if all chunks received
+                        let mut all_received = true;
+                        for i in 0..total_chunks {
+                            if !cache_dir.join(format!("{file_id}.part{i}")).exists() {
+                                all_received = false;
+                                break;
+                            }
+                        }
+
+                        if all_received {
+                            // Reassemble
+                            let final_path = cache_dir.join(&file_id);
+                            let mut full_data = Vec::new();
+                            for i in 0..total_chunks {
+                                let p = cache_dir.join(format!("{file_id}.part{i}"));
+                                let chunk_data = tokio::fs::read(&p).await?;
+                                full_data.extend_from_slice(&chunk_data);
+                                let _ = tokio::fs::remove_file(&p).await;
+                            }
+                            tokio::fs::write(&final_path, &full_data).await?;
+                            info!(
+                                file_id = %file_id,
+                                filename = %filename,
+                                size = full_data.len(),
+                                chunks = total_chunks,
+                                "file transfer complete"
+                            );
+                        } else {
+                            debug!(
+                                file_id = %file_id,
+                                chunk = chunk_index,
+                                total = total_chunks,
+                                "received file chunk"
+                            );
+                        }
+                    }
+
                     CoordMessage::AssignChunk {
                         chunk_id,
                         task_id,
@@ -346,15 +402,22 @@ async fn connect_and_run(
                         hash_file_id,
                         skip,
                         limit,
-                        mask,
-                        custom_charsets,
+                        attack,
                         extra_args,
                     } => {
+                        use crack_common::protocol::AssignChunkAttack;
+
+                        let mask_display = match &attack {
+                            AssignChunkAttack::BruteForce { mask, .. } => mask.clone(),
+                            AssignChunkAttack::Dictionary { .. } => "dictionary".to_string(),
+                            AssignChunkAttack::DictionaryWithRules { .. } => "dict+rules".to_string(),
+                        };
+
                         info!(
                             chunk_id = %chunk_id,
                             task_id = %task_id,
                             hash_mode,
-                            mask = %mask,
+                            attack = %mask_display,
                             skip, limit,
                             "received chunk assignment"
                         );
@@ -363,7 +426,7 @@ async fn connect_and_run(
                             task_id,
                             chunk_id,
                             hash_mode,
-                            mask: mask.clone(),
+                            mask: mask_display,
                         });
 
                         // Decode hash file from the message and cache locally
@@ -373,16 +436,56 @@ async fn connect_and_run(
                         let outfile_path =
                             config.cache_dir().join(format!("out_{chunk_id}.txt"));
 
-                        let run_config = HashcatRunConfig {
-                            hashcat_path: config.hashcat_path.clone(),
-                            hash_file_path,
-                            hash_mode,
-                            mask,
-                            skip,
-                            limit,
-                            custom_charsets,
-                            extra_args,
-                            outfile_path,
+                        let cache_dir = config.cache_dir();
+                        let run_config = match attack {
+                            AssignChunkAttack::BruteForce { mask, custom_charsets } => {
+                                HashcatRunConfig {
+                                    hashcat_path: config.hashcat_path.clone(),
+                                    hash_file_path,
+                                    hash_mode,
+                                    attack_mode: 3,
+                                    mask: Some(mask),
+                                    skip,
+                                    limit,
+                                    custom_charsets,
+                                    wordlist_path: None,
+                                    rules_path: None,
+                                    extra_args,
+                                    outfile_path,
+                                }
+                            }
+                            AssignChunkAttack::Dictionary { wordlist_file_id } => {
+                                HashcatRunConfig {
+                                    hashcat_path: config.hashcat_path.clone(),
+                                    hash_file_path,
+                                    hash_mode,
+                                    attack_mode: 0,
+                                    mask: None,
+                                    skip,
+                                    limit,
+                                    custom_charsets: None,
+                                    wordlist_path: Some(cache_dir.join(&wordlist_file_id)),
+                                    rules_path: None,
+                                    extra_args,
+                                    outfile_path,
+                                }
+                            }
+                            AssignChunkAttack::DictionaryWithRules { wordlist_file_id, rules_file_id } => {
+                                HashcatRunConfig {
+                                    hashcat_path: config.hashcat_path.clone(),
+                                    hash_file_path,
+                                    hash_mode,
+                                    attack_mode: 0,
+                                    mask: None,
+                                    skip,
+                                    limit,
+                                    custom_charsets: None,
+                                    wordlist_path: Some(cache_dir.join(&wordlist_file_id)),
+                                    rules_path: Some(cache_dir.join(&rules_file_id)),
+                                    extra_args,
+                                    outfile_path,
+                                }
+                            }
                         };
 
                         // Only run one hashcat at a time to avoid GPU contention.

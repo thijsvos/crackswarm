@@ -72,9 +72,17 @@ enum TaskAction {
         #[arg(long)]
         hash_file: String,
 
-        /// Brute-force mask (required)
+        /// Brute-force mask (for mask/brute-force attack)
         #[arg(long)]
-        mask: String,
+        mask: Option<String>,
+
+        /// Wordlist file ID (for dictionary attack, from `file upload`)
+        #[arg(long)]
+        wordlist: Option<String>,
+
+        /// Rules file ID (for dictionary+rules attack, from `file upload`)
+        #[arg(long)]
+        rules_file: Option<String>,
 
         /// Custom charset 1 (-1)
         #[arg(long)]
@@ -288,6 +296,8 @@ async fn handle_task(client: &Client, action: TaskAction) -> Result<()> {
             hash_mode,
             hash_file,
             mask,
+            wordlist,
+            rules_file,
             charset1,
             charset2,
             charset3,
@@ -295,14 +305,42 @@ async fn handle_task(client: &Client, action: TaskAction) -> Result<()> {
             priority,
             extra_args,
         } => {
-            // Build custom charsets list from the individual --charset flags
-            let custom_charsets = {
-                let slots = [charset1, charset2, charset3, charset4];
-                let charsets: Vec<String> = slots.into_iter().flatten().collect();
-                if charsets.is_empty() {
-                    None
-                } else {
-                    Some(charsets)
+            // Determine the attack config based on which flags were provided.
+            let attack_config = match (mask, wordlist) {
+                (Some(m), None) => {
+                    // Brute-force / mask attack
+                    let custom_charsets = {
+                        let slots = [charset1, charset2, charset3, charset4];
+                        let charsets: Vec<String> = slots.into_iter().flatten().collect();
+                        if charsets.is_empty() {
+                            None
+                        } else {
+                            Some(charsets)
+                        }
+                    };
+                    AttackConfig::BruteForce {
+                        mask: m,
+                        custom_charsets,
+                    }
+                }
+                (None, Some(wl)) => {
+                    // Dictionary attack (optionally with rules)
+                    if let Some(rf) = rules_file {
+                        AttackConfig::DictionaryWithRules {
+                            wordlist_file_id: wl,
+                            rules_file_id: rf,
+                        }
+                    } else {
+                        AttackConfig::Dictionary {
+                            wordlist_file_id: wl,
+                        }
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("Cannot specify both --mask and --wordlist. Use --mask for brute-force or --wordlist for dictionary attacks.");
+                }
+                (None, None) => {
+                    anyhow::bail!("Either --mask or --wordlist is required.");
                 }
             };
 
@@ -314,10 +352,7 @@ async fn handle_task(client: &Client, action: TaskAction) -> Result<()> {
                 name,
                 hash_mode,
                 hash_file_id: hash_file,
-                attack_config: AttackConfig::BruteForce {
-                    mask,
-                    custom_charsets,
-                },
+                attack_config,
                 priority,
                 extra_args: extra,
             };
