@@ -8,6 +8,7 @@
 *.enc
 *.key
 *.pem
+.env*
 
 # Compiled binaries (release copies in repo root)
 /crack-agent
