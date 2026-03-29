@@ -1,6 +1,15 @@
 # crack-orchestrate
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/thijsvos/password-crack-orchestrate/actions/workflows/ci.yml/badge.svg)](https://github.com/thijsvos/password-crack-orchestrate/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/thijsvos/password-crack-orchestrate)](https://github.com/thijsvos/password-crack-orchestrate/releases)
+
 Distributed hashcat orchestration tool. Splits cracking work across GPU workers with encrypted transport, live TUI dashboards, and multi-phase campaign support.
+
+<!-- TODO: Add TUI screenshots here
+![Coordinator TUI](docs/screenshots/coord-tui.png)
+![Agent TUI](docs/screenshots/agent-tui.png)
+-->
 
 ## Architecture
 
@@ -185,6 +194,12 @@ crack-agent run         Connect and process work
 7. **Result collection** — cracked hashes reported in real-time, stored in SQLite
 8. **Campaign advancement** — when a phase exhausts, uncracked hashes roll into the next phase
 
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
+
+For security vulnerabilities, see [SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT
+[MIT](LICENSE)
