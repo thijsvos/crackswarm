@@ -1,8 +1,8 @@
-# crack-orchestrate
+# crackswarm
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/thijsvos/password-crack-orchestrate/actions/workflows/ci.yml/badge.svg)](https://github.com/thijsvos/password-crack-orchestrate/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/thijsvos/password-crack-orchestrate)](https://github.com/thijsvos/password-crack-orchestrate/releases)
+[![CI](https://github.com/thijsvos/crackswarm/actions/workflows/ci.yml/badge.svg)](https://github.com/thijsvos/crackswarm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/thijsvos/crackswarm)](https://github.com/thijsvos/crackswarm/releases)
 
 Distributed hashcat orchestration tool. Splits cracking work across GPU workers with encrypted transport, live TUI dashboards, and multi-phase campaign support.
 
@@ -65,7 +65,7 @@ cargo build --release
 
 Binaries are in `target/release/`: `crack-coord`, `crack-agent`, `crackctl`.
 
-Pre-built binaries for Linux, macOS, and Windows are available on the [releases page](https://github.com/thijsvos/password-crack-orchestrate/releases).
+Pre-built binaries for Linux, macOS, and Windows are available on the [releases page](https://github.com/thijsvos/crackswarm/releases).
 
 ### Single-Machine Setup
 

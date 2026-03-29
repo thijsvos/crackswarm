@@ -8,7 +8,7 @@ If you discover a security vulnerability in this project, please report it respo
 
 Instead, please use one of the following methods:
 
-1. **GitHub Security Advisory** (preferred): [Report a vulnerability](https://github.com/thijsvos/password-crack-orchestrate/security/advisories/new)
+1. **GitHub Security Advisory** (preferred): [Report a vulnerability](https://github.com/thijsvos/crackswarm/security/advisories/new)
 2. **Email**: Send details to the repository owner via their GitHub profile
 
 ### What to include
