@@ -5,7 +5,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use base64::Engine;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crack_common::models::{EnrollmentToken, Worker};
@@ -65,7 +64,7 @@ pub async fn enroll_worker(
     Json(req): Json<EnrollWorkerRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Generate 16 random bytes as hex nonce
-    let nonce_bytes: [u8; 16] = rand::thread_rng().gen();
+    let nonce_bytes: [u8; 16] = rand::random();
     let nonce: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
     // Compute expires_at
