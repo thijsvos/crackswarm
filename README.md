@@ -6,6 +6,22 @@
 
 Distributed hashcat orchestration tool. Splits cracking work across GPU workers with encrypted transport, live TUI dashboards, and multi-phase campaign support.
 
+![Crackswarm TUI Demo](docs/demo.gif)
+
+## Table of Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Quick Start](#quick-start)
+- [TUI Dashboard](#tui-dashboard)
+- [Campaigns](#campaigns)
+- [Commands](#commands)
+- [Security](#security)
+- [How It Works](#how-it-works)
+- [Changelog](CHANGELOG.md)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Features
 
 - **Distributed cracking** -- coordinate hashcat across multiple GPU workers from a single dashboard

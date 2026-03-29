@@ -1,0 +1,40 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Start coordinator with `crack-coord run --with-agent`
+        2. Create a task with `crackctl task create ...`
+        3. Observe error in ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Rust version, hashcat version, Crackswarm version
+      placeholder: |
+        - OS: macOS 14.5 / Ubuntu 24.04 / Windows 11
+        - Crackswarm: v0.8.2
+        - hashcat: v6.2.6
+        - GPU: NVIDIA RTX 4090
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Any error messages, stack traces, or log output
+      render: shell
