@@ -494,14 +494,14 @@ mod tests {
             nonce: "deadbeef".to_string(),
             worker_name: "gpu-1".to_string(),
             expires_at: "2026-01-01T00:00:00Z".to_string(),
-            server_addr: "10.0.1.5:8443".to_string(),
+            server_addr: "198.51.100.1:8443".to_string(),
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(json.contains("server_addr"));
-        assert!(json.contains("10.0.1.5:8443"));
+        assert!(json.contains("198.51.100.1:8443"));
 
         let decoded: EnrollmentToken = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.server_addr, "10.0.1.5:8443");
+        assert_eq!(decoded.server_addr, "198.51.100.1:8443");
         assert_eq!(decoded.coord_pubkey, "abc123");
     }
 

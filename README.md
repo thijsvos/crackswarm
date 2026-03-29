@@ -6,11 +6,6 @@
 
 Distributed hashcat orchestration tool. Splits cracking work across GPU workers with encrypted transport, live TUI dashboards, and multi-phase campaign support.
 
-<!-- TODO: Add TUI screenshots here
-![Coordinator TUI](docs/screenshots/coord-tui.png)
-![Agent TUI](docs/screenshots/agent-tui.png)
--->
-
 ## Architecture
 
 ```

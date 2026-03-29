@@ -82,19 +82,3 @@ crackctl file upload ntds.txt --type hash
 crackctl task create --name "NTDS brute" --hash-mode 1000 --hash-file <id> --mask '?a?a?a?a?a?a'
 ```
 
-## Post-MVP TODOs
-
-- Wordlist attacks (mode 0) + rules support
-- Hybrid attacks (modes 6, 7)
-- Wordlist file distribution + SHA-256 caching on workers
-- `crackctl task show --watch` live terminal refresh
-- Web UI dashboard
-- Multi-task priority scheduling
-- Graceful shutdown with worker draining
-- Integration tests with mock workers
-- Cloud worker support (AWS/GCP GPU instances)
-- Encrypted SQLite via sqlcipher
-- Encrypted file storage on disk
-- Memory zeroing on all secret-holding structs (partially done via zeroize on Keypair)
-- Hashcat outfile written to tmpfs/ramdisk
-- Auto-expiry for old results

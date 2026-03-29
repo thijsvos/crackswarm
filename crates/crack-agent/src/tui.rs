@@ -586,7 +586,7 @@ mod tests {
     fn make_state() -> AgentTuiState {
         AgentTuiState::new(
             "test-gpu".to_string(),
-            "10.0.1.5:8443".to_string(),
+            "198.51.100.1:8443".to_string(),
             "v6.2.6".to_string(),
             vec![DeviceInfo {
                 id: 1,
@@ -685,7 +685,7 @@ mod tests {
     fn test_initial_state() {
         let state = make_state();
         assert_eq!(state.worker_name, "test-gpu");
-        assert_eq!(state.server_addr, "10.0.1.5:8443");
+        assert_eq!(state.server_addr, "198.51.100.1:8443");
         assert_eq!(state.hashcat_version, "v6.2.6");
         assert_eq!(state.devices.len(), 1);
         assert!(matches!(state.connection_status, ConnectionStatus::Connecting));
