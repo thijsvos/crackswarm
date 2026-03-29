@@ -136,6 +136,7 @@ pub fn load_remote_key(dir: &Path, filename: &str) -> Result<Vec<u8>> {
 pub fn build_responder(keypair: &Keypair) -> Result<snow::HandshakeState> {
     snow::Builder::new(noise_params())
         .local_private_key(&keypair.private_key)
+        .map_err(CrackError::Noise)?
         .build_responder()
         .map_err(CrackError::Noise)
 }
@@ -145,7 +146,9 @@ pub fn build_responder(keypair: &Keypair) -> Result<snow::HandshakeState> {
 pub fn build_initiator(keypair: &Keypair, remote_static: &[u8]) -> Result<snow::HandshakeState> {
     snow::Builder::new(noise_params())
         .local_private_key(&keypair.private_key)
+        .map_err(CrackError::Noise)?
         .remote_public_key(remote_static)
+        .map_err(CrackError::Noise)?
         .build_initiator()
         .map_err(CrackError::Noise)
 }
