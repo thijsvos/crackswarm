@@ -234,6 +234,14 @@ enum CampaignAction {
         /// Path to a hash file on disk (auto-uploads before creating campaign)
         #[arg(long)]
         hash_file_path: Option<PathBuf>,
+
+        /// Wordlist file ID for dictionary phases in templates (from `file upload`)
+        #[arg(long)]
+        wordlist: Option<String>,
+
+        /// Rules file ID for dictionary+rules phases in templates (from `file upload`)
+        #[arg(long)]
+        rules_file: Option<String>,
     },
     /// List all campaigns
     List,
@@ -461,6 +469,8 @@ async fn handle_campaign(client: &Client, action: CampaignAction) -> Result<()> 
             extra_args,
             auto_start,
             hash_file_path,
+            wordlist,
+            rules_file,
         } => {
             // Resolve hash file ID: either from --hash-file or auto-upload from --hash-file-path
             let hash_file_id = if let Some(path) = hash_file_path {
@@ -484,6 +494,8 @@ async fn handle_campaign(client: &Client, action: CampaignAction) -> Result<()> 
                 template,
                 priority,
                 extra_args: extra,
+                wordlist_file_id: wordlist,
+                rules_file_id: rules_file,
             };
 
             let campaign = client.create_campaign(payload).await?;

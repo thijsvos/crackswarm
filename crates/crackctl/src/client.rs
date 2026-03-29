@@ -49,6 +49,10 @@ pub struct CreateCampaignPayload {
     pub priority: u8,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wordlist_file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules_file_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -45,12 +45,43 @@ pub async fn create_campaign(
             .find(|t| t.name == *template_name)
             .ok_or_else(|| ApiError::BadRequest(format!("unknown template: {template_name}")))?;
 
+        use campaign::templates::{SENTINEL_RULES, SENTINEL_WORDLIST};
+
         template
             .phases
             .iter()
-            .map(|p| CreatePhaseRequest {
-                name: p.name.clone(),
-                config: p.config.clone(),
+            .filter_map(|p| {
+                // Resolve sentinel values in Dictionary phases
+                match &p.config {
+                    PhaseConfig::Dictionary {
+                        wordlist_file_id,
+                        rules,
+                    } if wordlist_file_id == SENTINEL_WORDLIST => {
+                        // Skip dictionary phases if no wordlist provided
+                        let wl_id = req.wordlist_file_id.as_ref()?;
+                        let resolved_rules: Vec<String> = rules
+                            .iter()
+                            .filter_map(|r| {
+                                if r == SENTINEL_RULES {
+                                    req.rules_file_id.clone()
+                                } else {
+                                    Some(r.clone())
+                                }
+                            })
+                            .collect();
+                        Some(CreatePhaseRequest {
+                            name: p.name.clone(),
+                            config: PhaseConfig::Dictionary {
+                                wordlist_file_id: wl_id.clone(),
+                                rules: resolved_rules,
+                            },
+                        })
+                    }
+                    _ => Some(CreatePhaseRequest {
+                        name: p.name.clone(),
+                        config: p.config.clone(),
+                    }),
+                }
             })
             .collect()
     } else if !req.phases.is_empty() {

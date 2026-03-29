@@ -12,11 +12,17 @@ fn me(mask: &str) -> MaskEntry {
     }
 }
 
+/// Sentinel value for wordlist file ID in templates, replaced at campaign creation time.
+pub const SENTINEL_WORDLIST: &str = "$wordlist";
+/// Sentinel value for rules file ID in templates, replaced at campaign creation time.
+pub const SENTINEL_RULES: &str = "$rules";
+
 fn ntlm_standard() -> CampaignTemplate {
     CampaignTemplate {
         name: "ntlm-standard".to_string(),
-        description: "NTLM (mode 1000) — PINs, targeted patterns, iteration, brute-force"
-            .to_string(),
+        description:
+            "NTLM (mode 1000) — PINs, dictionary+rules, targeted patterns, iteration, brute-force"
+                .to_string(),
         hash_mode: Some(1000),
         phases: vec![
             TemplatePhase {
@@ -27,6 +33,13 @@ fn ntlm_standard() -> CampaignTemplate {
                         me("?d?d?d?d?d?d?d?d"),
                         me("?d?d?d?d?d?d?d?d?d?d"),
                     ],
+                },
+            },
+            TemplatePhase {
+                name: "Dictionary + rules".to_string(),
+                config: PhaseConfig::Dictionary {
+                    wordlist_file_id: SENTINEL_WORDLIST.to_string(),
+                    rules: vec![SENTINEL_RULES.to_string()],
                 },
             },
             TemplatePhase {
@@ -101,7 +114,9 @@ fn ntlm_standard() -> CampaignTemplate {
 fn wpa_quick() -> CampaignTemplate {
     CampaignTemplate {
         name: "wpa-quick".to_string(),
-        description: "WPA/WPA2 (mode 22000) — 8-digit PIN, common 8-char, iteration".to_string(),
+        description:
+            "WPA/WPA2 (mode 22000) — 8-digit PIN, dictionary+rules, common 8-char, iteration"
+                .to_string(),
         hash_mode: Some(22000),
         phases: vec![
             TemplatePhase {
@@ -109,6 +124,13 @@ fn wpa_quick() -> CampaignTemplate {
                 config: PhaseConfig::StaticMask {
                     mask: "?d?d?d?d?d?d?d?d".to_string(),
                     custom_charsets: None,
+                },
+            },
+            TemplatePhase {
+                name: "Dictionary + rules".to_string(),
+                config: PhaseConfig::Dictionary {
+                    wordlist_file_id: SENTINEL_WORDLIST.to_string(),
+                    rules: vec![SENTINEL_RULES.to_string()],
                 },
             },
             TemplatePhase {
@@ -135,13 +157,21 @@ fn wpa_quick() -> CampaignTemplate {
 fn generic_quick() -> CampaignTemplate {
     CampaignTemplate {
         name: "generic-quick".to_string(),
-        description: "Generic — PINs, common patterns, iteration, brute-force".to_string(),
+        description: "Generic — PINs, dictionary+rules, common patterns, iteration, brute-force"
+            .to_string(),
         hash_mode: None,
         phases: vec![
             TemplatePhase {
                 name: "PIN sweep".to_string(),
                 config: PhaseConfig::MultiMask {
                     masks: vec![me("?d?d?d?d?d?d"), me("?d?d?d?d?d?d?d?d")],
+                },
+            },
+            TemplatePhase {
+                name: "Dictionary + rules".to_string(),
+                config: PhaseConfig::Dictionary {
+                    wordlist_file_id: SENTINEL_WORDLIST.to_string(),
+                    rules: vec![SENTINEL_RULES.to_string()],
                 },
             },
             TemplatePhase {

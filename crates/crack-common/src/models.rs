@@ -477,6 +477,10 @@ pub struct CreateCampaignRequest {
     pub priority: u8,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Wordlist file ID for dictionary phases in templates.
+    pub wordlist_file_id: Option<String>,
+    /// Rules file ID for dictionary+rules phases in templates.
+    pub rules_file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
