@@ -21,7 +21,7 @@ axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "stream", "rustls"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
@@ -46,20 +46,20 @@ thiserror = "2"
 anyhow = "1"
 
 # Crypto / Security
-snow = "0.9"
+snow = "0.10"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 hkdf = "0.12"
 chacha20poly1305 = "0.10"
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Configuration
-toml = "0.8"
+toml = "1"
 
 # Cross-platform
 dirs = "6"
