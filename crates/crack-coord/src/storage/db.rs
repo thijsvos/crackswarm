@@ -415,14 +415,17 @@ pub async fn delete_task(pool: &SqlitePool, id: Uuid) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn increment_task_cracked_count(pool: &SqlitePool, id: Uuid, delta: u32) -> Result<()> {
-    sqlx::query("UPDATE tasks SET cracked_count = cracked_count + ?1 WHERE id = ?2")
-        .bind(delta)
-        .bind(id.to_string())
-        .execute(pool)
-        .await
-        .context("incrementing cracked count")?;
-    Ok(())
+pub async fn increment_task_cracked_count(pool: &SqlitePool, id: Uuid, delta: u32) -> Result<u32> {
+    let row = sqlx::query(
+        "UPDATE tasks SET cracked_count = cracked_count + ?1 WHERE id = ?2 RETURNING cracked_count",
+    )
+    .bind(delta)
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await
+    .context("incrementing cracked count")?;
+
+    Ok(row.get::<u32, _>("cracked_count"))
 }
 
 pub async fn set_task_keyspace(
@@ -582,7 +585,7 @@ pub async fn claim_pending_chunk(
     };
 
     // Claim it: set status to dispatched and assign worker
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE chunks SET status = 'dispatched', assigned_worker = ?1, assigned_at = ?2 WHERE id = ?3 AND status = 'pending'"
     )
     .bind(worker_id)
@@ -591,6 +594,11 @@ pub async fn claim_pending_chunk(
     .execute(pool)
     .await
     .context("claiming pending chunk")?;
+
+    // Another worker already claimed this chunk between the SELECT and UPDATE
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
 
     let task = get_task(pool, chunk.task_id)
         .await?

@@ -5,6 +5,7 @@ mod workers;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -125,5 +126,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/status", get(tasks::system_status))
         .route("/api/v1/potfile/stats", get(tasks::potfile_stats))
         .route("/api/v1/potfile/plaintexts", get(tasks::potfile_plaintexts))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
         .with_state(state)
 }

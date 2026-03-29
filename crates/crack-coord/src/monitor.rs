@@ -213,8 +213,7 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
         }
 
         // Create a new pending chunk for the remaining work
-        let new_chunk_id = uuid::Uuid::new_v4();
-        db::create_chunk(&state.db, chunk.task_id, new_skip, new_limit).await?;
+        let new_chunk = db::create_chunk(&state.db, chunk.task_id, new_skip, new_limit).await?;
 
         // Mark the old chunk as fully abandoned (don't retry it again)
         db::update_chunk_status(
@@ -226,7 +225,7 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
 
         info!(
             old_chunk = %chunk.id,
-            new_chunk = %new_chunk_id,
+            new_chunk = %new_chunk.id,
             task = %chunk.task_id,
             remaining = new_limit,
             "reassigned abandoned chunk"

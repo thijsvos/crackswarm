@@ -391,8 +391,17 @@ async fn handle_worker_message(
                 worker_id = %wid,
                 "received HashCracked from worker"
             );
-            db::insert_cracked_hash(&state.db, *task_id, hash, plaintext, wid).await?;
-            db::increment_task_cracked_count(&state.db, *task_id, 1).await?;
+            let inserted =
+                db::insert_cracked_hash(&state.db, *task_id, hash, plaintext, wid).await?;
+
+            // Only increment the count and check completion if the hash was
+            // actually new (not a duplicate).
+            if !inserted {
+                debug!(task_id = %task_id, hash = %hash, "duplicate hash ignored");
+                return Ok(());
+            }
+
+            let new_count = db::increment_task_cracked_count(&state.db, *task_id, 1).await?;
 
             state.emit(AppEvent::HashCracked {
                 task_id: *task_id,
@@ -401,7 +410,7 @@ async fn handle_worker_message(
 
             // Check if all hashes for this task have been cracked.
             if let Some(task) = db::get_task(&state.db, *task_id).await? {
-                if task.cracked_count + 1 >= task.total_hashes {
+                if new_count >= task.total_hashes {
                     info!(task_id = %task_id, "all hashes cracked, completing task");
                     db::update_task_status(&state.db, *task_id, TaskStatus::Completed).await?;
 

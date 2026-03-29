@@ -51,12 +51,24 @@ impl Keypair {
         let priv_path = dir.join("private.key");
         let pub_path = dir.join("public.key");
 
-        // Write private key with restrictive permissions
-        std::fs::write(&priv_path, &self.private_key)?;
+        // Write private key with restrictive permissions.
+        // On Unix, create the file with mode 0o600 atomically to avoid a
+        // window where the key is world-readable.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&priv_path)?;
+            f.write_all(&self.private_key)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&priv_path, &self.private_key)?;
         }
 
         std::fs::write(&pub_path, &self.public_key)?;

@@ -5,13 +5,19 @@ use crate::client::{CampaignDetailResponse, PotfileStats};
 
 // ── Helpers ──
 
-/// Truncate a string to `max` characters, appending "..." if truncated.
+/// Truncate a string to `max` bytes, appending "..." if truncated.
+/// Ensures the truncation point falls on a valid UTF-8 char boundary.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        return s.to_string();
     }
+    let end = s
+        .char_indices()
+        .take_while(|(i, _)| *i + 3 < max)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}...", &s[..end])
 }
 
 /// First 8 characters of an ID (for UUID or other string IDs).
@@ -173,7 +179,7 @@ pub fn print_task_detail(task: &Task, chunks: &[Chunk]) {
         for chunk in chunks {
             let chunk_id_str = chunk.id.to_string();
             let id = short_id(&chunk_id_str);
-            let progress = format!("{:.1}%", chunk.progress * 100.0);
+            let progress = format!("{:.1}%", chunk.progress);
             let speed = human_speed(chunk.speed);
 
             println!(
