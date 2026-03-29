@@ -30,7 +30,8 @@ async fn main() -> anyhow::Result<()> {
             headless,
             hashcat_path,
         } => {
-            let config = RunConfig::from_cli(data_dir, bind, api_bind, with_agent, headless, hashcat_path);
+            let config =
+                RunConfig::from_cli(data_dir, bind, api_bind, with_agent, headless, hashcat_path);
             cmd_run(config).await
         }
     }
@@ -59,13 +60,23 @@ async fn cmd_init(data_dir: &std::path::Path) -> anyhow::Result<()> {
     println!("  {}", keypair.public_key_b64());
     println!();
     println!("Workers can initialize with:");
-    println!("  crack-agent init --coord-key {}", keypair.public_key_b64());
+    println!(
+        "  crack-agent init --coord-key {}",
+        keypair.public_key_b64()
+    );
 
     Ok(())
 }
 
 async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
-    let RunConfig { data_dir, bind, api_bind, with_agent, headless, hashcat_path } = config;
+    let RunConfig {
+        data_dir,
+        bind,
+        api_bind,
+        with_agent,
+        headless,
+        hashcat_path,
+    } = config;
 
     // Ensure data directory exists before anything else
     std::fs::create_dir_all(&data_dir)?;
@@ -95,14 +106,13 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     // Auto-init: generate keypair + files dir if not present
     let keypair = if data_dir.join("private.key").exists() {
         Keypair::load_from_dir(&data_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to load keypair from {}: {}",
-                data_dir.display(),
-                e
-            )
+            anyhow::anyhow!("Failed to load keypair from {}: {}", data_dir.display(), e)
         })?
     } else {
-        info!("No keypair found, auto-initializing coordinator in {}...", data_dir.display());
+        info!(
+            "No keypair found, auto-initializing coordinator in {}...",
+            data_dir.display()
+        );
         let kp = Keypair::generate()?;
         kp.save_to_dir(&data_dir)?;
         std::fs::create_dir_all(data_dir.join("files"))?;
@@ -126,7 +136,13 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         .unwrap_or_else(|| "hashcat".to_string());
 
     // Create shared state
-    let state = state::AppState::new(db, data_dir.clone(), keypair, hc_path_str.clone(), bind.clone());
+    let state = state::AppState::new(
+        db,
+        data_dir.clone(),
+        keypair,
+        hc_path_str.clone(),
+        bind.clone(),
+    );
 
     // Audit log: coordinator started
     let _ = storage::db::insert_audit(
@@ -236,12 +252,8 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
 
             // Auto-authorize this agent in the coordinator's DB
             let pubkey_b64 = agent_kp.public_key_b64();
-            if let Err(e) = storage::db::authorize_worker(
-                &agent_state.db,
-                &pubkey_b64,
-                "built-in-agent",
-            )
-            .await
+            if let Err(e) =
+                storage::db::authorize_worker(&agent_state.db, &pubkey_b64, "built-in-agent").await
             {
                 error!("Failed to authorize built-in agent: {e}");
                 return;
@@ -280,4 +292,3 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
 
     Ok(())
 }
-

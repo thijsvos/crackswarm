@@ -42,9 +42,7 @@ pub struct EnrollWorkerResponse {
 // ── Handlers ──
 
 /// GET /api/v1/workers - List all known workers.
-pub async fn list_workers(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<Vec<Worker>>> {
+pub async fn list_workers(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Worker>>> {
     let workers = db::list_workers(&state.db).await?;
     Ok(Json(workers))
 }
@@ -68,8 +66,7 @@ pub async fn enroll_worker(
     let nonce: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
     // Compute expires_at
-    let expires_at = chrono::Utc::now()
-        + chrono::Duration::minutes(req.expires_minutes as i64);
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(req.expires_minutes as i64);
     let expires_at_str = expires_at.to_rfc3339();
 
     // Store in DB

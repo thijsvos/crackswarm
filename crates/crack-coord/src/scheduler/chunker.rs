@@ -23,26 +23,41 @@ pub async fn compute_keyspace(
             mask,
             custom_charsets,
         } => {
-            let keyspace =
-                compute_keyspace_via_hashcat(hashcat_path, hash_mode, mask, custom_charsets.as_deref())
-                    .await?;
+            let keyspace = compute_keyspace_via_hashcat(
+                hashcat_path,
+                hash_mode,
+                mask,
+                custom_charsets.as_deref(),
+            )
+            .await?;
             info!(mask = %mask, keyspace, "computed base keyspace via hashcat --keyspace");
             Ok(keyspace)
         }
         AttackConfig::Dictionary { wordlist_file_id } => {
             let wordlist_path = files::resolve_file_path(files_dir, wordlist_file_id)?;
             let keyspace = compute_dictionary_keyspace(
-                hashcat_path, hash_mode, &wordlist_path.to_string_lossy(), None,
-            ).await?;
+                hashcat_path,
+                hash_mode,
+                &wordlist_path.to_string_lossy(),
+                None,
+            )
+            .await?;
             info!(wordlist = %wordlist_file_id, keyspace, "computed dictionary keyspace via hashcat --keyspace");
             Ok(keyspace)
         }
-        AttackConfig::DictionaryWithRules { wordlist_file_id, rules_file_id } => {
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id,
+            rules_file_id,
+        } => {
             let wordlist_path = files::resolve_file_path(files_dir, wordlist_file_id)?;
             let rules_path = files::resolve_file_path(files_dir, rules_file_id)?;
             let keyspace = compute_dictionary_keyspace(
-                hashcat_path, hash_mode, &wordlist_path.to_string_lossy(), Some(&rules_path.to_string_lossy()),
-            ).await?;
+                hashcat_path,
+                hash_mode,
+                &wordlist_path.to_string_lossy(),
+                Some(&rules_path.to_string_lossy()),
+            )
+            .await?;
             info!(wordlist = %wordlist_file_id, rules = %rules_file_id, keyspace, "computed dictionary+rules keyspace via hashcat --keyspace");
             Ok(keyspace)
         }
@@ -81,10 +96,12 @@ async fn compute_dictionary_keyspace(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let keyspace: u64 = stdout
-        .trim()
-        .parse()
-        .with_context(|| format!("failed to parse hashcat --keyspace output: '{}'", stdout.trim()))?;
+    let keyspace: u64 = stdout.trim().parse().with_context(|| {
+        format!(
+            "failed to parse hashcat --keyspace output: '{}'",
+            stdout.trim()
+        )
+    })?;
 
     Ok(keyspace)
 }
@@ -123,10 +140,12 @@ async fn compute_keyspace_via_hashcat(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let keyspace: u64 = stdout
-        .trim()
-        .parse()
-        .with_context(|| format!("failed to parse hashcat --keyspace output: '{}'", stdout.trim()))?;
+    let keyspace: u64 = stdout.trim().parse().with_context(|| {
+        format!(
+            "failed to parse hashcat --keyspace output: '{}'",
+            stdout.trim()
+        )
+    })?;
 
     Ok(keyspace)
 }
@@ -143,6 +162,7 @@ async fn compute_keyspace_via_hashcat(
 ///   ?h = 16 (hex lower), ?H = 16 (hex upper)
 ///
 /// Custom charsets ?1..?4 are defined via the custom_charsets parameter.
+#[allow(dead_code)]
 fn compute_mask_keyspace(mask: &str, custom_charsets: Option<&[String]>) -> anyhow::Result<u64> {
     // First, collect all the charset sizes for each mask position
     let mut position_sizes: Vec<u64> = Vec::new();
@@ -203,12 +223,17 @@ fn compute_mask_keyspace(mask: &str, custom_charsets: Option<&[String]>) -> anyh
 ///
 /// Custom charsets can reference built-in charsets (e.g., "?l?d" = 36 chars)
 /// or list literal characters (e.g., "abc" = 3 chars).
+#[allow(dead_code)]
 fn custom_charset_size(idx: usize, custom_charsets: Option<&[String]>) -> anyhow::Result<u64> {
     let charsets = custom_charsets
         .ok_or_else(|| anyhow::anyhow!("mask uses ?{} but no custom charsets defined", idx + 1))?;
-    let cs = charsets
-        .get(idx)
-        .ok_or_else(|| anyhow::anyhow!("mask uses ?{} but only {} custom charsets defined", idx + 1, charsets.len()))?;
+    let cs = charsets.get(idx).ok_or_else(|| {
+        anyhow::anyhow!(
+            "mask uses ?{} but only {} custom charsets defined",
+            idx + 1,
+            charsets.len()
+        )
+    })?;
 
     let mut size: u64 = 0;
     let chars: Vec<char> = cs.chars().collect();

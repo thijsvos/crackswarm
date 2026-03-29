@@ -1,11 +1,7 @@
 use crack_common::models::{CampaignTemplate, MaskEntry, PhaseConfig, TemplatePhase};
 
 pub fn builtin_templates() -> Vec<CampaignTemplate> {
-    vec![
-        ntlm_standard(),
-        wpa_quick(),
-        generic_quick(),
-    ]
+    vec![ntlm_standard(), wpa_quick(), generic_quick()]
 }
 
 fn me(mask: &str) -> MaskEntry {
@@ -19,7 +15,8 @@ fn me(mask: &str) -> MaskEntry {
 fn ntlm_standard() -> CampaignTemplate {
     CampaignTemplate {
         name: "ntlm-standard".to_string(),
-        description: "NTLM (mode 1000) — PINs, targeted patterns, iteration, brute-force".to_string(),
+        description: "NTLM (mode 1000) — PINs, targeted patterns, iteration, brute-force"
+            .to_string(),
         hash_mode: Some(1000),
         phases: vec![
             TemplatePhase {
@@ -36,32 +33,32 @@ fn ntlm_standard() -> CampaignTemplate {
                 name: "Common patterns".to_string(),
                 config: PhaseConfig::MultiMask {
                     masks: vec![
-                        me("?l?l?l?l?l?l?l?l"),               // all lowercase 8
-                        me("?u?l?l?l?l?l?d?d"),               // Ullllldd (Password12)
-                        me("?u?l?l?l?l?l?l?d"),               // Ullllllld
-                        me("?u?l?l?l?l?l?d?d?d?d"),           // Ulllldddd (Summer2024)
-                        me("?u?l?l?l?l?l?l?l?d"),             // Ulllllllld
-                        me("?l?l?l?l?l?l?d?d?d?d"),           // lllllldddd
-                        me("?u?l?l?l?l?l?d?d?d?d?s"),         // Ulllllddds (Summer2024!)
-                        me("?u?l?l?l?l?l?l?d?d?d?d"),         // Ulllllldddd
-                        me("?l?l?l?l?l?l?l?l?l"),             // all lowercase 9
-                        me("?u?l?l?l?l?l?l?l?d?d"),           // Ulllllllldd
-                        me("?d?d?d?d?d?d?d"),                 // 7-digit PIN
-                        me("?d?d?d?d?d?d?d?d?d"),             // 9-digit PIN
-                        me("?u?l?l?l?l?d?d"),                 // Ulllldd
-                        me("?u?l?l?l?l?l?l?l"),               // Ulllllll
-                        me("?l?l?l?l?l?d?d?d"),               // llllldddd
-                        me("?u?l?l?l?d?d?d?d"),               // Ullldddd
-                        me("?u?l?l?l?l?l?l?d?d"),             // Ulllllldd
-                        me("?l?l?l?l?l?l?l?d?d"),             // llllllldd
-                        me("?u?l?l?l?l?l?l?l?l?d"),           // Ulllllllld
-                        me("?l?l?l?l?l?l?d?d"),               // lllllldd
-                        me("?u?l?l?l?l?l?s"),                 // Ullllls
-                        me("?u?l?l?l?l?l?l?d?d?s"),           // Ulllllldds
-                        me("?u?l?l?l?l?l?l?l?d?d?d?d"),       // Ulllllllldddd
-                        me("?u?l?l?l?l?l?l?l?d?s"),           // Ulllllllds
-                        me("?u?l?l?l?l?l?l?l?l?d?d"),         // Ullllllllldd
-                        me("?l?l?l?l?l?l?l?l?d?d"),           // lllllllldd
+                        me("?l?l?l?l?l?l?l?l"),         // all lowercase 8
+                        me("?u?l?l?l?l?l?d?d"),         // Ullllldd (Password12)
+                        me("?u?l?l?l?l?l?l?d"),         // Ullllllld
+                        me("?u?l?l?l?l?l?d?d?d?d"),     // Ulllldddd (Summer2024)
+                        me("?u?l?l?l?l?l?l?l?d"),       // Ulllllllld
+                        me("?l?l?l?l?l?l?d?d?d?d"),     // lllllldddd
+                        me("?u?l?l?l?l?l?d?d?d?d?s"),   // Ulllllddds (Summer2024!)
+                        me("?u?l?l?l?l?l?l?d?d?d?d"),   // Ulllllldddd
+                        me("?l?l?l?l?l?l?l?l?l"),       // all lowercase 9
+                        me("?u?l?l?l?l?l?l?l?d?d"),     // Ulllllllldd
+                        me("?d?d?d?d?d?d?d"),           // 7-digit PIN
+                        me("?d?d?d?d?d?d?d?d?d"),       // 9-digit PIN
+                        me("?u?l?l?l?l?d?d"),           // Ulllldd
+                        me("?u?l?l?l?l?l?l?l"),         // Ulllllll
+                        me("?l?l?l?l?l?d?d?d"),         // llllldddd
+                        me("?u?l?l?l?d?d?d?d"),         // Ullldddd
+                        me("?u?l?l?l?l?l?l?d?d"),       // Ulllllldd
+                        me("?l?l?l?l?l?l?l?d?d"),       // llllllldd
+                        me("?u?l?l?l?l?l?l?l?l?d"),     // Ulllllllld
+                        me("?l?l?l?l?l?l?d?d"),         // lllllldd
+                        me("?u?l?l?l?l?l?s"),           // Ullllls
+                        me("?u?l?l?l?l?l?l?d?d?s"),     // Ulllllldds
+                        me("?u?l?l?l?l?l?l?l?d?d?d?d"), // Ulllllllldddd
+                        me("?u?l?l?l?l?l?l?l?d?s"),     // Ulllllllds
+                        me("?u?l?l?l?l?l?l?l?l?d?d"),   // Ullllllllldd
+                        me("?l?l?l?l?l?l?l?l?d?d"),     // lllllllldd
                     ],
                 },
             },
@@ -144,10 +141,7 @@ fn generic_quick() -> CampaignTemplate {
             TemplatePhase {
                 name: "PIN sweep".to_string(),
                 config: PhaseConfig::MultiMask {
-                    masks: vec![
-                        me("?d?d?d?d?d?d"),
-                        me("?d?d?d?d?d?d?d?d"),
-                    ],
+                    masks: vec![me("?d?d?d?d?d?d"), me("?d?d?d?d?d?d?d?d")],
                 },
             },
             TemplatePhase {
@@ -205,7 +199,11 @@ mod tests {
     fn test_builtin_templates_unique_names() {
         let templates = builtin_templates();
         let names: HashSet<&str> = templates.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names.len(), templates.len(), "template names must be unique");
+        assert_eq!(
+            names.len(),
+            templates.len(),
+            "template names must be unique"
+        );
     }
 
     #[test]
@@ -218,8 +216,15 @@ mod tests {
     #[test]
     fn test_every_template_has_autogenerated() {
         for t in builtin_templates() {
-            let has_auto = t.phases.iter().any(|p| matches!(p.config, PhaseConfig::AutoGenerated { .. }));
-            assert!(has_auto, "template '{}' should have at least one AutoGenerated phase", t.name);
+            let has_auto = t
+                .phases
+                .iter()
+                .any(|p| matches!(p.config, PhaseConfig::AutoGenerated { .. }));
+            assert!(
+                has_auto,
+                "template '{}' should have at least one AutoGenerated phase",
+                t.name
+            );
         }
     }
 }

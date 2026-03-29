@@ -13,7 +13,11 @@ use crate::tui::theme::Theme;
 
 pub fn render_campaign_list(f: &mut Frame, area: Rect, state: &TuiState) {
     let focused = state.focus == FocusPanel::Left;
-    let border_color = if focused { Theme::BLUE } else { Theme::SURFACE1 };
+    let border_color = if focused {
+        Theme::BLUE
+    } else {
+        Theme::SURFACE1
+    };
 
     let block = Block::default()
         .title(" Campaigns ")
@@ -21,7 +25,9 @@ pub fn render_campaign_list(f: &mut Frame, area: Rect, state: &TuiState) {
         .border_style(Style::default().fg(border_color));
 
     if state.campaigns.is_empty() {
-        let msg = Paragraph::new(" No campaigns").style(Style::default().fg(Theme::OVERLAY0)).block(block);
+        let msg = Paragraph::new(" No campaigns")
+            .style(Style::default().fg(Theme::OVERLAY0))
+            .block(block);
         f.render_widget(msg, area);
         return;
     }
@@ -48,7 +54,11 @@ pub fn render_campaign_list(f: &mut Frame, area: Rect, state: &TuiState) {
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {:<20}", truncate(&c.name, 18)),
-                    Style::default().fg(if selected { Theme::TEXT } else { Theme::SUBTEXT0 }),
+                    Style::default().fg(if selected {
+                        Theme::TEXT
+                    } else {
+                        Theme::SUBTEXT0
+                    }),
                 ),
                 Span::styled(
                     format!("{:<10}", c.status),
@@ -65,7 +75,9 @@ pub fn render_campaign_list(f: &mut Frame, area: Rect, state: &TuiState) {
             ]);
 
             let style = if selected {
-                Style::default().bg(Theme::SURFACE0).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Theme::SURFACE0)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -80,7 +92,11 @@ pub fn render_campaign_list(f: &mut Frame, area: Rect, state: &TuiState) {
 
 pub fn render_campaign_detail(f: &mut Frame, area: Rect, state: &TuiState) {
     let focused = state.focus == FocusPanel::Right;
-    let border_color = if focused { Theme::BLUE } else { Theme::SURFACE1 };
+    let border_color = if focused {
+        Theme::BLUE
+    } else {
+        Theme::SURFACE1
+    };
 
     let block = Block::default()
         .title(" Phase Detail ")
@@ -102,7 +118,10 @@ pub fn render_campaign_detail(f: &mut Frame, area: Rect, state: &TuiState) {
         ]),
         Line::from(vec![
             Span::styled("  Mode: ", Style::default().fg(Theme::OVERLAY0)),
-            Span::styled(campaign.hash_mode.to_string(), Style::default().fg(Theme::TEXT)),
+            Span::styled(
+                campaign.hash_mode.to_string(),
+                Style::default().fg(Theme::TEXT),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Progress: ", Style::default().fg(Theme::OVERLAY0)),
@@ -114,7 +133,9 @@ pub fn render_campaign_detail(f: &mut Frame, area: Rect, state: &TuiState) {
         Line::default(),
         Line::from(Span::styled(
             "  Phases:",
-            Style::default().fg(Theme::MAUVE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
 
@@ -142,10 +163,7 @@ pub fn render_campaign_detail(f: &mut Frame, area: Rect, state: &TuiState) {
                 format!("  {status_icon} {}. ", phase.phase_index + 1),
                 Style::default().fg(status_color),
             ),
-            Span::styled(
-                truncate(&phase.name, 20),
-                Style::default().fg(Theme::TEXT),
-            ),
+            Span::styled(truncate(&phase.name, 20), Style::default().fg(Theme::TEXT)),
             Span::styled(
                 format!("  [{}]", phase.status),
                 Style::default().fg(status_color),

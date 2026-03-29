@@ -150,7 +150,10 @@ pub async fn init_db(data_dir: &Path) -> Result<SqlitePool> {
         .await
         .with_context(|| format!("opening database: {}", db_path.display()))?;
 
-    sqlx::raw_sql(INIT_SQL).execute(&pool).await.context("running init migration")?;
+    sqlx::raw_sql(INIT_SQL)
+        .execute(&pool)
+        .await
+        .context("running init migration")?;
 
     // Migration: add campaign_id to tasks (idempotent)
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN campaign_id TEXT REFERENCES campaigns(id)")
@@ -166,7 +169,7 @@ pub async fn init_db(data_dir: &Path) -> Result<SqlitePool> {
             expires_at TEXT NOT NULL,
             used_at TEXT,
             used_by_pubkey TEXT
-        );"
+        );",
     )
     .execute(&pool)
     .await
@@ -217,14 +220,15 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> Result<Task> {
         hash_file_id: row.get("hash_file_id"),
         attack_config: serde_json::from_str(&attack_config_json)
             .context("parsing attack_config JSON")?,
-        total_keyspace: row.get::<Option<i64>, _>("total_keyspace").map(|v| v as u64),
+        total_keyspace: row
+            .get::<Option<i64>, _>("total_keyspace")
+            .map(|v| v as u64),
         next_skip: row.get::<i64, _>("next_skip") as u64,
         priority: row.get::<u8, _>("priority"),
         status: TaskStatus::from_str(&status_str).map_err(|e| anyhow::anyhow!(e))?,
         total_hashes: row.get::<u32, _>("total_hashes"),
         cracked_count: row.get::<u32, _>("cracked_count"),
-        extra_args: serde_json::from_str(&extra_args_json)
-            .context("parsing extra_args JSON")?,
+        extra_args: serde_json::from_str(&extra_args_json).context("parsing extra_args JSON")?,
         campaign_id,
         created_at: parse_dt(row.get("created_at")),
         started_at: parse_dt_opt(row.get("started_at")),
@@ -334,7 +338,9 @@ pub async fn create_task(pool: &SqlitePool, req: &CreateTaskRequest) -> Result<T
     .await
     .context("inserting task")?;
 
-    get_task(pool, id).await?.ok_or_else(|| anyhow::anyhow!("task not found after insert"))
+    get_task(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task not found after insert"))
 }
 
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> Result<Option<Task>> {
@@ -425,15 +431,13 @@ pub async fn set_task_keyspace(
     keyspace: u64,
     total_hashes: u32,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE tasks SET total_keyspace = ?1, total_hashes = ?2 WHERE id = ?3",
-    )
-    .bind(keyspace as i64)
-    .bind(total_hashes)
-    .bind(id.to_string())
-    .execute(pool)
-    .await
-    .context("setting task keyspace")?;
+    sqlx::query("UPDATE tasks SET total_keyspace = ?1, total_hashes = ?2 WHERE id = ?3")
+        .bind(keyspace as i64)
+        .bind(total_hashes)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("setting task keyspace")?;
     Ok(())
 }
 
@@ -461,7 +465,7 @@ pub async fn create_chunk(
 
     sqlx::query(
         "INSERT INTO chunks (id, task_id, skip, \"limit\", status)
-         VALUES (?1, ?2, ?3, ?4, 'pending')"
+         VALUES (?1, ?2, ?3, ?4, 'pending')",
     )
     .bind(id.to_string())
     .bind(task_id.to_string())
@@ -471,7 +475,9 @@ pub async fn create_chunk(
     .await
     .context("inserting chunk")?;
 
-    get_chunk(pool, id).await?.ok_or_else(|| anyhow::anyhow!("chunk not found after insert"))
+    get_chunk(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("chunk not found after insert"))
 }
 
 pub async fn get_chunk(pool: &SqlitePool, id: Uuid) -> Result<Option<Chunk>> {
@@ -497,11 +503,7 @@ pub async fn get_chunks_for_task(pool: &SqlitePool, task_id: Uuid) -> Result<Vec
     rows.iter().map(row_to_chunk).collect()
 }
 
-pub async fn update_chunk_status(
-    pool: &SqlitePool,
-    id: Uuid,
-    status: ChunkStatus,
-) -> Result<()> {
+pub async fn update_chunk_status(pool: &SqlitePool, id: Uuid, status: ChunkStatus) -> Result<()> {
     let now = now_iso();
     let status_str = status.to_string();
 
@@ -534,33 +536,32 @@ pub async fn update_chunk_progress(
     progress: f64,
     speed: u64,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE chunks SET progress = ?1, speed = ?2 WHERE id = ?3",
-    )
-    .bind(progress)
-    .bind(speed as i64)
-    .bind(id.to_string())
-    .execute(pool)
-    .await
-    .context("updating chunk progress")?;
+    sqlx::query("UPDATE chunks SET progress = ?1, speed = ?2 WHERE id = ?3")
+        .bind(progress)
+        .bind(speed as i64)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("updating chunk progress")?;
     Ok(())
 }
 
 pub async fn finalize_chunk_progress(pool: &SqlitePool, id: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE chunks SET progress = 100.0 WHERE id = ?1",
-    )
-    .bind(id.to_string())
-    .execute(pool)
-    .await
-    .context("finalizing chunk progress")?;
+    sqlx::query("UPDATE chunks SET progress = 100.0 WHERE id = ?1")
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .context("finalizing chunk progress")?;
     Ok(())
 }
 
 /// Claim the oldest pending chunk across all running tasks, assigning it to the
 /// given worker. Returns the chunk and its parent task, or None if no pending
 /// chunks exist.
-pub async fn claim_pending_chunk(pool: &SqlitePool, worker_id: &str) -> Result<Option<(Task, Chunk)>> {
+pub async fn claim_pending_chunk(
+    pool: &SqlitePool,
+    worker_id: &str,
+) -> Result<Option<(Task, Chunk)>> {
     let now = now_iso();
 
     // Find the oldest pending chunk from any running task, ordered by priority
@@ -569,7 +570,7 @@ pub async fn claim_pending_chunk(pool: &SqlitePool, worker_id: &str) -> Result<O
          JOIN tasks t ON t.id = c.task_id
          WHERE c.status = 'pending' AND t.status = 'running'
          ORDER BY t.priority DESC, c.skip ASC
-         LIMIT 1"
+         LIMIT 1",
     )
     .fetch_optional(pool)
     .await
@@ -603,9 +604,14 @@ pub async fn claim_pending_chunk(pool: &SqlitePool, worker_id: &str) -> Result<O
     Ok(Some((task, chunk)))
 }
 
-pub async fn get_pending_chunks(pool: &SqlitePool, task_id: Uuid, limit: u32) -> Result<Vec<Chunk>> {
+#[allow(dead_code)]
+pub async fn get_pending_chunks(
+    pool: &SqlitePool,
+    task_id: Uuid,
+    limit: u32,
+) -> Result<Vec<Chunk>> {
     let rows = sqlx::query(
-        "SELECT * FROM chunks WHERE task_id = ?1 AND status = 'pending' ORDER BY skip ASC LIMIT ?2"
+        "SELECT * FROM chunks WHERE task_id = ?1 AND status = 'pending' ORDER BY skip ASC LIMIT ?2",
     )
     .bind(task_id.to_string())
     .bind(limit)
@@ -627,7 +633,7 @@ pub async fn get_abandoned_chunks(pool: &SqlitePool, timeout_secs: i64) -> Resul
          WHERE c.status IN ('dispatched', 'running')
            AND c.assigned_at < ?1
            AND w.status = 'disconnected'
-         ORDER BY c.assigned_at ASC"
+         ORDER BY c.assigned_at ASC",
     )
     .bind(&cutoff)
     .fetch_all(pool)
@@ -640,7 +646,7 @@ pub async fn get_abandoned_chunks(pool: &SqlitePool, timeout_secs: i64) -> Resul
 pub async fn abandon_worker_chunks(pool: &SqlitePool, worker_id: &str) -> Result<u64> {
     let result = sqlx::query(
         "UPDATE chunks SET status = 'abandoned', assigned_worker = NULL
-         WHERE assigned_worker = ?1 AND status IN ('dispatched', 'running')"
+         WHERE assigned_worker = ?1 AND status IN ('dispatched', 'running')",
     )
     .bind(worker_id)
     .execute(pool)
@@ -654,6 +660,7 @@ pub async fn abandon_worker_chunks(pool: &SqlitePool, worker_id: &str) -> Result
 // Worker operations
 // ════════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub async fn create_or_update_worker(pool: &SqlitePool, worker: &Worker) -> Result<()> {
     let now = now_iso();
     let devices_json = serde_json::to_string(&worker.devices)?;
@@ -757,11 +764,7 @@ pub async fn is_worker_authorized(pool: &SqlitePool, public_key: &str) -> Result
     Ok(count > 0)
 }
 
-pub async fn authorize_worker(
-    pool: &SqlitePool,
-    public_key: &str,
-    name: &str,
-) -> Result<Worker> {
+pub async fn authorize_worker(pool: &SqlitePool, public_key: &str, name: &str) -> Result<Worker> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
 
@@ -769,7 +772,7 @@ pub async fn authorize_worker(
         "INSERT INTO workers (id, name, public_key, status, created_at, last_seen_at)
          VALUES (?1, ?2, ?3, 'disconnected', ?4, ?4)
          ON CONFLICT(public_key) DO UPDATE SET
-           name = excluded.name"
+           name = excluded.name",
     )
     .bind(&id)
     .bind(name)
@@ -798,7 +801,7 @@ pub async fn create_enrollment_token(
     let now = now_iso();
     sqlx::query(
         "INSERT INTO enrollment_tokens (nonce, worker_name, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4)"
+         VALUES (?1, ?2, ?3, ?4)",
     )
     .bind(nonce)
     .bind(worker_name)
@@ -814,7 +817,7 @@ pub async fn validate_enrollment_nonce(pool: &SqlitePool, nonce: &str) -> Result
     let now = now_iso();
     let row = sqlx::query(
         "SELECT worker_name FROM enrollment_tokens
-         WHERE nonce = ?1 AND used_at IS NULL AND expires_at > ?2"
+         WHERE nonce = ?1 AND used_at IS NULL AND expires_at > ?2",
     )
     .bind(nonce)
     .bind(&now)
@@ -827,15 +830,13 @@ pub async fn validate_enrollment_nonce(pool: &SqlitePool, nonce: &str) -> Result
 
 pub async fn mark_nonce_used(pool: &SqlitePool, nonce: &str, pubkey: &str) -> Result<()> {
     let now = now_iso();
-    sqlx::query(
-        "UPDATE enrollment_tokens SET used_at = ?1, used_by_pubkey = ?2 WHERE nonce = ?3"
-    )
-    .bind(&now)
-    .bind(pubkey)
-    .bind(nonce)
-    .execute(pool)
-    .await
-    .context("marking enrollment nonce as used")?;
+    sqlx::query("UPDATE enrollment_tokens SET used_at = ?1, used_by_pubkey = ?2 WHERE nonce = ?3")
+        .bind(&now)
+        .bind(pubkey)
+        .bind(nonce)
+        .execute(pool)
+        .await
+        .context("marking enrollment nonce as used")?;
     Ok(())
 }
 
@@ -854,7 +855,7 @@ pub async fn insert_cracked_hash(
 
     let result = sqlx::query(
         "INSERT OR IGNORE INTO cracked_hashes (task_id, hash, plaintext, worker_id, cracked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )
     .bind(task_id.to_string())
     .bind(hash)
@@ -870,25 +871,23 @@ pub async fn insert_cracked_hash(
 }
 
 pub async fn get_cracked_for_task(pool: &SqlitePool, task_id: Uuid) -> Result<Vec<CrackedHash>> {
-    let rows = sqlx::query(
-        "SELECT * FROM cracked_hashes WHERE task_id = ?1 ORDER BY cracked_at ASC"
-    )
-    .bind(task_id.to_string())
-    .fetch_all(pool)
-    .await
-    .context("fetching cracked hashes for task")?;
+    let rows =
+        sqlx::query("SELECT * FROM cracked_hashes WHERE task_id = ?1 ORDER BY cracked_at ASC")
+            .bind(task_id.to_string())
+            .fetch_all(pool)
+            .await
+            .context("fetching cracked hashes for task")?;
 
     rows.iter().map(row_to_cracked).collect()
 }
 
+#[allow(dead_code)]
 pub async fn check_potfile(pool: &SqlitePool, hash: &str) -> Result<Option<CrackedHash>> {
-    let row = sqlx::query(
-        "SELECT * FROM cracked_hashes WHERE hash = ?1 LIMIT 1"
-    )
-    .bind(hash)
-    .fetch_optional(pool)
-    .await
-    .context("checking potfile for hash")?;
+    let row = sqlx::query("SELECT * FROM cracked_hashes WHERE hash = ?1 LIMIT 1")
+        .bind(hash)
+        .fetch_optional(pool)
+        .await
+        .context("checking potfile for hash")?;
 
     match row {
         Some(ref r) => Ok(Some(row_to_cracked(r)?)),
@@ -896,6 +895,7 @@ pub async fn check_potfile(pool: &SqlitePool, hash: &str) -> Result<Option<Crack
     }
 }
 
+#[allow(dead_code)]
 pub async fn get_all_cracked_plaintexts(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
     let rows = sqlx::query("SELECT hash, plaintext FROM cracked_hashes ORDER BY cracked_at ASC")
         .fetch_all(pool)
@@ -912,6 +912,7 @@ pub async fn get_all_cracked_plaintexts(pool: &SqlitePool) -> Result<Vec<(String
         .collect())
 }
 
+#[allow(dead_code)]
 pub async fn count_total_cracked(pool: &SqlitePool) -> Result<u64> {
     let row = sqlx::query("SELECT COUNT(*) as cnt FROM cracked_hashes")
         .fetch_one(pool)
@@ -939,7 +940,7 @@ pub async fn upsert_benchmark(
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(worker_id, hash_mode) DO UPDATE SET
            speed = excluded.speed,
-           measured_at = excluded.measured_at"
+           measured_at = excluded.measured_at",
     )
     .bind(worker_id)
     .bind(hash_mode)
@@ -957,14 +958,13 @@ pub async fn get_benchmark(
     worker_id: &str,
     hash_mode: u32,
 ) -> Result<Option<WorkerBenchmark>> {
-    let row = sqlx::query(
-        "SELECT * FROM worker_benchmarks WHERE worker_id = ?1 AND hash_mode = ?2"
-    )
-    .bind(worker_id)
-    .bind(hash_mode)
-    .fetch_optional(pool)
-    .await
-    .context("fetching benchmark")?;
+    let row =
+        sqlx::query("SELECT * FROM worker_benchmarks WHERE worker_id = ?1 AND hash_mode = ?2")
+            .bind(worker_id)
+            .bind(hash_mode)
+            .fetch_optional(pool)
+            .await
+            .context("fetching benchmark")?;
 
     match row {
         Some(ref r) => Ok(Some(row_to_benchmark(r)?)),
@@ -987,7 +987,7 @@ pub async fn insert_audit(
 
     sqlx::query(
         "INSERT INTO audit_log (event_type, details, source_ip, worker_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )
     .bind(event_type)
     .bind(details)
@@ -1002,13 +1002,11 @@ pub async fn insert_audit(
 }
 
 pub async fn get_recent_audit(pool: &SqlitePool, limit: u32) -> Result<Vec<AuditEntry>> {
-    let rows = sqlx::query(
-        "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?1"
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("fetching recent audit entries")?;
+    let rows = sqlx::query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?1")
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("fetching recent audit entries")?;
 
     rows.iter().map(row_to_audit).collect()
 }
@@ -1022,7 +1020,7 @@ pub async fn insert_file_record(pool: &SqlitePool, record: &FileRecord) -> Resul
 
     sqlx::query(
         "INSERT INTO files (id, filename, file_type, size_bytes, sha256, disk_path, uploaded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(&record.id)
     .bind(&record.filename)
@@ -1051,6 +1049,7 @@ pub async fn get_file_record(pool: &SqlitePool, id: &str) -> Result<Option<FileR
     }
 }
 
+#[allow(dead_code)]
 pub async fn delete_file_record(pool: &SqlitePool, id: &str) -> Result<bool> {
     let result = sqlx::query("DELETE FROM files WHERE id = ?1")
         .bind(id)
@@ -1139,13 +1138,11 @@ pub async fn get_potfile_stats(pool: &SqlitePool) -> Result<(u64, u64, u64)> {
 
 /// Get recently cracked hashes across all tasks (for TUI).
 pub async fn get_recent_cracked(pool: &SqlitePool, limit: u32) -> Result<Vec<CrackedHash>> {
-    let rows = sqlx::query(
-        "SELECT * FROM cracked_hashes ORDER BY cracked_at DESC LIMIT ?1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("fetching recent cracked hashes")?;
+    let rows = sqlx::query("SELECT * FROM cracked_hashes ORDER BY cracked_at DESC LIMIT ?1")
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("fetching recent cracked hashes")?;
 
     rows.iter().map(row_to_cracked).collect()
 }
@@ -1222,7 +1219,7 @@ pub async fn insert_chunk(pool: &SqlitePool, chunk: &Chunk) -> Result<()> {
     .bind(chunk.limit as i64)
     .bind(chunk.status.to_string())
     .bind(&chunk.assigned_worker)
-    .bind(chunk.assigned_at.map(|t| t.to_rfc3339()).or_else(|| Some(now)))
+    .bind(chunk.assigned_at.map(|t| t.to_rfc3339()).or(Some(now)))
     .execute(pool)
     .await
     .context("inserting chunk")?;
@@ -1237,7 +1234,10 @@ pub async fn get_all_plaintexts(pool: &SqlitePool) -> Result<Vec<String>> {
         .await
         .context("fetching all plaintexts")?;
 
-    Ok(rows.iter().map(|r| r.get::<String, _>("plaintext")).collect())
+    Ok(rows
+        .iter()
+        .map(|r| r.get::<String, _>("plaintext"))
+        .collect())
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1249,7 +1249,7 @@ pub async fn get_system_status(pool: &SqlitePool) -> Result<SystemStatus> {
         "SELECT
            COUNT(*) as total_tasks,
            COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) as running_tasks
-         FROM tasks"
+         FROM tasks",
     )
     .fetch_one(pool)
     .await
@@ -1273,7 +1273,7 @@ pub async fn get_system_status(pool: &SqlitePool) -> Result<SystemStatus> {
     let speed_row = sqlx::query(
         "SELECT COALESCE(SUM(speed), 0) as aggregate_speed
          FROM chunks
-         WHERE status = 'running'"
+         WHERE status = 'running'",
     )
     .fetch_one(pool)
     .await
@@ -1303,7 +1303,9 @@ fn row_to_campaign(row: &sqlx::sqlite::SqliteRow) -> Result<Campaign> {
         hash_mode: row.get::<u32, _>("hash_mode"),
         original_hash_file_id: row.get("original_hash_file_id"),
         status: CampaignStatus::from_str(&status_str).map_err(|e| anyhow::anyhow!(e))?,
-        active_phase_index: row.get::<Option<i32>, _>("active_phase_index").map(|v| v as u32),
+        active_phase_index: row
+            .get::<Option<i32>, _>("active_phase_index")
+            .map(|v| v as u32),
         total_phases: row.get::<i32, _>("total_phases") as u32,
         total_hashes: row.get::<i32, _>("total_hashes") as u32,
         cracked_count: row.get::<i32, _>("cracked_count") as u32,
@@ -1320,10 +1322,7 @@ fn row_to_phase(row: &sqlx::sqlite::SqliteRow) -> Result<CampaignPhase> {
     let status_str: String = row.get("status");
     let config_json: String = row.get("config");
     let task_id_str: Option<String> = row.get("task_id");
-    let task_id = task_id_str
-        .as_deref()
-        .map(Uuid::parse_str)
-        .transpose()?;
+    let task_id = task_id_str.as_deref().map(Uuid::parse_str).transpose()?;
 
     Ok(CampaignPhase {
         id: Uuid::parse_str(row.get::<&str, _>("id"))?,
@@ -1341,7 +1340,11 @@ fn row_to_phase(row: &sqlx::sqlite::SqliteRow) -> Result<CampaignPhase> {
     })
 }
 
-pub async fn create_campaign(pool: &SqlitePool, req: &CreateCampaignRequest, total_phases: u32) -> Result<Campaign> {
+pub async fn create_campaign(
+    pool: &SqlitePool,
+    req: &CreateCampaignRequest,
+    total_phases: u32,
+) -> Result<Campaign> {
     let id = Uuid::new_v4();
     let now = now_iso();
     let extra_args_json = serde_json::to_string(&req.extra_args)?;
@@ -1362,7 +1365,9 @@ pub async fn create_campaign(pool: &SqlitePool, req: &CreateCampaignRequest, tot
     .await
     .context("inserting campaign")?;
 
-    get_campaign(pool, id).await?.ok_or_else(|| anyhow::anyhow!("campaign not found after insert"))
+    get_campaign(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("campaign not found after insert"))
 }
 
 pub async fn get_campaign(pool: &SqlitePool, id: Uuid) -> Result<Option<Campaign>> {
@@ -1387,7 +1392,11 @@ pub async fn list_campaigns(pool: &SqlitePool) -> Result<Vec<Campaign>> {
     rows.iter().map(row_to_campaign).collect()
 }
 
-pub async fn update_campaign_status(pool: &SqlitePool, id: Uuid, status: CampaignStatus) -> Result<()> {
+pub async fn update_campaign_status(
+    pool: &SqlitePool,
+    id: Uuid,
+    status: CampaignStatus,
+) -> Result<()> {
     let now = now_iso();
     let status_str = status.to_string();
     let id_str = id.to_string();
@@ -1426,7 +1435,12 @@ pub async fn update_campaign_status(pool: &SqlitePool, id: Uuid, status: Campaig
     Ok(())
 }
 
-pub async fn increment_campaign_cracked_count(pool: &SqlitePool, id: Uuid, delta: u32) -> Result<()> {
+#[allow(dead_code)]
+pub async fn increment_campaign_cracked_count(
+    pool: &SqlitePool,
+    id: Uuid,
+    delta: u32,
+) -> Result<()> {
     sqlx::query("UPDATE campaigns SET cracked_count = cracked_count + ?1 WHERE id = ?2")
         .bind(delta)
         .bind(id.to_string())
@@ -1455,19 +1469,30 @@ pub async fn delete_campaign(pool: &SqlitePool, id: Uuid) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_campaigns_by_status(pool: &SqlitePool, status: CampaignStatus) -> Result<Vec<Campaign>> {
-    let rows = sqlx::query("SELECT * FROM campaigns WHERE status = ?1 ORDER BY priority DESC, created_at ASC")
-        .bind(status.to_string())
-        .fetch_all(pool)
-        .await
-        .context("fetching campaigns by status")?;
+pub async fn get_campaigns_by_status(
+    pool: &SqlitePool,
+    status: CampaignStatus,
+) -> Result<Vec<Campaign>> {
+    let rows = sqlx::query(
+        "SELECT * FROM campaigns WHERE status = ?1 ORDER BY priority DESC, created_at ASC",
+    )
+    .bind(status.to_string())
+    .fetch_all(pool)
+    .await
+    .context("fetching campaigns by status")?;
 
     rows.iter().map(row_to_campaign).collect()
 }
 
 // ── Campaign Phase operations ──
 
-pub async fn create_phase(pool: &SqlitePool, campaign_id: Uuid, phase_index: u32, name: &str, config: &PhaseConfig) -> Result<CampaignPhase> {
+pub async fn create_phase(
+    pool: &SqlitePool,
+    campaign_id: Uuid,
+    phase_index: u32,
+    name: &str,
+    config: &PhaseConfig,
+) -> Result<CampaignPhase> {
     let id = Uuid::new_v4();
     let now = now_iso();
     let config_json = serde_json::to_string(config)?;
@@ -1486,10 +1511,16 @@ pub async fn create_phase(pool: &SqlitePool, campaign_id: Uuid, phase_index: u32
     .await
     .context("inserting campaign phase")?;
 
-    get_phase(pool, id).await?.ok_or_else(|| anyhow::anyhow!("phase not found after insert"))
+    get_phase(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("phase not found after insert"))
 }
 
-pub async fn create_phases_batch(pool: &SqlitePool, campaign_id: Uuid, phases: &[CreatePhaseRequest]) -> Result<Vec<CampaignPhase>> {
+pub async fn create_phases_batch(
+    pool: &SqlitePool,
+    campaign_id: Uuid,
+    phases: &[CreatePhaseRequest],
+) -> Result<Vec<CampaignPhase>> {
     let mut result = Vec::with_capacity(phases.len());
     for (i, p) in phases.iter().enumerate() {
         let phase = create_phase(pool, campaign_id, i as u32, &p.name, &p.config).await?;
@@ -1511,21 +1542,29 @@ pub async fn get_phase(pool: &SqlitePool, id: Uuid) -> Result<Option<CampaignPha
     }
 }
 
-pub async fn get_phases_for_campaign(pool: &SqlitePool, campaign_id: Uuid) -> Result<Vec<CampaignPhase>> {
-    let rows = sqlx::query("SELECT * FROM campaign_phases WHERE campaign_id = ?1 ORDER BY phase_index ASC")
-        .bind(campaign_id.to_string())
-        .fetch_all(pool)
-        .await
-        .context("fetching phases for campaign")?;
+pub async fn get_phases_for_campaign(
+    pool: &SqlitePool,
+    campaign_id: Uuid,
+) -> Result<Vec<CampaignPhase>> {
+    let rows = sqlx::query(
+        "SELECT * FROM campaign_phases WHERE campaign_id = ?1 ORDER BY phase_index ASC",
+    )
+    .bind(campaign_id.to_string())
+    .fetch_all(pool)
+    .await
+    .context("fetching phases for campaign")?;
 
     rows.iter().map(row_to_phase).collect()
 }
 
-pub async fn get_active_phase(pool: &SqlitePool, campaign_id: Uuid) -> Result<Option<CampaignPhase>> {
+pub async fn get_active_phase(
+    pool: &SqlitePool,
+    campaign_id: Uuid,
+) -> Result<Option<CampaignPhase>> {
     let row = sqlx::query(
         "SELECT cp.* FROM campaign_phases cp
          JOIN campaigns c ON c.id = cp.campaign_id
-         WHERE cp.campaign_id = ?1 AND cp.phase_index = c.active_phase_index"
+         WHERE cp.campaign_id = ?1 AND cp.phase_index = c.active_phase_index",
     )
     .bind(campaign_id.to_string())
     .fetch_optional(pool)
@@ -1554,7 +1593,10 @@ pub async fn update_phase_status(pool: &SqlitePool, id: Uuid, status: PhaseStatu
             .await
             .context("updating phase status to running")?;
         }
-        PhaseStatus::Completed | PhaseStatus::Exhausted | PhaseStatus::Failed | PhaseStatus::Skipped => {
+        PhaseStatus::Completed
+        | PhaseStatus::Exhausted
+        | PhaseStatus::Failed
+        | PhaseStatus::Skipped => {
             sqlx::query("UPDATE campaign_phases SET status = ?1, completed_at = ?2 WHERE id = ?3")
                 .bind(&status_str)
                 .bind(&now)
@@ -1586,7 +1628,11 @@ pub async fn set_phase_task_id(pool: &SqlitePool, phase_id: Uuid, task_id: Uuid)
     Ok(())
 }
 
-pub async fn set_phase_hash_file_id(pool: &SqlitePool, phase_id: Uuid, hash_file_id: &str) -> Result<()> {
+pub async fn set_phase_hash_file_id(
+    pool: &SqlitePool,
+    phase_id: Uuid,
+    hash_file_id: &str,
+) -> Result<()> {
     sqlx::query("UPDATE campaign_phases SET hash_file_id = ?1 WHERE id = ?2")
         .bind(hash_file_id)
         .bind(phase_id.to_string())
@@ -1596,6 +1642,7 @@ pub async fn set_phase_hash_file_id(pool: &SqlitePool, phase_id: Uuid, hash_file
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn increment_phase_cracked_count(pool: &SqlitePool, id: Uuid, delta: u32) -> Result<()> {
     sqlx::query("UPDATE campaign_phases SET cracked_count = cracked_count + ?1 WHERE id = ?2")
         .bind(delta)
@@ -1606,7 +1653,11 @@ pub async fn increment_phase_cracked_count(pool: &SqlitePool, id: Uuid, delta: u
     Ok(())
 }
 
-pub async fn advance_campaign_phase(pool: &SqlitePool, campaign_id: Uuid, new_index: u32) -> Result<()> {
+pub async fn advance_campaign_phase(
+    pool: &SqlitePool,
+    campaign_id: Uuid,
+    new_index: u32,
+) -> Result<()> {
     sqlx::query("UPDATE campaigns SET active_phase_index = ?1 WHERE id = ?2")
         .bind(new_index as i32)
         .bind(campaign_id.to_string())
@@ -1628,12 +1679,15 @@ pub async fn get_tasks_for_campaign(pool: &SqlitePool, campaign_id: Uuid) -> Res
     rows.iter().map(row_to_task).collect()
 }
 
-pub async fn get_cracked_hashes_for_campaign(pool: &SqlitePool, campaign_id: Uuid) -> Result<Vec<CrackedHash>> {
+pub async fn get_cracked_hashes_for_campaign(
+    pool: &SqlitePool,
+    campaign_id: Uuid,
+) -> Result<Vec<CrackedHash>> {
     let rows = sqlx::query(
         "SELECT ch.* FROM cracked_hashes ch
          JOIN tasks t ON t.id = ch.task_id
          WHERE t.campaign_id = ?1
-         ORDER BY ch.cracked_at ASC"
+         ORDER BY ch.cracked_at ASC",
     )
     .bind(campaign_id.to_string())
     .fetch_all(pool)
@@ -1647,7 +1701,7 @@ pub async fn sync_campaign_cracked_count(pool: &SqlitePool, campaign_id: Uuid) -
     let row = sqlx::query(
         "SELECT COUNT(*) as cnt FROM cracked_hashes ch
          JOIN tasks t ON t.id = ch.task_id
-         WHERE t.campaign_id = ?1"
+         WHERE t.campaign_id = ?1",
     )
     .bind(campaign_id.to_string())
     .fetch_one(pool)
@@ -1665,7 +1719,11 @@ pub async fn sync_campaign_cracked_count(pool: &SqlitePool, campaign_id: Uuid) -
     Ok(count)
 }
 
-pub async fn create_campaign_task(pool: &SqlitePool, req: &CreateTaskRequest, campaign_id: Uuid) -> Result<Task> {
+pub async fn create_campaign_task(
+    pool: &SqlitePool,
+    req: &CreateTaskRequest,
+    campaign_id: Uuid,
+) -> Result<Task> {
     let id = Uuid::new_v4();
     let now = now_iso();
     let attack_config_json = serde_json::to_string(&req.attack_config)?;
@@ -1688,5 +1746,7 @@ pub async fn create_campaign_task(pool: &SqlitePool, req: &CreateTaskRequest, ca
     .await
     .context("inserting campaign task")?;
 
-    get_task(pool, id).await?.ok_or_else(|| anyhow::anyhow!("task not found after insert"))
+    get_task(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task not found after insert"))
 }

@@ -1,0 +1,9 @@
+# Ignored advisories for cargo audit / rustsec
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa crate timing sidechannel (Marvin Attack)
+    # Transitive dependency via rustls-platform-verifier -> webpki.
+    # No patch available. We don't use RSA directly; our transport uses
+    # Noise IK with Curve25519/ChaCha20-Poly1305.
+    "RUSTSEC-2023-0071",
+]

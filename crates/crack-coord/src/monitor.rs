@@ -47,11 +47,16 @@ async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
         info!(task_id = %task.id, task_name = %task.name, "preparing pending task");
 
         // 1. Count hashes in the hash file
-        let hash_file = match db::get_file_record(&state.db, &task.hash_file_id).await? {
+        let _hash_file = match db::get_file_record(&state.db, &task.hash_file_id).await? {
             Some(f) => f,
             None => {
                 error!(task_id = %task.id, "hash file {} not found, failing task", task.hash_file_id);
-                db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+                db::update_task_status(
+                    &state.db,
+                    task.id,
+                    crack_common::models::TaskStatus::Failed,
+                )
+                .await?;
                 continue;
             }
         };
@@ -60,7 +65,12 @@ async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
             Ok(data) => data,
             Err(e) => {
                 error!(task_id = %task.id, error = %e, "failed to read hash file");
-                db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+                db::update_task_status(
+                    &state.db,
+                    task.id,
+                    crack_common::models::TaskStatus::Failed,
+                )
+                .await?;
                 continue;
             }
         };
@@ -70,7 +80,8 @@ async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
 
         if total_hashes == 0 {
             error!(task_id = %task.id, "hash file is empty, failing task");
-            db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+            db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed)
+                .await?;
             continue;
         }
 
@@ -80,11 +91,18 @@ async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
             task.hash_mode,
             &task.attack_config,
             &state.files_dir(),
-        ).await {
+        )
+        .await
+        {
             Ok(ks) => ks,
             Err(e) => {
                 error!(task_id = %task.id, error = %e, "failed to compute keyspace");
-                db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed).await?;
+                db::update_task_status(
+                    &state.db,
+                    task.id,
+                    crack_common::models::TaskStatus::Failed,
+                )
+                .await?;
                 continue;
             }
         };
@@ -100,7 +118,12 @@ async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
         db::set_task_keyspace(&state.db, task.id, keyspace, total_hashes).await?;
 
         // 4. Transition to running
-        db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Running).await?;
+        db::update_task_status(
+            &state.db,
+            task.id,
+            crack_common::models::TaskStatus::Running,
+        )
+        .await?;
 
         state.emit(AppEvent::TaskUpdated { task_id: task.id });
     }
@@ -154,7 +177,11 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
             db::insert_audit(
                 &state.db,
                 "worker_timeout",
-                &format!("Worker {} timed out after {}s", worker.name, elapsed.num_seconds()),
+                &format!(
+                    "Worker {} timed out after {}s",
+                    worker.name,
+                    elapsed.num_seconds()
+                ),
                 None,
                 Some(&worker.id),
             )
@@ -216,7 +243,10 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
             let conns = state.worker_connections.read().await;
             if let Some(conn) = conns.get(&worker_id) {
                 // Transfer wordlist/rules files before assigning the chunk
-                if let Err(e) = crate::transport::handler::send_attack_files_via_tx(state, &task, &conn.tx).await {
+                if let Err(e) =
+                    crate::transport::handler::send_attack_files_via_tx(state, &task, &conn.tx)
+                        .await
+                {
                     error!(task_id = %task.id, error = %e, "failed to transfer attack files for dispatch");
                     continue;
                 }

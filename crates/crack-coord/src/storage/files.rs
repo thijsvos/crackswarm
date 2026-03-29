@@ -54,8 +54,7 @@ pub fn read_file(files_dir: &Path, file_id: &str) -> Result<Vec<u8>> {
     // Try exact match first
     let exact = files_dir.join(file_id);
     if exact.is_file() {
-        return std::fs::read(&exact)
-            .with_context(|| format!("reading file {}", exact.display()));
+        return std::fs::read(&exact).with_context(|| format!("reading file {}", exact.display()));
     }
 
     // Fall back: look for file_id.* (with extension)
@@ -103,6 +102,7 @@ pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
 /// Delete a file from disk by its file_id.
 ///
 /// Tries the bare file_id first, then falls back to any file whose name starts with the file_id.
+#[allow(dead_code)]
 pub fn delete_file(files_dir: &Path, file_id: &str) -> Result<()> {
     // Try exact match first
     let exact = files_dir.join(file_id);
@@ -126,5 +126,8 @@ pub fn delete_file(files_dir: &Path, file_id: &str) -> Result<()> {
         }
     }
 
-    anyhow::bail!("file not found for deletion: {file_id} in {}", files_dir.display())
+    anyhow::bail!(
+        "file not found for deletion: {file_id} in {}",
+        files_dir.display()
+    )
 }

@@ -33,7 +33,9 @@ pub async fn create_campaign(
     // Verify hash file exists
     let _file = db::get_file_record(&state.db, &req.hash_file_id)
         .await?
-        .ok_or_else(|| ApiError::BadRequest(format!("hash file not found: {}", req.hash_file_id)))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("hash file not found: {}", req.hash_file_id))
+        })?;
 
     // Resolve phases from template or request
     let phases: Vec<CreatePhaseRequest> = if let Some(template_name) = &req.template {
@@ -71,9 +73,7 @@ pub async fn create_campaign(
     Ok((StatusCode::CREATED, Json(c)))
 }
 
-pub async fn list_campaigns(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<Vec<Campaign>>> {
+pub async fn list_campaigns(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Campaign>>> {
     let campaigns = db::list_campaigns(&state.db).await?;
     Ok(Json(campaigns))
 }

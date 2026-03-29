@@ -117,6 +117,7 @@ pub async fn assign_next_chunk(
 ///
 /// The original chunk's progress is used to compute how much work has already been done.
 /// A new `Pending` chunk is created covering only the unfinished portion.
+#[allow(dead_code)]
 pub async fn reassign_chunk(state: &AppState, chunk: &Chunk) -> anyhow::Result<Chunk> {
     // Calculate how much of the chunk was already completed based on progress percentage.
     let consumed = if chunk.progress > 0.0 {

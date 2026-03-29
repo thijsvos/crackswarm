@@ -122,7 +122,9 @@ pub fn encode_message<T: Serialize>(msg: &T) -> crate::error::Result<Vec<u8>> {
 
 /// Read a length-prefixed message from a stream of bytes.
 /// Returns the deserialized message and the number of bytes consumed.
-pub fn decode_message<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> crate::error::Result<Option<(T, usize)>> {
+pub fn decode_message<T: for<'de> Deserialize<'de>>(
+    buf: &[u8],
+) -> crate::error::Result<Option<(T, usize)>> {
     if buf.len() < 4 {
         return Ok(None);
     }

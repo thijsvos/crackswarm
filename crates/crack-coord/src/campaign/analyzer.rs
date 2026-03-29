@@ -35,6 +35,7 @@ pub struct AnalysisResult {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GeneratedMask {
     pub mask: String,
     pub custom_charsets: Option<Vec<String>>,
@@ -52,6 +53,7 @@ pub enum MaskSource {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AnalysisSummary {
     pub total_passwords: usize,
     pub unique_skeletons: usize,
@@ -230,9 +232,8 @@ pub fn analyze(
 
     // Pass 2: Position-level analysis for top skeletons (Phase B)
     for (skel, _count) in ranked.iter().take(20) {
-        let mut positions: Vec<PositionStats> = (0..skel.len())
-            .map(|_| PositionStats::new())
-            .collect();
+        let mut positions: Vec<PositionStats> =
+            (0..skel.len()).map(|_| PositionStats::new()).collect();
 
         for &pw in &plaintexts {
             let pw_skel = Skeleton::from_plaintext(pw);
@@ -282,7 +283,11 @@ pub fn analyze(
             custom_ks = custom_ks.saturating_mul(size);
         }
 
-        if has_narrowing && !already_run.contains(&custom_mask) && custom_ks <= config.max_keyspace && custom_ks > 0 {
+        if has_narrowing
+            && !already_run.contains(&custom_mask)
+            && custom_ks <= config.max_keyspace
+            && custom_ks > 0
+        {
             let base_skel_ks = skel.keyspace();
             let reduction = if base_skel_ks > 0 {
                 1.0 - (custom_ks as f64 / base_skel_ks as f64)
@@ -375,7 +380,11 @@ pub fn analyze(
     // Deduplicate and rank
     let mut seen = HashSet::new();
     all_masks.retain(|m| seen.insert(m.mask.clone()));
-    all_masks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all_masks.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     all_masks.truncate(config.max_masks_to_generate);
 
     let masks_generated = all_masks.len();

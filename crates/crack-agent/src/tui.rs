@@ -39,9 +39,13 @@ const TEAL: Color = Color::Rgb(148, 226, 213);
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    Connected { worker_id: String },
+    Connected {
+        worker_id: String,
+    },
     Disconnected,
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     ChunkAssigned {
         task_id: Uuid,
         chunk_id: Uuid,
@@ -341,11 +345,7 @@ fn render(f: &mut ratatui::Frame, state: &AgentTuiState) {
     let title = format!(" CRACK-AGENT: {} ", state.worker_name);
     let outer_block = Block::default()
         .title(title)
-        .title_style(
-            Style::default()
-                .fg(MAUVE)
-                .add_modifier(Modifier::BOLD),
-        )
+        .title_style(Style::default().fg(MAUVE).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(SURFACE1))
         .style(Style::default().bg(BASE));
@@ -357,8 +357,8 @@ fn render(f: &mut ratatui::Frame, state: &AgentTuiState) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // Status header
-            Constraint::Length(7),  // Current work + progress
+            Constraint::Length(2), // Status header
+            Constraint::Length(7), // Current work + progress
             Constraint::Min(3),    // Recent cracks
             Constraint::Length(2), // Session stats + key hints
         ])
@@ -387,7 +387,12 @@ fn render_status(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Ag
             Span::styled(" Server: ", Style::default().fg(OVERLAY0)),
             Span::styled(&state.server_addr, Style::default().fg(TEXT)),
             Span::styled("    Status: ", Style::default().fg(OVERLAY0)),
-            Span::styled(status_label, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status_label,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" Hashcat: ", Style::default().fg(OVERLAY0)),
@@ -480,7 +485,11 @@ fn render_work(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Agen
                     Span::styled(" Cracked: ", Style::default().fg(OVERLAY0)),
                     Span::styled(
                         format!("{} this chunk", chunk.cracked_this_chunk),
-                        Style::default().fg(if chunk.cracked_this_chunk > 0 { GREEN } else { TEXT }),
+                        Style::default().fg(if chunk.cracked_this_chunk > 0 {
+                            GREEN
+                        } else {
+                            TEXT
+                        }),
                     ),
                 ]),
             ];
@@ -531,18 +540,28 @@ fn render_stats(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Age
     let lines = vec![
         Line::from(vec![
             Span::styled(" Chunks: ", Style::default().fg(OVERLAY0)),
-            Span::styled(state.chunks_completed.to_string(), Style::default().fg(TEXT)),
+            Span::styled(
+                state.chunks_completed.to_string(),
+                Style::default().fg(TEXT),
+            ),
             Span::styled(" completed   Cracked: ", Style::default().fg(OVERLAY0)),
-            Span::styled(state.total_cracked.to_string(), Style::default().fg(if state.total_cracked > 0 { GREEN } else { TEXT })),
+            Span::styled(
+                state.total_cracked.to_string(),
+                Style::default().fg(if state.total_cracked > 0 { GREEN } else { TEXT }),
+            ),
             Span::styled(" total   Uptime: ", Style::default().fg(OVERLAY0)),
             Span::styled(&uptime, Style::default().fg(TEXT)),
             Span::styled("   Reconnects: ", Style::default().fg(OVERLAY0)),
-            Span::styled(state.reconnect_count.to_string(), Style::default().fg(if state.reconnect_count > 0 { YELLOW } else { TEXT })),
+            Span::styled(
+                state.reconnect_count.to_string(),
+                Style::default().fg(if state.reconnect_count > 0 {
+                    YELLOW
+                } else {
+                    TEXT
+                }),
+            ),
         ]),
-        Line::from(Span::styled(
-            " q: quit",
-            Style::default().fg(SUBTEXT0),
-        )),
+        Line::from(Span::styled(" q: quit", Style::default().fg(SUBTEXT0))),
     ];
 
     let block = Block::default()
@@ -688,7 +707,10 @@ mod tests {
         assert_eq!(state.server_addr, "198.51.100.1:8443");
         assert_eq!(state.hashcat_version, "v6.2.6");
         assert_eq!(state.devices.len(), 1);
-        assert!(matches!(state.connection_status, ConnectionStatus::Connecting));
+        assert!(matches!(
+            state.connection_status,
+            ConnectionStatus::Connecting
+        ));
         assert!(state.current_chunk.is_none());
         assert!(state.recent_cracks.is_empty());
         assert_eq!(state.chunks_completed, 0);
@@ -705,7 +727,10 @@ mod tests {
         state.handle_event(AgentEvent::Connected {
             worker_id: "w-123".to_string(),
         });
-        assert!(matches!(state.connection_status, ConnectionStatus::Connected));
+        assert!(matches!(
+            state.connection_status,
+            ConnectionStatus::Connected
+        ));
     }
 
     #[test]
@@ -723,7 +748,10 @@ mod tests {
         assert!(state.current_chunk.is_some());
 
         state.handle_event(AgentEvent::Disconnected);
-        assert!(matches!(state.connection_status, ConnectionStatus::Disconnected));
+        assert!(matches!(
+            state.connection_status,
+            ConnectionStatus::Disconnected
+        ));
         assert!(state.current_chunk.is_none());
     }
 
@@ -734,7 +762,10 @@ mod tests {
 
         state.handle_event(AgentEvent::Reconnecting { attempt: 1 });
         assert_eq!(state.reconnect_count, 1);
-        assert!(matches!(state.connection_status, ConnectionStatus::Reconnecting(1)));
+        assert!(matches!(
+            state.connection_status,
+            ConnectionStatus::Reconnecting(1)
+        ));
 
         state.handle_event(AgentEvent::Reconnecting { attempt: 2 });
         assert_eq!(state.reconnect_count, 2);
@@ -966,30 +997,43 @@ mod tests {
         let mut state = make_state();
 
         // 1. Connect
-        state.handle_event(AgentEvent::Connected { worker_id: "w-1".to_string() });
-        assert!(matches!(state.connection_status, ConnectionStatus::Connected));
+        state.handle_event(AgentEvent::Connected {
+            worker_id: "w-1".to_string(),
+        });
+        assert!(matches!(
+            state.connection_status,
+            ConnectionStatus::Connected
+        ));
 
         // 2. Get chunk
         let (tid, cid) = make_chunk_id();
         state.handle_event(AgentEvent::ChunkAssigned {
-            task_id: tid, chunk_id: cid,
-            hash_mode: 1000, mask: "?a?a?a?a".to_string(),
+            task_id: tid,
+            chunk_id: cid,
+            hash_mode: 1000,
+            mask: "?a?a?a?a".to_string(),
         });
 
         // 3. Progress updates
         state.handle_event(AgentEvent::ChunkProgress {
-            progress_pct: 25.0, speed: 5_000_000, est_remaining: Some(300),
+            progress_pct: 25.0,
+            speed: 5_000_000,
+            est_remaining: Some(300),
         });
         state.handle_event(AgentEvent::ChunkProgress {
-            progress_pct: 50.0, speed: 5_500_000, est_remaining: Some(150),
+            progress_pct: 50.0,
+            speed: 5_500_000,
+            est_remaining: Some(150),
         });
 
         // 4. Crack some hashes
         state.handle_event(AgentEvent::HashCracked {
-            hash: "aaaa".to_string(), plaintext: "test1".to_string(),
+            hash: "aaaa".to_string(),
+            plaintext: "test1".to_string(),
         });
         state.handle_event(AgentEvent::HashCracked {
-            hash: "bbbb".to_string(), plaintext: "test2".to_string(),
+            hash: "bbbb".to_string(),
+            plaintext: "test2".to_string(),
         });
 
         // Verify mid-chunk state
@@ -1005,18 +1049,25 @@ mod tests {
 
         // 6. Disconnect + reconnect
         state.handle_event(AgentEvent::Disconnected);
-        assert!(matches!(state.connection_status, ConnectionStatus::Disconnected));
+        assert!(matches!(
+            state.connection_status,
+            ConnectionStatus::Disconnected
+        ));
 
         state.handle_event(AgentEvent::Reconnecting { attempt: 1 });
         assert_eq!(state.reconnect_count, 1);
 
-        state.handle_event(AgentEvent::Connected { worker_id: "w-1".to_string() });
+        state.handle_event(AgentEvent::Connected {
+            worker_id: "w-1".to_string(),
+        });
 
         // 7. Second chunk + failure
         let (tid2, cid2) = make_chunk_id();
         state.handle_event(AgentEvent::ChunkAssigned {
-            task_id: tid2, chunk_id: cid2,
-            hash_mode: 2500, mask: "?d?d?d?d?d?d?d?d".to_string(),
+            task_id: tid2,
+            chunk_id: cid2,
+            hash_mode: 2500,
+            mask: "?d?d?d?d?d?d?d?d".to_string(),
         });
         state.handle_event(AgentEvent::ChunkFailed {
             error: "GPU memory error".to_string(),
@@ -1038,15 +1089,19 @@ mod tests {
 
         let (tid1, cid1) = make_chunk_id();
         state.handle_event(AgentEvent::ChunkAssigned {
-            task_id: tid1, chunk_id: cid1,
-            hash_mode: 1000, mask: "?a?a".to_string(),
+            task_id: tid1,
+            chunk_id: cid1,
+            hash_mode: 1000,
+            mask: "?a?a".to_string(),
         });
 
         // Assign second chunk without completing the first (edge case)
         let (tid2, cid2) = make_chunk_id();
         state.handle_event(AgentEvent::ChunkAssigned {
-            task_id: tid2, chunk_id: cid2,
-            hash_mode: 2500, mask: "?d?d?d?d".to_string(),
+            task_id: tid2,
+            chunk_id: cid2,
+            hash_mode: 2500,
+            mask: "?d?d?d?d".to_string(),
         });
 
         let chunk = state.current_chunk.as_ref().unwrap();

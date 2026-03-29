@@ -147,7 +147,8 @@ mod tests {
 
     #[test]
     fn test_parse_outfile_line() {
-        let (hash, plain) = parse_outfile_line("5f4dcc3b5aa765d61d8327deb882cf99:password").unwrap();
+        let (hash, plain) =
+            parse_outfile_line("5f4dcc3b5aa765d61d8327deb882cf99:password").unwrap();
         assert_eq!(hash, "5f4dcc3b5aa765d61d8327deb882cf99");
         assert_eq!(plain, "password");
     }

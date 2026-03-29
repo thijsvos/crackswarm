@@ -54,12 +54,11 @@ pub fn render_results(f: &mut Frame, area: Rect, state: &TuiState) {
         ],
     )
     .header(
-        Row::new(vec!["Task", "Hash", "Plaintext", "Worker", "Cracked At"])
-            .style(
-                Style::default()
-                    .fg(Theme::MAUVE)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        Row::new(vec!["Task", "Hash", "Plaintext", "Worker", "Cracked At"]).style(
+            Style::default()
+                .fg(Theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(
         Block::default()

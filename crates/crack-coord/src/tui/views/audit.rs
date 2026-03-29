@@ -40,12 +40,11 @@ pub fn render_audit_log(f: &mut Frame, area: Rect, state: &TuiState) {
         ],
     )
     .header(
-        Row::new(vec!["Time", "Event", "Worker", "Details"])
-            .style(
-                Style::default()
-                    .fg(Theme::MAUVE)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        Row::new(vec!["Time", "Event", "Worker", "Details"]).style(
+            Style::default()
+                .fg(Theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(
         Block::default()

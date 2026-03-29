@@ -212,7 +212,12 @@ async fn connect_and_run(
     let _worker_id = match welcome {
         CoordMessage::Welcome { ref worker_id } => {
             info!(worker_id = %worker_id, "registered with coordinator");
-            emit(event_tx, AgentEvent::Connected { worker_id: worker_id.clone() });
+            emit(
+                event_tx,
+                AgentEvent::Connected {
+                    worker_id: worker_id.clone(),
+                },
+            );
             worker_id.clone()
         }
         other => {
@@ -309,21 +314,21 @@ async fn connect_and_run(
 
             Action::TcpReadable => {
                 // Read with a timeout to avoid blocking forever on spurious readability.
-                let cipher = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    read_framed(&mut stream),
-                ).await {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(e)) => {
-                        // Real read error (connection closed, etc.)
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        // Timeout — no data arrived, continue loop
-                        // (heartbeat and runner events will be processed)
-                        continue;
-                    }
-                };
+                let cipher =
+                    match tokio::time::timeout(Duration::from_secs(5), read_framed(&mut stream))
+                        .await
+                    {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(e)) => {
+                            // Real read error (connection closed, etc.)
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            // Timeout — no data arrived, continue loop
+                            // (heartbeat and runner events will be processed)
+                            continue;
+                        }
+                    };
 
                 // Decrypt
                 let mut plain = vec![0u8; 65535];
@@ -345,7 +350,6 @@ async fn connect_and_run(
                         total_chunks,
                         data_b64,
                     } => {
-                        use std::collections::HashMap;
                         // Decode chunk data
                         let data = base64::engine::general_purpose::STANDARD
                             .decode(&data_b64)
@@ -410,7 +414,9 @@ async fn connect_and_run(
                         let mask_display = match &attack {
                             AssignChunkAttack::BruteForce { mask, .. } => mask.clone(),
                             AssignChunkAttack::Dictionary { .. } => "dictionary".to_string(),
-                            AssignChunkAttack::DictionaryWithRules { .. } => "dict+rules".to_string(),
+                            AssignChunkAttack::DictionaryWithRules { .. } => {
+                                "dict+rules".to_string()
+                            }
                         };
 
                         info!(
@@ -422,38 +428,41 @@ async fn connect_and_run(
                             "received chunk assignment"
                         );
 
-                        emit(event_tx, AgentEvent::ChunkAssigned {
-                            task_id,
-                            chunk_id,
-                            hash_mode,
-                            mask: mask_display,
-                        });
+                        emit(
+                            event_tx,
+                            AgentEvent::ChunkAssigned {
+                                task_id,
+                                chunk_id,
+                                hash_mode,
+                                mask: mask_display,
+                            },
+                        );
 
                         // Decode hash file from the message and cache locally
                         let hash_file_path =
                             save_hash_file(config, &hash_file_id, &hash_file_b64).await?;
 
-                        let outfile_path =
-                            config.cache_dir().join(format!("out_{chunk_id}.txt"));
+                        let outfile_path = config.cache_dir().join(format!("out_{chunk_id}.txt"));
 
                         let cache_dir = config.cache_dir();
                         let run_config = match attack {
-                            AssignChunkAttack::BruteForce { mask, custom_charsets } => {
-                                HashcatRunConfig {
-                                    hashcat_path: config.hashcat_path.clone(),
-                                    hash_file_path,
-                                    hash_mode,
-                                    attack_mode: 3,
-                                    mask: Some(mask),
-                                    skip,
-                                    limit,
-                                    custom_charsets,
-                                    wordlist_path: None,
-                                    rules_path: None,
-                                    extra_args,
-                                    outfile_path,
-                                }
-                            }
+                            AssignChunkAttack::BruteForce {
+                                mask,
+                                custom_charsets,
+                            } => HashcatRunConfig {
+                                hashcat_path: config.hashcat_path.clone(),
+                                hash_file_path,
+                                hash_mode,
+                                attack_mode: 3,
+                                mask: Some(mask),
+                                skip,
+                                limit,
+                                custom_charsets,
+                                wordlist_path: None,
+                                rules_path: None,
+                                extra_args,
+                                outfile_path,
+                            },
                             AssignChunkAttack::Dictionary { wordlist_file_id } => {
                                 HashcatRunConfig {
                                     hashcat_path: config.hashcat_path.clone(),
@@ -470,22 +479,23 @@ async fn connect_and_run(
                                     outfile_path,
                                 }
                             }
-                            AssignChunkAttack::DictionaryWithRules { wordlist_file_id, rules_file_id } => {
-                                HashcatRunConfig {
-                                    hashcat_path: config.hashcat_path.clone(),
-                                    hash_file_path,
-                                    hash_mode,
-                                    attack_mode: 0,
-                                    mask: None,
-                                    skip,
-                                    limit,
-                                    custom_charsets: None,
-                                    wordlist_path: Some(cache_dir.join(&wordlist_file_id)),
-                                    rules_path: Some(cache_dir.join(&rules_file_id)),
-                                    extra_args,
-                                    outfile_path,
-                                }
-                            }
+                            AssignChunkAttack::DictionaryWithRules {
+                                wordlist_file_id,
+                                rules_file_id,
+                            } => HashcatRunConfig {
+                                hashcat_path: config.hashcat_path.clone(),
+                                hash_file_path,
+                                hash_mode,
+                                attack_mode: 0,
+                                mask: None,
+                                skip,
+                                limit,
+                                custom_charsets: None,
+                                wordlist_path: Some(cache_dir.join(&wordlist_file_id)),
+                                rules_path: Some(cache_dir.join(&rules_file_id)),
+                                extra_args,
+                                outfile_path,
+                            },
                         };
 
                         // Only run one hashcat at a time to avoid GPU contention.
@@ -544,12 +554,7 @@ async fn connect_and_run(
                             info!(chunk_id = %cid, "killing hashcat for shutdown");
                             let _ = kill_tx.send(());
                         }
-                        send_message(
-                            &mut stream,
-                            &mut transport,
-                            &WorkerMessage::Leaving,
-                        )
-                        .await?;
+                        send_message(&mut stream, &mut transport, &WorkerMessage::Leaving).await?;
                         return Ok(());
                     }
                 }
@@ -559,6 +564,7 @@ async fn connect_and_run(
 }
 
 /// Start a hashcat process for a chunk assignment.
+#[allow(clippy::too_many_arguments)]
 async fn start_hashcat(
     run_config: &HashcatRunConfig,
     chunk_id: Uuid,
@@ -571,12 +577,7 @@ async fn start_hashcat(
 ) -> anyhow::Result<()> {
     match HashcatRunner::start(run_config) {
         Ok(runner) => {
-            send_message(
-                stream,
-                transport,
-                &WorkerMessage::ChunkStarted { chunk_id },
-            )
-            .await?;
+            send_message(stream, transport, &WorkerMessage::ChunkStarted { chunk_id }).await?;
 
             chunk_task.insert(chunk_id, task_id);
 
@@ -637,11 +638,14 @@ async fn handle_runner_event(
             speed,
             est_remaining,
         } => {
-            emit(event_tx, AgentEvent::ChunkProgress {
-                progress_pct,
-                speed,
-                est_remaining,
-            });
+            emit(
+                event_tx,
+                AgentEvent::ChunkProgress {
+                    progress_pct,
+                    speed,
+                    est_remaining,
+                },
+            );
             send_message(
                 stream,
                 transport,
@@ -662,10 +666,13 @@ async fn handle_runner_event(
                 plaintext = %plaintext,
                 "sending HashCracked to coordinator"
             );
-            emit(event_tx, AgentEvent::HashCracked {
-                hash: hash.clone(),
-                plaintext: plaintext.clone(),
-            });
+            emit(
+                event_tx,
+                AgentEvent::HashCracked {
+                    hash: hash.clone(),
+                    plaintext: plaintext.clone(),
+                },
+            );
             send_message(
                 stream,
                 transport,
@@ -696,7 +703,12 @@ async fn handle_runner_event(
         RunnerEvent::Failed { error } => {
             error!(chunk_id = %chunk_id, error = %error, "chunk failed");
             active_chunks.remove(&chunk_id);
-            emit(event_tx, AgentEvent::ChunkFailed { error: error.clone() });
+            emit(
+                event_tx,
+                AgentEvent::ChunkFailed {
+                    error: error.clone(),
+                },
+            );
             send_message(
                 stream,
                 transport,
@@ -778,7 +790,11 @@ async fn recv_message(
 // ── Hash file caching ──
 
 /// Save a base64-encoded hash file received over the Noise channel to the local cache.
-async fn save_hash_file(config: &RunConfig, file_id: &str, b64_data: &str) -> anyhow::Result<PathBuf> {
+async fn save_hash_file(
+    config: &RunConfig,
+    file_id: &str,
+    b64_data: &str,
+) -> anyhow::Result<PathBuf> {
     let cache_dir = config.cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
 

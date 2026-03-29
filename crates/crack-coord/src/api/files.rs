@@ -29,10 +29,7 @@ pub async fn upload_file(
 
         match field_name.as_str() {
             "file" => {
-                let filename = field
-                    .file_name()
-                    .unwrap_or("upload")
-                    .to_string();
+                let filename = field.file_name().unwrap_or("upload").to_string();
                 let data = field
                     .bytes()
                     .await
@@ -78,9 +75,7 @@ pub async fn upload_file(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-pub async fn list_files(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<Vec<FileRecord>>> {
+pub async fn list_files(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<FileRecord>>> {
     let records = db::list_file_records(&state.db).await?;
     Ok(Json(records))
 }

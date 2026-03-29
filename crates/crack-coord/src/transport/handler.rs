@@ -40,11 +40,12 @@ async fn run_connection(
 ) -> anyhow::Result<()> {
     // ── 1. Noise IK handshake (coordinator is responder) ────────────────
 
-    let mut handshake = build_responder(&state.keypair)
-        .context("failed to build noise responder")?;
+    let mut handshake =
+        build_responder(&state.keypair).context("failed to build noise responder")?;
 
     // Read the initiator's first message (e, es, s, ss).
-    let msg1 = read_noise_frame(stream).await
+    let msg1 = read_noise_frame(stream)
+        .await
         .context("failed to read handshake message 1")?;
 
     let mut buf = vec![0u8; 65535];
@@ -71,7 +72,8 @@ async fn run_connection(
     let len = handshake
         .write_message(&[], &mut buf)
         .context("noise handshake: failed to write responder message")?;
-    write_noise_frame(stream, &buf[..len]).await
+    write_noise_frame(stream, &buf[..len])
+        .await
         .context("failed to send handshake message 2")?;
 
     // Transition to transport mode.
@@ -85,11 +87,8 @@ async fn run_connection(
     if !authorized {
         info!(%peer_addr, pubkey = %pubkey_b64, "worker not pre-authorized, waiting for enrollment");
 
-        let enroll_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_noise_frame(stream),
-        )
-        .await;
+        let enroll_result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_noise_frame(stream)).await;
 
         let ciphertext = match enroll_result {
             Ok(Ok(ct)) => ct,
@@ -160,7 +159,9 @@ async fn run_connection(
                         db::insert_audit(
                             &state.db,
                             "enroll_rejected",
-                            &format!("Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"),
+                            &format!(
+                                "Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"
+                            ),
                             Some(&peer_addr.to_string()),
                             None,
                         )
@@ -404,9 +405,7 @@ async fn handle_worker_message(
                     info!(task_id = %task_id, "all hashes cracked, completing task");
                     db::update_task_status(&state.db, *task_id, TaskStatus::Completed).await?;
 
-                    state.emit(AppEvent::TaskCompleted {
-                        task_id: *task_id,
-                    });
+                    state.emit(AppEvent::TaskCompleted { task_id: *task_id });
 
                     // Abort all running chunks on this task across all workers.
                     abort_task_chunks(state, *task_id).await?;
@@ -443,9 +442,7 @@ async fn handle_worker_message(
 
             // Try to assign more work to this worker.
             if let Some(wid) = worker_id.as_deref() {
-                if let Some((task, new_chunk)) =
-                    scheduler::assign_next_chunk(state, wid).await?
-                {
+                if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
                     send_attack_files(state, &task, outbound_tx, transferred_files).await?;
                     let msg = build_assign_chunk_msg(state, &task, &new_chunk)?;
                     let _ = outbound_tx.send(msg).await;
@@ -534,6 +531,7 @@ async fn handle_worker_message(
 
 // ── Register ────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_register(
     state: &Arc<AppState>,
     outbound_tx: &mpsc::Sender<CoordMessage>,
@@ -565,7 +563,11 @@ async fn handle_register(
             tx: outbound_tx.clone(),
             peer_addr: peer_addr.to_string(),
         };
-        state.worker_connections.write().await.insert(wid.clone(), conn);
+        state
+            .worker_connections
+            .write()
+            .await
+            .insert(wid.clone(), conn);
     }
 
     // Send the Welcome response.
@@ -672,7 +674,7 @@ async fn send_file_to_worker(
     };
 
     const CHUNK_SIZE: usize = 40 * 1024; // ~40 KB
-    let total_chunks = ((file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1) as u32;
+    let total_chunks = file_data.len().div_ceil(CHUNK_SIZE).max(1) as u32;
 
     for (i, chunk_data) in file_data.chunks(CHUNK_SIZE).enumerate() {
         let data_b64 = base64::engine::general_purpose::STANDARD.encode(chunk_data);
@@ -760,9 +762,7 @@ async fn abort_task_chunks(state: &Arc<AppState>, task_id: Uuid) -> anyhow::Resu
                 if let Some(conn) = conns.get(assigned) {
                     let _ = conn
                         .tx
-                        .send(CoordMessage::AbortChunk {
-                            chunk_id: chunk.id,
-                        })
+                        .send(CoordMessage::AbortChunk { chunk_id: chunk.id })
                         .await;
                 }
             }
@@ -779,7 +779,10 @@ async fn check_task_completion(state: &Arc<AppState>, task_id: Uuid) -> anyhow::
         && chunks.iter().all(|c| {
             matches!(
                 c.status,
-                ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed | ChunkStatus::Abandoned
+                ChunkStatus::Completed
+                    | ChunkStatus::Exhausted
+                    | ChunkStatus::Failed
+                    | ChunkStatus::Abandoned
             )
         });
 

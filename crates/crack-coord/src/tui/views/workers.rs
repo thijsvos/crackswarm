@@ -34,7 +34,11 @@ pub fn render_worker_list(f: &mut Frame, area: Rect, state: &TuiState) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Theme::SURFACE1)),
         )
-        .highlight_style(Style::default().bg(Theme::SURFACE0).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .bg(Theme::SURFACE0)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let mut list_state = ListState::default();
     list_state.select(Some(state.worker_list_index));
@@ -60,7 +64,7 @@ pub fn render_worker_detail(f: &mut Frame, area: Rect, state: &TuiState) {
     };
 
     let status_str = worker.status.to_string();
-    let devices_str = if worker.devices.is_empty() {
+    let _devices_str = if worker.devices.is_empty() {
         "None detected".to_string()
     } else {
         worker

@@ -245,13 +245,10 @@ impl HashcatRunner {
                 // hashcat prints cracked hashes to stdout as "hash:plaintext".
                 // Filter out hashcat info lines (contain spaces/dots before ':',
                 // or the "hash" part is too short to be a real hash).
-                let is_info_line =
-                    hash.contains(' ') || hash.contains("...") || hash.len() < 16;
+                let is_info_line = hash.contains(' ') || hash.contains("...") || hash.len() < 16;
                 if !is_info_line {
                     info!(hash = %hash, "hash cracked (stdout)");
-                    let _ = tx
-                        .send(RunnerEvent::HashCracked { hash, plaintext })
-                        .await;
+                    let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
                 }
             } else {
                 debug!(line = %line, "hashcat stdout (non-JSON)");
@@ -280,9 +277,7 @@ impl HashcatRunner {
                 for line in contents.lines() {
                     if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
                         info!(hash = %hash, plaintext = %plaintext, "hash cracked (final outfile read)");
-                        let _ = tx
-                            .send(RunnerEvent::HashCracked { hash, plaintext })
-                            .await;
+                        let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
                     }
                 }
             }

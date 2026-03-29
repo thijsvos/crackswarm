@@ -2,7 +2,9 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    },
     Frame,
 };
 
@@ -25,7 +27,14 @@ pub fn render_task_list(f: &mut Frame, area: Rect, state: &TuiState) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!(" {} ", if state.tasks.get(state.task_list_index).map(|t| t.id) == Some(task.id) { "▶" } else { " " }),
+                    format!(
+                        " {} ",
+                        if state.tasks.get(state.task_list_index).map(|t| t.id) == Some(task.id) {
+                            "▶"
+                        } else {
+                            " "
+                        }
+                    ),
                     Style::default().fg(Theme::BLUE),
                 ),
                 Span::styled(&task.name, Style::default().fg(Theme::TEXT)),
@@ -44,7 +53,11 @@ pub fn render_task_list(f: &mut Frame, area: Rect, state: &TuiState) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Theme::SURFACE1)),
         )
-        .highlight_style(Style::default().bg(Theme::SURFACE0).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .bg(Theme::SURFACE0)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let mut list_state = ListState::default();
     list_state.select(Some(state.task_list_index));
@@ -72,8 +85,16 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let status_str = task.status.to_string();
     let attack_str = match &task.attack_config {
         AttackConfig::BruteForce { mask, .. } => format!("Brute Force: {mask}"),
-        AttackConfig::Dictionary { wordlist_file_id } => format!("Dictionary: {}", &wordlist_file_id[..8.min(wordlist_file_id.len())]),
-        AttackConfig::DictionaryWithRules { wordlist_file_id, .. } => format!("Dict+Rules: {}", &wordlist_file_id[..8.min(wordlist_file_id.len())]),
+        AttackConfig::Dictionary { wordlist_file_id } => format!(
+            "Dictionary: {}",
+            &wordlist_file_id[..8.min(wordlist_file_id.len())]
+        ),
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id, ..
+        } => format!(
+            "Dict+Rules: {}",
+            &wordlist_file_id[..8.min(wordlist_file_id.len())]
+        ),
     };
 
     let progress_pct = if let Some(ks) = task.total_keyspace {
@@ -125,7 +146,10 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let lines = vec![
         Line::from(vec![
             Span::styled("  Hash Mode:  ", Style::default().fg(Theme::SUBTEXT0)),
-            Span::styled(format!("{}", task.hash_mode), Style::default().fg(Theme::TEXT)),
+            Span::styled(
+                format!("{}", task.hash_mode),
+                Style::default().fg(Theme::TEXT),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Attack:     ", Style::default().fg(Theme::SUBTEXT0)),
@@ -205,7 +229,10 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &mut TuiState) {
             let chunk_status = chunk.status.to_string();
             let is_terminal = matches!(
                 chunk.status,
-                ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed | ChunkStatus::Abandoned
+                ChunkStatus::Completed
+                    | ChunkStatus::Exhausted
+                    | ChunkStatus::Failed
+                    | ChunkStatus::Abandoned
             );
             let worker = chunk
                 .assigned_worker
@@ -243,8 +270,11 @@ pub fn render_task_detail(f: &mut Frame, area: Rect, state: &mut TuiState) {
         ],
     )
     .header(
-        Row::new(vec!["Chunk", "Worker", "Progress", "Speed", "Status"])
-            .style(Style::default().fg(Theme::MAUVE).add_modifier(Modifier::BOLD)),
+        Row::new(vec!["Chunk", "Worker", "Progress", "Speed", "Status"]).style(
+            Style::default()
+                .fg(Theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(
         Block::default()

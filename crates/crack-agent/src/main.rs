@@ -12,7 +12,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { coord_key, data_dir } => {
+        Commands::Init {
+            coord_key,
+            data_dir,
+        } => {
             init_tracing();
             cmd_init(&coord_key, &data_dir).await?;
         }
@@ -25,7 +28,12 @@ async fn main() -> anyhow::Result<()> {
             }
             cmd_run(&run_config).await?;
         }
-        Commands::Enroll { token, server, data_dir, hashcat_path } => {
+        Commands::Enroll {
+            token,
+            server,
+            data_dir,
+            hashcat_path,
+        } => {
             init_tracing();
             cmd_enroll(&token, server.as_deref(), &data_dir, &hashcat_path).await?;
         }
@@ -81,8 +89,7 @@ async fn cmd_init(coord_key_b64: &str, data_dir: &std::path::Path) -> anyhow::Re
     }
 
     // Generate agent keypair
-    let keypair =
-        auth::Keypair::generate().context("failed to generate keypair")?;
+    let keypair = auth::Keypair::generate().context("failed to generate keypair")?;
 
     // Save keypair (private.key + public.key)
     keypair
@@ -114,8 +121,8 @@ async fn cmd_enroll(
     let token_json = base64::engine::general_purpose::STANDARD
         .decode(token_b64)
         .context("failed to decode enrollment token (invalid base64)")?;
-    let token: EnrollmentToken = serde_json::from_slice(&token_json)
-        .context("failed to parse enrollment token")?;
+    let token: EnrollmentToken =
+        serde_json::from_slice(&token_json).context("failed to parse enrollment token")?;
 
     // 2. Resolve server address: CLI override > token > error
     let server = match server_override {
@@ -150,8 +157,7 @@ async fn cmd_enroll(
     // 4. Generate keypair if not present
     let keypair = if data_dir.join("private.key").exists() && data_dir.join("public.key").exists() {
         info!("using existing agent keypair");
-        auth::Keypair::load_from_dir(data_dir)
-            .context("failed to load existing keypair")?
+        auth::Keypair::load_from_dir(data_dir).context("failed to load existing keypair")?
     } else {
         info!("generating new agent keypair");
         let kp = auth::Keypair::generate().context("failed to generate keypair")?;
@@ -190,7 +196,8 @@ async fn cmd_enroll(
     println!("Connecting to coordinator at {} ...", server);
 
     // Use the enrollment-aware connection
-    connection::run_connection_with_enroll(&run_config, &token.nonce, &token.worker_name, None).await
+    connection::run_connection_with_enroll(&run_config, &token.nonce, &token.worker_name, None)
+        .await
 }
 
 /// `crack-agent run` -- connect to the coordinator and start processing work.
@@ -231,7 +238,9 @@ async fn cmd_run(config: &RunConfig) -> anyhow::Result<()> {
         connection::run_connection(config, None).await
     } else {
         // TUI mode: spawn connection in background, run TUI on main thread
-        let devices = status::get_devices(&config.hashcat_path).await.unwrap_or_default();
+        let devices = status::get_devices(&config.hashcat_path)
+            .await
+            .unwrap_or_default();
 
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let config_clone = config.clone();

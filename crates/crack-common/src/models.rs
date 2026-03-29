@@ -262,12 +262,12 @@ pub struct SystemStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentToken {
-    pub coord_pubkey: String,   // base64
-    pub nonce: String,          // hex 16 bytes
+    pub coord_pubkey: String, // base64
+    pub nonce: String,        // hex 16 bytes
     pub worker_name: String,
-    pub expires_at: String,     // ISO 8601
+    pub expires_at: String, // ISO 8601
     #[serde(default)]
-    pub server_addr: String,    // coordinator transport address (host:port)
+    pub server_addr: String, // coordinator transport address (host:port)
 }
 
 // ── API request/response types ──
@@ -539,7 +539,9 @@ mod tests {
         let json = serde_json::to_vec(&token).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&json);
 
-        let decoded_json = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        let decoded_json = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .unwrap();
         let decoded: EnrollmentToken = serde_json::from_slice(&decoded_json).unwrap();
         assert_eq!(decoded.server_addr, "0.0.0.0:8443");
         assert_eq!(decoded.worker_name, "test-worker");

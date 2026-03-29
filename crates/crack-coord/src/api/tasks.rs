@@ -75,9 +75,7 @@ pub async fn create_task(
     Ok((StatusCode::CREATED, Json(task)))
 }
 
-pub async fn list_tasks(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<Vec<Task>>> {
+pub async fn list_tasks(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Task>>> {
     let tasks = db::list_tasks(&state.db).await?;
     Ok(Json(tasks))
 }
@@ -142,16 +140,12 @@ pub async fn get_task_results(
     Ok(Json(results))
 }
 
-pub async fn system_status(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<SystemStatus>> {
+pub async fn system_status(State(state): State<Arc<AppState>>) -> ApiResult<Json<SystemStatus>> {
     let status = db::get_system_status(&state.db).await?;
     Ok(Json(status))
 }
 
-pub async fn potfile_stats(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<PotfileStats>> {
+pub async fn potfile_stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<PotfileStats>> {
     let (total_cracked, unique_hashes, unique_plaintexts) =
         db::get_potfile_stats(&state.db).await?;
     Ok(Json(PotfileStats {

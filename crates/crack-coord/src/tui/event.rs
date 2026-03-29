@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum TermEvent {
     Key(KeyEvent),
+    #[allow(dead_code)]
     Resize(u16, u16),
     Tick,
 }

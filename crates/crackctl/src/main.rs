@@ -16,7 +16,12 @@ use crate::client::{Client, CreateCampaignPayload, CreateTaskPayload};
 #[command(name = "crackctl", version, about)]
 struct Cli {
     /// Coordinator API URL
-    #[arg(long, env = "CRACKCTL_API_URL", default_value = "http://127.0.0.1:9443", global = true)]
+    #[arg(
+        long,
+        env = "CRACKCTL_API_URL",
+        default_value = "http://127.0.0.1:9443",
+        global = true
+    )]
     api_url: String,
 
     #[command(subcommand)]
@@ -57,6 +62,7 @@ enum Commands {
 // ── Task subcommands ──
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum TaskAction {
     /// Create a new cracking task
     Create {
@@ -418,9 +424,15 @@ async fn handle_worker(client: &Client, action: WorkerAction) -> Result<()> {
             println!("Worker '{name}' authorized.");
         }
 
-        WorkerAction::Enroll { name, expires_minutes } => {
+        WorkerAction::Enroll {
+            name,
+            expires_minutes,
+        } => {
             let resp = client.enroll_worker(&name, expires_minutes).await?;
-            println!("Token generated for worker '{}' (expires in {} minutes).", name, expires_minutes);
+            println!(
+                "Token generated for worker '{}' (expires in {} minutes).",
+                name, expires_minutes
+            );
             println!();
             println!("Token: {}", resp.token);
             println!();
@@ -428,7 +440,10 @@ async fn handle_worker(client: &Client, action: WorkerAction) -> Result<()> {
             println!("  crack-agent enroll --token '{}'", resp.token);
             println!();
             println!("To override the server address:");
-            println!("  crack-agent enroll --token '{}' --server <ip>:8443", resp.token);
+            println!(
+                "  crack-agent enroll --token '{}' --server <ip>:8443",
+                resp.token
+            );
         }
     }
 

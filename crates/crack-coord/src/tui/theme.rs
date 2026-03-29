@@ -3,6 +3,7 @@ use ratatui::style::Color;
 /// Catppuccin Mocha color palette.
 pub struct Theme;
 
+#[allow(dead_code)]
 impl Theme {
     // Base colors
     pub const BASE: Color = Color::Rgb(30, 30, 46);

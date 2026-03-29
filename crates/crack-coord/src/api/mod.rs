@@ -73,7 +73,10 @@ pub type ApiResult<T> = Result<T, ApiError>;
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Tasks
-        .route("/api/v1/tasks", post(tasks::create_task).get(tasks::list_tasks))
+        .route(
+            "/api/v1/tasks",
+            post(tasks::create_task).get(tasks::list_tasks),
+        )
         .route(
             "/api/v1/tasks/{id}",
             get(tasks::get_task)
@@ -82,24 +85,42 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/tasks/{id}/results", get(tasks::get_task_results))
         // Files
-        .route("/api/v1/files", post(files::upload_file).get(files::list_files))
+        .route(
+            "/api/v1/files",
+            post(files::upload_file).get(files::list_files),
+        )
         .route("/api/v1/files/{id}", get(files::download_file))
         // Workers
         .route("/api/v1/workers", get(workers::list_workers))
         .route("/api/v1/workers/authorize", post(workers::authorize_worker))
         .route("/api/v1/workers/enroll", post(workers::enroll_worker))
         // Campaigns
-        .route("/api/v1/campaigns", post(campaigns::create_campaign).get(campaigns::list_campaigns))
+        .route(
+            "/api/v1/campaigns",
+            post(campaigns::create_campaign).get(campaigns::list_campaigns),
+        )
         .route(
             "/api/v1/campaigns/{id}",
             get(campaigns::get_campaign)
                 .patch(campaigns::update_campaign)
                 .delete(campaigns::delete_campaign),
         )
-        .route("/api/v1/campaigns/{id}/phases", get(campaigns::get_campaign_phases))
-        .route("/api/v1/campaigns/{id}/start", post(campaigns::start_campaign_handler))
-        .route("/api/v1/campaigns/{id}/results", get(campaigns::get_campaign_results))
-        .route("/api/v1/campaigns/templates", get(campaigns::list_templates))
+        .route(
+            "/api/v1/campaigns/{id}/phases",
+            get(campaigns::get_campaign_phases),
+        )
+        .route(
+            "/api/v1/campaigns/{id}/start",
+            post(campaigns::start_campaign_handler),
+        )
+        .route(
+            "/api/v1/campaigns/{id}/results",
+            get(campaigns::get_campaign_results),
+        )
+        .route(
+            "/api/v1/campaigns/templates",
+            get(campaigns::list_templates),
+        )
         // System
         .route("/api/v1/status", get(tasks::system_status))
         .route("/api/v1/potfile/stats", get(tasks::potfile_stats))

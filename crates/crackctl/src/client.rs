@@ -71,6 +71,7 @@ struct EnrollWorkerPayload {
 #[derive(Debug, Deserialize)]
 pub struct EnrollWorkerResponse {
     pub token: String,
+    #[allow(dead_code)]
     pub message: String,
 }
 
@@ -219,7 +220,10 @@ impl Client {
             .context("failed to reach coordinator")?;
 
         let resp = Self::check(resp).await?;
-        let campaign: Campaign = resp.json().await.context("failed to parse campaign response")?;
+        let campaign: Campaign = resp
+            .json()
+            .await
+            .context("failed to parse campaign response")?;
         Ok(campaign)
     }
 
@@ -245,7 +249,10 @@ impl Client {
             .context("failed to reach coordinator")?;
 
         let resp = Self::check(resp).await?;
-        let detail: CampaignDetailResponse = resp.json().await.context("failed to parse campaign detail")?;
+        let detail: CampaignDetailResponse = resp
+            .json()
+            .await
+            .context("failed to parse campaign detail")?;
         Ok(detail)
     }
 
@@ -313,7 +320,8 @@ impl Client {
             .context("failed to reach coordinator")?;
 
         let resp = Self::check(resp).await?;
-        let templates: Vec<CampaignTemplate> = resp.json().await.context("failed to parse templates")?;
+        let templates: Vec<CampaignTemplate> =
+            resp.json().await.context("failed to parse templates")?;
         Ok(templates)
     }
 
@@ -397,7 +405,11 @@ impl Client {
         Ok(())
     }
 
-    pub async fn enroll_worker(&self, name: &str, expires_minutes: u64) -> Result<EnrollWorkerResponse> {
+    pub async fn enroll_worker(
+        &self,
+        name: &str,
+        expires_minutes: u64,
+    ) -> Result<EnrollWorkerResponse> {
         let payload = EnrollWorkerPayload {
             name: name.to_string(),
             expires_minutes,
@@ -412,7 +424,10 @@ impl Client {
             .context("failed to reach coordinator")?;
 
         let resp = Self::check(resp).await?;
-        let enroll_resp: EnrollWorkerResponse = resp.json().await.context("failed to parse enroll response")?;
+        let enroll_resp: EnrollWorkerResponse = resp
+            .json()
+            .await
+            .context("failed to parse enroll response")?;
         Ok(enroll_resp)
     }
 

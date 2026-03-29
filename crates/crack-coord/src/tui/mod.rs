@@ -102,19 +102,31 @@ fn spawn_data_refresher(
             // so the UI loop is never blocked.
             let tasks = db::list_tasks(&state.db).await.unwrap_or_default();
             let workers = db::list_workers(&state.db).await.unwrap_or_default();
-            let results = db::get_recent_cracked(&state.db, 100).await.unwrap_or_default();
-            let audit_entries = db::get_recent_audit(&state.db, 100).await.unwrap_or_default();
+            let results = db::get_recent_cracked(&state.db, 100)
+                .await
+                .unwrap_or_default();
+            let audit_entries = db::get_recent_audit(&state.db, 100)
+                .await
+                .unwrap_or_default();
             let status = db::get_system_status(&state.db).await.ok();
             let campaigns = db::list_campaigns(&state.db).await.unwrap_or_default();
 
             let chunks = if let Some(tid) = selected_task_id {
-                Some(db::get_chunks_for_task(&state.db, tid).await.unwrap_or_default())
+                Some(
+                    db::get_chunks_for_task(&state.db, tid)
+                        .await
+                        .unwrap_or_default(),
+                )
             } else {
                 None
             };
 
             let campaign_phases = if let Some(cid) = selected_campaign_id {
-                Some(db::get_phases_for_campaign(&state.db, cid).await.unwrap_or_default())
+                Some(
+                    db::get_phases_for_campaign(&state.db, cid)
+                        .await
+                        .unwrap_or_default(),
+                )
             } else {
                 None
             };
@@ -149,30 +161,64 @@ fn spawn_command_executor(
         while let Some(cmd) = cmd_rx.recv().await {
             let (msg, level) = match cmd {
                 TuiCommand::CancelTask(id) => {
-                    match db::update_task_status(&state.db, id, crack_common::models::TaskStatus::Cancelled).await {
+                    match db::update_task_status(
+                        &state.db,
+                        id,
+                        crack_common::models::TaskStatus::Cancelled,
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             state.emit(AppEvent::TaskUpdated { task_id: id });
-                            (format!("Task {} cancelled", &id.to_string()[..8]), NotificationLevel::Success)
+                            (
+                                format!("Task {} cancelled", &id.to_string()[..8]),
+                                NotificationLevel::Success,
+                            )
                         }
-                        Err(e) => (format!("Failed to cancel task: {e}"), NotificationLevel::Error),
+                        Err(e) => (
+                            format!("Failed to cancel task: {e}"),
+                            NotificationLevel::Error,
+                        ),
                     }
                 }
-                TuiCommand::DeleteTask(id) => {
-                    match db::delete_task(&state.db, id).await {
-                        Ok(_) => (format!("Task {} deleted", &id.to_string()[..8]), NotificationLevel::Success),
-                        Err(e) => (format!("Failed to delete task: {e}"), NotificationLevel::Error),
-                    }
-                }
+                TuiCommand::DeleteTask(id) => match db::delete_task(&state.db, id).await {
+                    Ok(_) => (
+                        format!("Task {} deleted", &id.to_string()[..8]),
+                        NotificationLevel::Success,
+                    ),
+                    Err(e) => (
+                        format!("Failed to delete task: {e}"),
+                        NotificationLevel::Error,
+                    ),
+                },
                 TuiCommand::StartCampaign(id) => {
                     match crate::campaign::start_campaign(&state, id).await {
-                        Ok(_) => (format!("Campaign {} started", &id.to_string()[..8]), NotificationLevel::Success),
-                        Err(e) => (format!("Failed to start campaign: {e}"), NotificationLevel::Error),
+                        Ok(_) => (
+                            format!("Campaign {} started", &id.to_string()[..8]),
+                            NotificationLevel::Success,
+                        ),
+                        Err(e) => (
+                            format!("Failed to start campaign: {e}"),
+                            NotificationLevel::Error,
+                        ),
                     }
                 }
                 TuiCommand::CancelCampaign(id) => {
-                    match db::update_campaign_status(&state.db, id, crack_common::models::CampaignStatus::Cancelled).await {
-                        Ok(_) => (format!("Campaign {} cancelled", &id.to_string()[..8]), NotificationLevel::Success),
-                        Err(e) => (format!("Failed to cancel campaign: {e}"), NotificationLevel::Error),
+                    match db::update_campaign_status(
+                        &state.db,
+                        id,
+                        crack_common::models::CampaignStatus::Cancelled,
+                    )
+                    .await
+                    {
+                        Ok(_) => (
+                            format!("Campaign {} cancelled", &id.to_string()[..8]),
+                            NotificationLevel::Success,
+                        ),
+                        Err(e) => (
+                            format!("Failed to cancel campaign: {e}"),
+                            NotificationLevel::Error,
+                        ),
                     }
                 }
             };
@@ -271,30 +317,45 @@ async fn run_tui_loop(
 /// Convert an AppEvent into a notification string (if appropriate).
 fn event_to_notification(event: &AppEvent) -> Option<(String, NotificationLevel)> {
     match event {
-        AppEvent::WorkerConnected { name, .. } => {
-            Some((format!("Worker '{}' connected", name), NotificationLevel::Info))
-        }
-        AppEvent::WorkerDisconnected { worker_id } => {
-            Some((format!("Worker {} disconnected", &worker_id[..8.min(worker_id.len())]), NotificationLevel::Info))
-        }
-        AppEvent::TaskCompleted { task_id } => {
-            Some((format!("Task {} completed", &task_id.to_string()[..8]), NotificationLevel::Success))
-        }
+        AppEvent::WorkerConnected { name, .. } => Some((
+            format!("Worker '{}' connected", name),
+            NotificationLevel::Info,
+        )),
+        AppEvent::WorkerDisconnected { worker_id } => Some((
+            format!(
+                "Worker {} disconnected",
+                &worker_id[..8.min(worker_id.len())]
+            ),
+            NotificationLevel::Info,
+        )),
+        AppEvent::TaskCompleted { task_id } => Some((
+            format!("Task {} completed", &task_id.to_string()[..8]),
+            NotificationLevel::Success,
+        )),
         AppEvent::HashCracked { hash, .. } => {
             let hash_short = if hash.len() > 16 { &hash[..16] } else { hash };
-            Some((format!("Hash cracked: {}...", hash_short), NotificationLevel::Success))
+            Some((
+                format!("Hash cracked: {}...", hash_short),
+                NotificationLevel::Success,
+            ))
         }
-        AppEvent::CampaignCompleted { campaign_id } => {
-            Some((format!("Campaign {} completed", &campaign_id.to_string()[..8]), NotificationLevel::Success))
-        }
-        AppEvent::CampaignPhaseAdvanced { phase_index, .. } => {
-            Some((format!("Campaign advanced to phase {}", phase_index + 1), NotificationLevel::Info))
-        }
+        AppEvent::CampaignCompleted { campaign_id } => Some((
+            format!("Campaign {} completed", &campaign_id.to_string()[..8]),
+            NotificationLevel::Success,
+        )),
+        AppEvent::CampaignPhaseAdvanced { phase_index, .. } => Some((
+            format!("Campaign advanced to phase {}", phase_index + 1),
+            NotificationLevel::Info,
+        )),
         _ => None,
     }
 }
 
-fn handle_action(state: &mut TuiState, action: KeyAction, _cmd_tx: &mpsc::UnboundedSender<TuiCommand>) {
+fn handle_action(
+    state: &mut TuiState,
+    action: KeyAction,
+    _cmd_tx: &mpsc::UnboundedSender<TuiCommand>,
+) {
     if state.show_help {
         match action {
             KeyAction::Help | KeyAction::Escape | KeyAction::Quit => {
@@ -424,36 +485,33 @@ fn handle_input_key(
 }
 
 /// Execute a command entered via the `:` command bar.
-fn execute_command(
-    state: &mut TuiState,
-    input: &str,
-    cmd_tx: &mpsc::UnboundedSender<TuiCommand>,
-) {
+fn execute_command(state: &mut TuiState, input: &str, cmd_tx: &mpsc::UnboundedSender<TuiCommand>) {
     let parts: Vec<&str> = input.split_whitespace().collect();
     let cmd = parts.first().copied().unwrap_or("");
 
     match cmd {
-        "cancel" => {
-            match state.active_tab {
-                ActiveTab::Tasks => {
-                    if let Some(task) = state.selected_task() {
-                        let _ = cmd_tx.send(TuiCommand::CancelTask(task.id));
-                    } else {
-                        state.notify("No task selected".into(), NotificationLevel::Error);
-                    }
-                }
-                ActiveTab::Campaigns => {
-                    if let Some(campaign) = state.selected_campaign() {
-                        let _ = cmd_tx.send(TuiCommand::CancelCampaign(campaign.id));
-                    } else {
-                        state.notify("No campaign selected".into(), NotificationLevel::Error);
-                    }
-                }
-                _ => {
-                    state.notify("Cancel not available on this tab".into(), NotificationLevel::Error);
+        "cancel" => match state.active_tab {
+            ActiveTab::Tasks => {
+                if let Some(task) = state.selected_task() {
+                    let _ = cmd_tx.send(TuiCommand::CancelTask(task.id));
+                } else {
+                    state.notify("No task selected".into(), NotificationLevel::Error);
                 }
             }
-        }
+            ActiveTab::Campaigns => {
+                if let Some(campaign) = state.selected_campaign() {
+                    let _ = cmd_tx.send(TuiCommand::CancelCampaign(campaign.id));
+                } else {
+                    state.notify("No campaign selected".into(), NotificationLevel::Error);
+                }
+            }
+            _ => {
+                state.notify(
+                    "Cancel not available on this tab".into(),
+                    NotificationLevel::Error,
+                );
+            }
+        },
         "start" => {
             if state.active_tab == ActiveTab::Campaigns {
                 if let Some(campaign) = state.selected_campaign() {
@@ -462,7 +520,10 @@ fn execute_command(
                     state.notify("No campaign selected".into(), NotificationLevel::Error);
                 }
             } else {
-                state.notify("Start only available on Campaigns tab".into(), NotificationLevel::Error);
+                state.notify(
+                    "Start only available on Campaigns tab".into(),
+                    NotificationLevel::Error,
+                );
             }
         }
         "delete" => {
@@ -473,7 +534,10 @@ fn execute_command(
                     state.notify("No task selected".into(), NotificationLevel::Error);
                 }
             } else {
-                state.notify("Delete only available on Tasks tab".into(), NotificationLevel::Error);
+                state.notify(
+                    "Delete only available on Tasks tab".into(),
+                    NotificationLevel::Error,
+                );
             }
         }
         "q" | "quit" => {
@@ -556,9 +620,19 @@ fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Tu
     match state.input_mode {
         InputMode::Command => {
             let input_line = Line::from(vec![
-                Span::styled(":", Style::default().fg(Theme::MAUVE).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    ":",
+                    Style::default()
+                        .fg(Theme::MAUVE)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(&state.input_buffer, Style::default().fg(Theme::TEXT)),
-                Span::styled("_", Style::default().fg(Theme::TEXT).add_modifier(Modifier::SLOW_BLINK)),
+                Span::styled(
+                    "_",
+                    Style::default()
+                        .fg(Theme::TEXT)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
             ]);
             f.render_widget(
                 Paragraph::new(input_line).style(Style::default().bg(Theme::MANTLE)),
@@ -567,9 +641,19 @@ fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Tu
         }
         InputMode::Search => {
             let input_line = Line::from(vec![
-                Span::styled("/", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(Theme::TEAL)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(&state.input_buffer, Style::default().fg(Theme::TEXT)),
-                Span::styled("_", Style::default().fg(Theme::TEXT).add_modifier(Modifier::SLOW_BLINK)),
+                Span::styled(
+                    "_",
+                    Style::default()
+                        .fg(Theme::TEXT)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
             ]);
             f.render_widget(
                 Paragraph::new(input_line).style(Style::default().bg(Theme::MANTLE)),
@@ -588,7 +672,8 @@ fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Tu
                 })
                 .unwrap_or_default();
 
-            let mut hints = String::from(" j/k:nav  Tab:switch  1-5:tabs  /:search  ::cmd  ?:help  q:quit ");
+            let mut hints =
+                String::from(" j/k:nav  Tab:switch  1-5:tabs  /:search  ::cmd  ?:help  q:quit ");
             if !state.search_filter.is_empty() {
                 hints.push_str(&format!(" [filter: {}]", state.search_filter));
             }

@@ -3,10 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crack_common::auth::Keypair;
-use crack_common::models::*;
 use crack_common::protocol::CoordMessage;
 use sqlx::SqlitePool;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 /// Shared application state accessible from REST API, transport handler, scheduler, and TUI.
@@ -28,6 +27,7 @@ pub struct AppState {
     pub events: broadcast::Sender<AppEvent>,
 }
 
+#[allow(dead_code)]
 pub struct WorkerConnection {
     pub worker_id: String,
     pub name: String,
@@ -37,22 +37,58 @@ pub struct WorkerConnection {
 
 /// Events broadcast to the TUI for live updates.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AppEvent {
-    WorkerConnected { worker_id: String, name: String },
-    WorkerDisconnected { worker_id: String },
-    TaskCreated { task_id: Uuid },
-    TaskUpdated { task_id: Uuid },
-    ChunkProgress { task_id: Uuid, chunk_id: Uuid, progress: f64, speed: u64 },
-    HashCracked { task_id: Uuid, hash: String },
-    TaskCompleted { task_id: Uuid },
-    AuditEntry { event_type: String, details: String },
-    CampaignCreated { campaign_id: Uuid },
-    CampaignPhaseAdvanced { campaign_id: Uuid, phase_index: u32 },
-    CampaignCompleted { campaign_id: Uuid },
+    WorkerConnected {
+        worker_id: String,
+        name: String,
+    },
+    WorkerDisconnected {
+        worker_id: String,
+    },
+    TaskCreated {
+        task_id: Uuid,
+    },
+    TaskUpdated {
+        task_id: Uuid,
+    },
+    ChunkProgress {
+        task_id: Uuid,
+        chunk_id: Uuid,
+        progress: f64,
+        speed: u64,
+    },
+    HashCracked {
+        task_id: Uuid,
+        hash: String,
+    },
+    TaskCompleted {
+        task_id: Uuid,
+    },
+    AuditEntry {
+        event_type: String,
+        details: String,
+    },
+    CampaignCreated {
+        campaign_id: Uuid,
+    },
+    CampaignPhaseAdvanced {
+        campaign_id: Uuid,
+        phase_index: u32,
+    },
+    CampaignCompleted {
+        campaign_id: Uuid,
+    },
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, data_dir: PathBuf, keypair: Keypair, hashcat_path: String, bind_addr: String) -> Arc<Self> {
+    pub fn new(
+        db: SqlitePool,
+        data_dir: PathBuf,
+        keypair: Keypair,
+        hashcat_path: String,
+        bind_addr: String,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             db,

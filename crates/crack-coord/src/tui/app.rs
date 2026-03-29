@@ -243,11 +243,34 @@ impl TuiState {
         }
         let filter = self.search_filter.to_lowercase();
         match self.active_tab {
-            ActiveTab::Tasks => self.tasks.iter().filter(|t| t.name.to_lowercase().contains(&filter)).count(),
-            ActiveTab::Workers => self.workers.iter().filter(|w| w.name.to_lowercase().contains(&filter)).count(),
-            ActiveTab::Results => self.results.iter().filter(|r| r.hash.to_lowercase().contains(&filter) || r.plaintext.to_lowercase().contains(&filter)).count(),
-            ActiveTab::AuditLog => self.audit_entries.iter().filter(|a| a.details.to_lowercase().contains(&filter)).count(),
-            ActiveTab::Campaigns => self.campaigns.iter().filter(|c| c.name.to_lowercase().contains(&filter)).count(),
+            ActiveTab::Tasks => self
+                .tasks
+                .iter()
+                .filter(|t| t.name.to_lowercase().contains(&filter))
+                .count(),
+            ActiveTab::Workers => self
+                .workers
+                .iter()
+                .filter(|w| w.name.to_lowercase().contains(&filter))
+                .count(),
+            ActiveTab::Results => self
+                .results
+                .iter()
+                .filter(|r| {
+                    r.hash.to_lowercase().contains(&filter)
+                        || r.plaintext.to_lowercase().contains(&filter)
+                })
+                .count(),
+            ActiveTab::AuditLog => self
+                .audit_entries
+                .iter()
+                .filter(|a| a.details.to_lowercase().contains(&filter))
+                .count(),
+            ActiveTab::Campaigns => self
+                .campaigns
+                .iter()
+                .filter(|c| c.name.to_lowercase().contains(&filter))
+                .count(),
         }
     }
 
