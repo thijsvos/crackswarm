@@ -163,6 +163,10 @@ async fn find_next_subtask(
 ) -> Result<Option<NextSubTask>> {
     let completed_mask = match &completed_task.attack_config {
         AttackConfig::BruteForce { mask, .. } => mask.clone(),
+        // Dictionary and DictionaryWithRules are single-task phases; no sub-task chaining.
+        AttackConfig::Dictionary { .. } | AttackConfig::DictionaryWithRules { .. } => {
+            return Ok(None);
+        }
     };
 
     match &phase.config {
@@ -419,9 +423,40 @@ async fn start_phase_inner(
             db::set_phase_task_id(&state.db, phase.id, task.id).await?;
         }
 
-        PhaseConfig::Dictionary { .. } | PhaseConfig::Hybrid { .. } => {
+        PhaseConfig::Dictionary { wordlist_file_id, rules } => {
+            let attack_config = if rules.is_empty() {
+                AttackConfig::Dictionary {
+                    wordlist_file_id: wordlist_file_id.clone(),
+                }
+            } else {
+                // For campaigns with rules, use the first rules file.
+                // Future: support multiple rules files.
+                AttackConfig::DictionaryWithRules {
+                    wordlist_file_id: wordlist_file_id.clone(),
+                    rules_file_id: rules[0].clone(),
+                }
+            };
+
+            let req = CreateTaskRequest {
+                name: format!("{} — {}", campaign.name, phase.name),
+                hash_mode: campaign.hash_mode,
+                hash_file_id: hash_file_id.to_string(),
+                attack_config,
+                priority: campaign.priority,
+                extra_args: campaign.extra_args.clone(),
+            };
+
+            let task = db::create_campaign_task(&state.db, &req, campaign.id).await?;
+            state.emit(AppEvent::TaskCreated { task_id: task.id });
+            db::set_phase_task_id(&state.db, phase.id, task.id).await?;
+
+            info!(campaign_id = %campaign.id, phase = phase.phase_index,
+                task_id = %task.id, "created dictionary task for campaign phase");
+        }
+
+        PhaseConfig::Hybrid { .. } => {
             warn!(campaign_id = %campaign.id, phase = phase.phase_index,
-                "dictionary/hybrid attacks not yet implemented, skipping phase");
+                "hybrid attacks not yet implemented, skipping phase");
             db::update_phase_status(&state.db, phase.id, PhaseStatus::Skipped).await?;
             advance_phase(state, campaign.id).await?;
         }

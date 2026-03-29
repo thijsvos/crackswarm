@@ -1,6 +1,10 @@
+use std::path::Path;
+
 use anyhow::{bail, Context};
 use crack_common::models::AttackConfig;
 use tracing::info;
+
+use crate::storage::files;
 
 /// Compute the total keyspace for an attack configuration.
 ///
@@ -12,6 +16,7 @@ pub async fn compute_keyspace(
     hashcat_path: &str,
     hash_mode: u32,
     attack_config: &AttackConfig,
+    files_dir: &Path,
 ) -> anyhow::Result<u64> {
     match attack_config {
         AttackConfig::BruteForce {
@@ -24,7 +29,64 @@ pub async fn compute_keyspace(
             info!(mask = %mask, keyspace, "computed base keyspace via hashcat --keyspace");
             Ok(keyspace)
         }
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            let wordlist_path = files::resolve_file_path(files_dir, wordlist_file_id)?;
+            let keyspace = compute_dictionary_keyspace(
+                hashcat_path, hash_mode, &wordlist_path.to_string_lossy(), None,
+            ).await?;
+            info!(wordlist = %wordlist_file_id, keyspace, "computed dictionary keyspace via hashcat --keyspace");
+            Ok(keyspace)
+        }
+        AttackConfig::DictionaryWithRules { wordlist_file_id, rules_file_id } => {
+            let wordlist_path = files::resolve_file_path(files_dir, wordlist_file_id)?;
+            let rules_path = files::resolve_file_path(files_dir, rules_file_id)?;
+            let keyspace = compute_dictionary_keyspace(
+                hashcat_path, hash_mode, &wordlist_path.to_string_lossy(), Some(&rules_path.to_string_lossy()),
+            ).await?;
+            info!(wordlist = %wordlist_file_id, rules = %rules_file_id, keyspace, "computed dictionary+rules keyspace via hashcat --keyspace");
+            Ok(keyspace)
+        }
     }
+}
+
+/// Run `hashcat --keyspace` for a dictionary attack (mode 0).
+async fn compute_dictionary_keyspace(
+    hashcat_path: &str,
+    hash_mode: u32,
+    wordlist_path: &str,
+    rules_path: Option<&str>,
+) -> anyhow::Result<u64> {
+    let mut cmd = tokio::process::Command::new(hashcat_path);
+    cmd.arg("-a").arg("0");
+    cmd.arg("-m").arg(hash_mode.to_string());
+    cmd.arg("--keyspace");
+    cmd.arg(wordlist_path);
+
+    if let Some(rules) = rules_path {
+        cmd.arg("-r").arg(rules);
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("failed to run hashcat --keyspace (dict) at '{hashcat_path}'"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "hashcat --keyspace (dict) failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let keyspace: u64 = stdout
+        .trim()
+        .parse()
+        .with_context(|| format!("failed to parse hashcat --keyspace output: '{}'", stdout.trim()))?;
+
+    Ok(keyspace)
 }
 
 /// Run `hashcat --keyspace` to get the exact restore-point count.

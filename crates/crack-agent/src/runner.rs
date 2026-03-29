@@ -34,10 +34,13 @@ pub struct HashcatRunConfig {
     pub hashcat_path: String,
     pub hash_file_path: PathBuf,
     pub hash_mode: u32,
-    pub mask: String,
+    pub attack_mode: u32,
+    pub mask: Option<String>,
     pub skip: u64,
     pub limit: u64,
     pub custom_charsets: Option<Vec<String>>,
+    pub wordlist_path: Option<PathBuf>,
+    pub rules_path: Option<PathBuf>,
     pub extra_args: Vec<String>,
     pub outfile_path: PathBuf,
 }
@@ -53,8 +56,8 @@ impl HashcatRunner {
     pub fn start(config: &HashcatRunConfig) -> anyhow::Result<Self> {
         let mut cmd = Command::new(&config.hashcat_path);
 
-        // Attack mode 3 = brute-force / mask
-        cmd.arg("-a").arg("3");
+        // Attack mode
+        cmd.arg("-a").arg(config.attack_mode.to_string());
 
         // Hash mode
         cmd.arg("-m").arg(config.hash_mode.to_string());
@@ -62,8 +65,26 @@ impl HashcatRunner {
         // Hash file
         cmd.arg(&config.hash_file_path);
 
-        // Mask
-        cmd.arg(&config.mask);
+        // Attack-specific positional argument
+        match config.attack_mode {
+            0 => {
+                // Dictionary: wordlist is the positional argument
+                if let Some(ref wl) = config.wordlist_path {
+                    cmd.arg(wl);
+                }
+                // Optional rules file
+                if let Some(ref rules) = config.rules_path {
+                    cmd.arg("-r").arg(rules);
+                }
+            }
+            3 => {
+                // Brute-force: mask is the positional argument
+                if let Some(ref mask) = config.mask {
+                    cmd.arg(mask);
+                }
+            }
+            _ => {}
+        }
 
         // Keyspace range
         cmd.arg("--skip").arg(config.skip.to_string());
@@ -121,7 +142,10 @@ impl HashcatRunner {
         info!(
             hashcat = %config.hashcat_path,
             hash_mode = config.hash_mode,
-            mask = %config.mask,
+            attack_mode = config.attack_mode,
+            mask = ?config.mask,
+            wordlist = ?config.wordlist_path,
+            rules = ?config.rules_path,
             skip = config.skip,
             limit = config.limit,
             "starting hashcat process"

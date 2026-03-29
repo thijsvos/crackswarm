@@ -42,6 +42,33 @@ pub async fn create_task(
             ApiError::BadRequest(format!("hash file not found: {}", req.hash_file_id))
         })?;
 
+    // Validate referenced files in the attack config.
+    match &req.attack_config {
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            db::get_file_record(&state.db, wordlist_file_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!("wordlist file not found: {wordlist_file_id}"))
+                })?;
+        }
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id,
+            rules_file_id,
+        } => {
+            db::get_file_record(&state.db, wordlist_file_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!("wordlist file not found: {wordlist_file_id}"))
+                })?;
+            db::get_file_record(&state.db, rules_file_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!("rules file not found: {rules_file_id}"))
+                })?;
+        }
+        AttackConfig::BruteForce { .. } => {}
+    }
+
     let task = db::create_task(&state.db, &req).await?;
     state.emit(AppEvent::TaskCreated { task_id: task.id });
 
