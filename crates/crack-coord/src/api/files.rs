@@ -92,7 +92,12 @@ pub async fn download_file(
     let data = files::read_file(&files_dir, &record.id)
         .map_err(|e| ApiError::Internal(format!("failed to read file: {e}")))?;
 
-    let content_disposition = format!("attachment; filename=\"{}\"", record.filename);
+    // Sanitize filename to prevent header injection via quotes, newlines, or null bytes.
+    let safe_filename = record
+        .filename
+        .replace('"', "'")
+        .replace(['\n', '\r', '\0'], "");
+    let content_disposition = format!("attachment; filename=\"{}\"", safe_filename);
 
     Ok((
         StatusCode::OK,

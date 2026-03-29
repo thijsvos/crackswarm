@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -113,8 +115,11 @@ impl HashcatRunner {
         // Output file
         cmd.arg("-o").arg(&config.outfile_path);
         // hashcat 7.x uses comma-separated format values (not bitmask like 6.x).
-        // 1 = hash, 2 = plain → "hash:plain" output.
+        // 1 = hash, 2 = plain → "hash<sep>plain" output.
         cmd.arg("--outfile-format=1,2");
+        // Use tab separator to avoid ambiguity with hashes or plaintexts that
+        // contain colons (the default separator).
+        cmd.arg("--separator").arg("\t");
 
         // Custom charsets (-1, -2, -3, -4)
         if let Some(charsets) = &config.custom_charsets {
@@ -123,8 +128,12 @@ impl HashcatRunner {
             }
         }
 
-        // Extra user-supplied arguments
+        // Extra user-supplied arguments (filtered for safety)
         for arg in &config.extra_args {
+            if is_dangerous_arg(arg) {
+                warn!(arg = %arg, "rejecting dangerous extra_arg");
+                continue;
+            }
             cmd.arg(arg);
         }
 
@@ -182,9 +191,14 @@ impl HashcatRunner {
         let tx_outfile = tx.clone();
         let tx_stderr = tx.clone();
 
+        // Shared set to deduplicate hashes across stdout, outfile watcher, and
+        // the final outfile read.
+        let seen_hashes: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seen_outfile = Arc::clone(&seen_hashes);
+
         // Spawn a task to watch the outfile for new cracked hashes
         let outfile_handle = tokio::spawn(async move {
-            watch_outfile(&outfile, tx_outfile).await;
+            watch_outfile(&outfile, tx_outfile, seen_outfile).await;
         });
 
         // Spawn a task to capture stderr
@@ -242,13 +256,16 @@ impl HashcatRunner {
                     })
                     .await;
             } else if let Some((hash, plaintext)) = status::parse_outfile_line(&line) {
-                // hashcat prints cracked hashes to stdout as "hash:plaintext".
-                // Filter out hashcat info lines (contain spaces/dots before ':',
+                // hashcat prints cracked hashes to stdout as "hash\tplaintext".
+                // Filter out hashcat info lines (contain spaces/dots before separator,
                 // or the "hash" part is too short to be a real hash).
                 let is_info_line = hash.contains(' ') || hash.contains("...") || hash.len() < 16;
                 if !is_info_line {
-                    info!(hash = %hash, "hash cracked (stdout)");
-                    let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
+                    let is_new = seen_hashes.lock().unwrap().insert(hash.clone());
+                    if is_new {
+                        info!(hash = %hash, "hash cracked (stdout)");
+                        let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
+                    }
                 }
             } else {
                 debug!(line = %line, "hashcat stdout (non-JSON)");
@@ -272,12 +289,16 @@ impl HashcatRunner {
         // The watcher polls every 2s, but hashcat can complete faster than that.
         // Note: hashcat only creates the outfile when it cracks something,
         // so a missing outfile on exit_code=1 (exhausted) is completely normal.
-        match tokio::fs::read_to_string(&self.outfile_path).await {
-            Ok(contents) => {
+        match tokio::fs::read(&self.outfile_path).await {
+            Ok(bytes) => {
+                let contents = String::from_utf8_lossy(&bytes);
                 for line in contents.lines() {
                     if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
-                        info!(hash = %hash, plaintext = %plaintext, "hash cracked (final outfile read)");
-                        let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
+                        let is_new = seen_hashes.lock().unwrap().insert(hash.clone());
+                        if is_new {
+                            info!(hash = %hash, plaintext = %plaintext, "hash cracked (final outfile read)");
+                            let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
+                        }
                     }
                 }
             }
@@ -346,11 +367,36 @@ impl HashcatRunner {
     }
 }
 
+/// Reject extra_args that could interfere with orchestration or write to
+/// arbitrary paths.
+fn is_dangerous_arg(arg: &str) -> bool {
+    const BLOCKED_PREFIXES: &[&str] = &[
+        "-o",
+        "--outfile",
+        "--potfile",
+        "--session",
+        "--remove",
+        "--restore",
+        "--keyspace",
+        "--stdout",
+        "--separator",
+    ];
+    let lower = arg.to_ascii_lowercase();
+    BLOCKED_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
 /// Watch an outfile for newly appended lines (cracked hashes).
 ///
-/// This polls the file periodically.  Each new line in format `hash:plaintext`
-/// is sent through the channel.
-async fn watch_outfile(path: &Path, tx: mpsc::Sender<RunnerEvent>) {
+/// This polls the file periodically.  Each new line in format `hash\tplaintext`
+/// is sent through the channel.  Uses raw bytes + lossy conversion to avoid
+/// panicking on non-UTF-8 outfile content.
+async fn watch_outfile(
+    path: &Path,
+    tx: mpsc::Sender<RunnerEvent>,
+    seen: Arc<Mutex<HashSet<String>>>,
+) {
     use tokio::fs;
     use tokio::time::{interval, Duration};
 
@@ -370,25 +416,30 @@ async fn watch_outfile(path: &Path, tx: mpsc::Sender<RunnerEvent>) {
             continue;
         }
 
-        // Read the new portion
-        match fs::read_to_string(path).await {
-            Ok(contents) => {
-                // We need to skip bytes we already processed
-                let new_data = if last_size as usize <= contents.len() {
-                    &contents[last_size as usize..]
+        // Read the file as raw bytes to avoid UTF-8 panics
+        match fs::read(path).await {
+            Ok(bytes) => {
+                // Skip bytes we already processed
+                let new_bytes = if (last_size as usize) <= bytes.len() {
+                    &bytes[last_size as usize..]
                 } else {
-                    &contents
+                    &bytes
                 };
+
+                let new_data = String::from_utf8_lossy(new_bytes);
 
                 for line in new_data.lines() {
                     if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
-                        info!(hash = %hash, "hash cracked!");
-                        if tx
-                            .send(RunnerEvent::HashCracked { hash, plaintext })
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        let is_new = seen.lock().unwrap().insert(hash.clone());
+                        if is_new {
+                            info!(hash = %hash, "hash cracked!");
+                            if tx
+                                .send(RunnerEvent::HashCracked { hash, plaintext })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                 }

@@ -16,7 +16,8 @@ pub fn parse_status_line(line: &str) -> Option<HashcatStatus> {
     serde_json::from_str::<HashcatStatus>(trimmed).ok()
 }
 
-/// Parse a line from the hashcat outfile (format=3: `hash:plaintext`).
+/// Parse a line from the hashcat outfile (format=1,2 with tab separator:
+/// `hash\tplaintext`).
 ///
 /// Returns `(hash, plaintext)` or `None` if the line doesn't contain a
 /// separator.
@@ -25,8 +26,8 @@ pub fn parse_outfile_line(line: &str) -> Option<(String, String)> {
     if trimmed.is_empty() {
         return None;
     }
-    // outfile-format=3 produces "hash:plaintext"
-    let (hash, plain) = trimmed.split_once(':')?;
+    // outfile-format=1,2 with --separator=\t produces "hash\tplaintext"
+    let (hash, plain) = trimmed.split_once('\t')?;
     Some((hash.to_string(), plain.to_string()))
 }
 
@@ -148,7 +149,7 @@ mod tests {
     #[test]
     fn test_parse_outfile_line() {
         let (hash, plain) =
-            parse_outfile_line("5f4dcc3b5aa765d61d8327deb882cf99:password").unwrap();
+            parse_outfile_line("5f4dcc3b5aa765d61d8327deb882cf99\tpassword").unwrap();
         assert_eq!(hash, "5f4dcc3b5aa765d61d8327deb882cf99");
         assert_eq!(plain, "password");
     }
@@ -162,5 +163,14 @@ mod tests {
     #[test]
     fn test_parse_outfile_line_no_separator() {
         assert!(parse_outfile_line("no_separator_here").is_none());
+    }
+
+    #[test]
+    fn test_parse_outfile_line_colon_in_plaintext() {
+        // Colons in the plaintext should not cause a split (we use tab separator)
+        let (hash, plain) =
+            parse_outfile_line("5f4dcc3b5aa765d61d8327deb882cf99\tpass:word").unwrap();
+        assert_eq!(hash, "5f4dcc3b5aa765d61d8327deb882cf99");
+        assert_eq!(plain, "pass:word");
     }
 }

@@ -350,6 +350,17 @@ async fn connect_and_run(
                         total_chunks,
                         data_b64,
                     } => {
+                        // Validate file_id is a proper UUID to prevent path traversal
+                        Uuid::parse_str(&file_id).context("invalid file_id: not a valid UUID")?;
+
+                        // Bounds checks
+                        if total_chunks > 10_000 {
+                            return Err(anyhow!("file transfer too large"));
+                        }
+                        if chunk_index >= total_chunks {
+                            continue;
+                        }
+
                         // Decode chunk data
                         let data = base64::engine::general_purpose::STANDARD
                             .decode(&data_b64)
@@ -795,6 +806,9 @@ async fn save_hash_file(
     file_id: &str,
     b64_data: &str,
 ) -> anyhow::Result<PathBuf> {
+    // Validate file_id is a proper UUID to prevent path traversal
+    Uuid::parse_str(file_id).context("invalid file_id: not a valid UUID")?;
+
     let cache_dir = config.cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
 
