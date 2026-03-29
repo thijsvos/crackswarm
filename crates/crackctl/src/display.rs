@@ -473,3 +473,113 @@ pub fn print_templates(templates: &[CampaignTemplate]) {
         println!();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate ──
+
+    #[test]
+    fn truncate_within_limit() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_at_limit() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_over_limit() {
+        let r = truncate("hello world", 8);
+        assert!(r.len() <= 8);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_empty() {
+        assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn truncate_small_max() {
+        let r = truncate("hello", 3);
+        assert_eq!(r, "...");
+    }
+
+    #[test]
+    fn truncate_utf8_safe() {
+        // Must not panic on multibyte chars
+        let r = truncate("cafe\u{0301} re\u{0301}sume\u{0301}", 8);
+        assert!(r.len() <= 11); // may include combining chars
+    }
+
+    #[test]
+    fn truncate_cjk() {
+        // Must not panic on CJK characters (3 bytes each in UTF-8)
+        let _r = truncate("\u{4e16}\u{754c}\u{4f60}\u{597d}\u{6d4b}\u{8bd5}", 10);
+    }
+
+    // ── short_id ──
+
+    #[test]
+    fn short_id_uuid() {
+        assert_eq!(short_id("550e8400-e29b-41d4-a716-446655440000"), "550e8400");
+    }
+
+    #[test]
+    fn short_id_short() {
+        assert_eq!(short_id("abc"), "abc");
+    }
+
+    #[test]
+    fn short_id_exact_8() {
+        assert_eq!(short_id("12345678"), "12345678");
+    }
+
+    // ── human_size ──
+
+    #[test]
+    fn human_size_bytes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+    }
+
+    #[test]
+    fn human_size_kb() {
+        assert!(human_size(1024).contains("KB"));
+    }
+
+    #[test]
+    fn human_size_mb() {
+        assert!(human_size(1_048_576).contains("MB"));
+    }
+
+    #[test]
+    fn human_size_gb() {
+        assert!(human_size(1_073_741_824).contains("GB"));
+    }
+
+    // ── human_speed ──
+
+    #[test]
+    fn human_speed_low() {
+        assert!(human_speed(500).contains("H/s"));
+    }
+
+    #[test]
+    fn human_speed_kilo() {
+        assert!(human_speed(5_000).contains("kH/s"));
+    }
+
+    #[test]
+    fn human_speed_mega() {
+        assert!(human_speed(5_000_000).contains("MH/s"));
+    }
+
+    #[test]
+    fn human_speed_giga() {
+        assert!(human_speed(5_000_000_000).contains("GH/s"));
+    }
+}

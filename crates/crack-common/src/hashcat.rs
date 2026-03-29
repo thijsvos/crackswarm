@@ -80,3 +80,104 @@ impl HashcatStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_status(
+        devices: Option<Vec<DeviceStatus>>,
+        progress: Option<Vec<u64>>,
+    ) -> HashcatStatus {
+        HashcatStatus {
+            session: None,
+            guess: None,
+            status: None,
+            target: None,
+            progress,
+            restore_point: None,
+            recovered_hashes: None,
+            recovered_salts: None,
+            rejected: None,
+            devices,
+            time_start: None,
+            estimated_stop: None,
+        }
+    }
+
+    fn make_device(speed: Option<u64>) -> DeviceStatus {
+        DeviceStatus {
+            device_id: Some(1),
+            device_name: Some("GPU".to_string()),
+            device_type: Some("GPU".to_string()),
+            speed,
+            temp: None,
+            util: None,
+        }
+    }
+
+    // ── total_speed ──
+
+    #[test]
+    fn total_speed_no_devices() {
+        let s = make_status(None, None);
+        assert_eq!(s.total_speed(), 0);
+    }
+
+    #[test]
+    fn total_speed_empty_devices() {
+        let s = make_status(Some(vec![]), None);
+        assert_eq!(s.total_speed(), 0);
+    }
+
+    #[test]
+    fn total_speed_mixed() {
+        let s = make_status(
+            Some(vec![
+                make_device(Some(1_000_000)),
+                make_device(None),
+                make_device(Some(2_000_000)),
+            ]),
+            None,
+        );
+        assert_eq!(s.total_speed(), 3_000_000);
+    }
+
+    // ── progress_pct ──
+
+    #[test]
+    fn progress_pct_none() {
+        let s = make_status(None, None);
+        assert!((s.progress_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_pct_empty() {
+        let s = make_status(None, Some(vec![]));
+        assert!((s.progress_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_pct_one_element() {
+        let s = make_status(None, Some(vec![50]));
+        assert!((s.progress_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_pct_zero_total() {
+        let s = make_status(None, Some(vec![0, 0]));
+        assert!((s.progress_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_pct_half() {
+        let s = make_status(None, Some(vec![50, 100]));
+        assert!((s.progress_pct() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_pct_complete() {
+        let s = make_status(None, Some(vec![100, 100]));
+        assert!((s.progress_pct() - 100.0).abs() < f64::EPSILON);
+    }
+}

@@ -550,4 +550,134 @@ mod tests {
         assert_eq!(decoded.server_addr, "0.0.0.0:8443");
         assert_eq!(decoded.worker_name, "test-worker");
     }
+
+    // ── AttackConfig serde round-trips ──
+
+    #[test]
+    fn attack_config_brute_force_serde() {
+        let config = AttackConfig::BruteForce {
+            mask: "?a?a?a?a".to_string(),
+            custom_charsets: Some(vec!["?l?d".to_string()]),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"type\":\"brute_force\""));
+        let decoded: AttackConfig = serde_json::from_str(&json).unwrap();
+        match decoded {
+            AttackConfig::BruteForce {
+                mask,
+                custom_charsets,
+            } => {
+                assert_eq!(mask, "?a?a?a?a");
+                assert_eq!(custom_charsets, Some(vec!["?l?d".to_string()]));
+            }
+            other => panic!("expected BruteForce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attack_config_dictionary_serde() {
+        let config = AttackConfig::Dictionary {
+            wordlist_file_id: "wl-42".to_string(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"type\":\"dictionary\""));
+        let decoded: AttackConfig = serde_json::from_str(&json).unwrap();
+        match decoded {
+            AttackConfig::Dictionary { wordlist_file_id } => {
+                assert_eq!(wordlist_file_id, "wl-42");
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attack_config_dict_rules_serde() {
+        let config = AttackConfig::DictionaryWithRules {
+            wordlist_file_id: "wl-1".to_string(),
+            rules_file_id: "rl-1".to_string(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"type\":\"dictionary_with_rules\""));
+        let decoded: AttackConfig = serde_json::from_str(&json).unwrap();
+        match decoded {
+            AttackConfig::DictionaryWithRules {
+                wordlist_file_id,
+                rules_file_id,
+            } => {
+                assert_eq!(wordlist_file_id, "wl-1");
+                assert_eq!(rules_file_id, "rl-1");
+            }
+            other => panic!("expected DictionaryWithRules, got {other:?}"),
+        }
+    }
+
+    // ── Status enum Display + FromStr round-trips ──
+
+    #[test]
+    fn task_status_roundtrip() {
+        let variants = [
+            TaskStatus::Pending,
+            TaskStatus::Ready,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ];
+        for variant in variants {
+            let s = variant.to_string();
+            let parsed: TaskStatus = s.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn chunk_status_roundtrip() {
+        let variants = [
+            ChunkStatus::Pending,
+            ChunkStatus::Dispatched,
+            ChunkStatus::Running,
+            ChunkStatus::Completed,
+            ChunkStatus::Exhausted,
+            ChunkStatus::Failed,
+            ChunkStatus::Abandoned,
+        ];
+        for variant in variants {
+            let s = variant.to_string();
+            let parsed: ChunkStatus = s.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn campaign_status_roundtrip() {
+        let variants = [
+            CampaignStatus::Draft,
+            CampaignStatus::Running,
+            CampaignStatus::Completed,
+            CampaignStatus::Failed,
+            CampaignStatus::Cancelled,
+        ];
+        for variant in variants {
+            let s = variant.to_string();
+            let parsed: CampaignStatus = s.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn phase_status_roundtrip() {
+        let variants = [
+            PhaseStatus::Pending,
+            PhaseStatus::Running,
+            PhaseStatus::Completed,
+            PhaseStatus::Exhausted,
+            PhaseStatus::Failed,
+            PhaseStatus::Skipped,
+        ];
+        for variant in variants {
+            let s = variant.to_string();
+            let parsed: PhaseStatus = s.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
 }

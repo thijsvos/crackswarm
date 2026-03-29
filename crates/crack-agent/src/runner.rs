@@ -452,3 +452,76 @@ async fn watch_outfile(
         last_size = size;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dangerous_outfile() {
+        assert!(is_dangerous_arg("-o"));
+        assert!(is_dangerous_arg("-o/tmp/evil"));
+    }
+
+    #[test]
+    fn dangerous_outfile_long() {
+        assert!(is_dangerous_arg("--outfile"));
+        assert!(is_dangerous_arg("--outfile=/tmp"));
+    }
+
+    #[test]
+    fn dangerous_potfile() {
+        assert!(is_dangerous_arg("--potfile-path"));
+    }
+
+    #[test]
+    fn dangerous_session() {
+        assert!(is_dangerous_arg("--session=test"));
+    }
+
+    #[test]
+    fn dangerous_remove() {
+        assert!(is_dangerous_arg("--remove"));
+        assert!(is_dangerous_arg("--remove-timer=5"));
+    }
+
+    #[test]
+    fn dangerous_restore() {
+        assert!(is_dangerous_arg("--restore"));
+    }
+
+    #[test]
+    fn dangerous_keyspace() {
+        assert!(is_dangerous_arg("--keyspace"));
+    }
+
+    #[test]
+    fn dangerous_stdout() {
+        assert!(is_dangerous_arg("--stdout"));
+    }
+
+    #[test]
+    fn dangerous_separator() {
+        assert!(is_dangerous_arg("--separator"));
+    }
+
+    #[test]
+    fn dangerous_case_insensitive() {
+        assert!(is_dangerous_arg("--OUTFILE"));
+        assert!(is_dangerous_arg("--Potfile-Path"));
+    }
+
+    #[test]
+    fn safe_args_pass() {
+        assert!(!is_dangerous_arg("--force"));
+        assert!(!is_dangerous_arg("-w3"));
+        assert!(!is_dangerous_arg("--optimized-kernel-enable"));
+        assert!(!is_dangerous_arg("-r"));
+        assert!(!is_dangerous_arg("--increment"));
+    }
+
+    #[test]
+    fn empty_arg_is_safe() {
+        assert!(!is_dangerous_arg(""));
+    }
+}
