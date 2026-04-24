@@ -36,3 +36,4 @@ toml = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 reqwest = { workspace = true }
+tokio-util = { workspace = true }

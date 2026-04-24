@@ -18,10 +18,12 @@ pub async fn upload_file(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> ApiResult<impl IntoResponse> {
-    let mut file_data: Option<(String, Vec<u8>)> = None;
-    let mut file_type = "hash".to_string();
+    let files_dir = state.files_dir();
 
-    while let Some(field) = multipart
+    let mut file_type = "hash".to_string();
+    let mut saved: Option<(String, String, u64, String)> = None; // (file_id, sha256, size, filename)
+
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
@@ -31,11 +33,42 @@ pub async fn upload_file(
         match field_name.as_str() {
             "file" => {
                 let filename = field.file_name().unwrap_or("upload").to_string();
-                let data = field
-                    .bytes()
+
+                // Stream the field straight to a `.partial` file while hashing
+                // incrementally. Nothing is buffered in RAM beyond the current
+                // chunk — supports arbitrary upload sizes bounded only by disk.
+                let mut writer = files::FileWriter::create(&files_dir, &filename)
                     .await
-                    .map_err(|e| ApiError::BadRequest(format!("failed to read file: {e}")))?;
-                file_data = Some((filename, data.to_vec()));
+                    .map_err(|e| {
+                        ApiError::Internal(format!("failed to open file for writing: {e}"))
+                    })?;
+
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if let Err(e) = writer.write_chunk(&chunk).await {
+                                writer.abort().await;
+                                return Err(ApiError::Internal(format!(
+                                    "failed to write chunk: {e}"
+                                )));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            writer.abort().await;
+                            return Err(ApiError::BadRequest(format!(
+                                "failed to read upload stream: {e}"
+                            )));
+                        }
+                    }
+                }
+
+                let (file_id, sha256, size) = writer
+                    .finalize()
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("failed to finalize upload: {e}")))?;
+
+                saved = Some((file_id, sha256, size, filename));
             }
             "file_type" => {
                 let value = field
@@ -50,13 +83,8 @@ pub async fn upload_file(
         }
     }
 
-    let (filename, data) =
-        file_data.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_string()))?;
-
-    // Save to disk (also computes sha256).
-    let files_dir = state.files_dir();
-    let (file_id, sha256) = files::save_file(&files_dir, &filename, &data)
-        .map_err(|e| ApiError::Internal(format!("failed to save file: {e}")))?;
+    let (file_id, sha256, size_bytes, filename) =
+        saved.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_string()))?;
 
     // Content dedup: if we already have a file with this sha256, drop the
     // one we just wrote and return the existing record. Keeps the operator
@@ -88,7 +116,7 @@ pub async fn upload_file(
         id: file_id,
         filename,
         file_type,
-        size_bytes: data.len() as i64,
+        size_bytes: size_bytes as i64,
         sha256,
         disk_path,
         uploaded_at: Utc::now(),

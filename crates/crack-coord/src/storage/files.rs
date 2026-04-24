@@ -2,7 +2,108 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+/// Streaming writer for an incoming upload. Writes to a `.partial` companion
+/// file so a crash or error leaves no half-finished entry in the canonical
+/// name slot; only a successful `finalize()` does the atomic rename.
+///
+/// SHA-256 and size are computed incrementally as chunks arrive. Callers
+/// drive the write loop (no axum/multipart types here — storage stays
+/// transport-agnostic).
+pub struct FileWriter {
+    file_id: String,
+    partial_path: PathBuf,
+    final_path: PathBuf,
+    file: tokio::fs::File,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl FileWriter {
+    pub async fn create(files_dir: &Path, filename: &str) -> Result<Self> {
+        tokio::fs::create_dir_all(files_dir)
+            .await
+            .with_context(|| format!("creating files directory: {}", files_dir.display()))?;
+
+        let file_id = Uuid::new_v4().to_string();
+
+        let ext = Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let disk_name = if ext.is_empty() {
+            file_id.clone()
+        } else {
+            format!("{file_id}.{ext}")
+        };
+
+        let final_path = files_dir.join(&disk_name);
+        let partial_path = files_dir.join(format!("{disk_name}.partial"));
+
+        let file = tokio::fs::File::create(&partial_path)
+            .await
+            .with_context(|| format!("creating {}", partial_path.display()))?;
+
+        Ok(Self {
+            file_id,
+            partial_path,
+            final_path,
+            file,
+            hasher: Sha256::new(),
+            size: 0,
+        })
+    }
+
+    pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file
+            .write_all(bytes)
+            .await
+            .with_context(|| format!("writing to {}", self.partial_path.display()))?;
+        self.hasher.update(bytes);
+        self.size += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Finish the upload: flush to disk, rename `.partial` to the final name,
+    /// and return `(file_id, sha256_hex, size_bytes)`.
+    pub async fn finalize(mut self) -> Result<(String, String, u64)> {
+        self.file
+            .flush()
+            .await
+            .with_context(|| format!("flushing {}", self.partial_path.display()))?;
+        drop(self.file);
+
+        let sha256 = format!("{:x}", self.hasher.finalize());
+
+        tokio::fs::rename(&self.partial_path, &self.final_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "renaming {} -> {}",
+                    self.partial_path.display(),
+                    self.final_path.display()
+                )
+            })?;
+
+        tracing::debug!(
+            file_id = %self.file_id,
+            size = self.size,
+            sha256 = %sha256,
+            "Saved file to disk (streaming)"
+        );
+
+        Ok((self.file_id, sha256, self.size))
+    }
+
+    /// Remove the `.partial` file if the upload was aborted. Best-effort; a
+    /// leftover `.partial` will be tolerated by future GC sweeps.
+    pub async fn abort(self) {
+        let _ = tokio::fs::remove_file(&self.partial_path).await;
+    }
+}
 
 /// Save file data to disk with a UUID-based filename.
 ///
@@ -129,4 +230,90 @@ pub fn delete_file(files_dir: &Path, file_id: &str) -> Result<()> {
         "file not found for deletion: {file_id} in {}",
         files_dir.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a unique scratch directory under the OS temp dir. Cleanup is
+    /// best-effort via `Drop` on the returned guard.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("crack-coord-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_writer_roundtrip_computes_sha_and_size() {
+        let dir = TempDir::new();
+        let mut writer = FileWriter::create(&dir.path, "sample.txt").await.unwrap();
+        writer.write_chunk(b"hello").await.unwrap();
+        writer.write_chunk(b" world").await.unwrap();
+        let (file_id, sha256, size) = writer.finalize().await.unwrap();
+
+        assert_eq!(size, 11);
+        // sha256("hello world")
+        assert_eq!(
+            sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+
+        let on_disk = resolve_file_path(&dir.path, &file_id).unwrap();
+        let data = std::fs::read(&on_disk).unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn file_writer_partial_is_renamed_on_finalize() {
+        let dir = TempDir::new();
+        let mut writer = FileWriter::create(&dir.path, "note.md").await.unwrap();
+        writer.write_chunk(b"x").await.unwrap();
+        let partial = writer.partial_path.clone();
+        assert!(partial.exists(), ".partial should exist during write");
+
+        writer.finalize().await.unwrap();
+        assert!(!partial.exists(), ".partial should be renamed on finalize");
+    }
+
+    #[tokio::test]
+    async fn file_writer_abort_removes_partial() {
+        let dir = TempDir::new();
+        let mut writer = FileWriter::create(&dir.path, "note.md").await.unwrap();
+        writer.write_chunk(b"abc").await.unwrap();
+        let partial = writer.partial_path.clone();
+        assert!(partial.exists());
+
+        writer.abort().await;
+        assert!(!partial.exists(), "abort should remove the .partial file");
+    }
+
+    #[tokio::test]
+    async fn file_writer_empty_upload_produces_empty_file() {
+        let dir = TempDir::new();
+        let writer = FileWriter::create(&dir.path, "empty.bin").await.unwrap();
+        let (file_id, sha256, size) = writer.finalize().await.unwrap();
+
+        assert_eq!(size, 0);
+        // sha256 of empty string
+        assert_eq!(
+            sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        let on_disk = resolve_file_path(&dir.path, &file_id).unwrap();
+        assert_eq!(std::fs::metadata(&on_disk).unwrap().len(), 0);
+    }
 }

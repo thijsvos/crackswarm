@@ -85,10 +85,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .delete(tasks::delete_task),
         )
         .route("/api/v1/tasks/{id}/results", get(tasks::get_task_results))
-        // Files
+        // Files — uploads are streamed directly to disk, so the global
+        // 512 MiB limit doesn't apply. Disabled only on this route.
         .route(
             "/api/v1/files",
-            post(files::upload_file).get(files::list_files),
+            post(files::upload_file)
+                .get(files::list_files)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/v1/files/{id}", get(files::download_file))
         // Workers
