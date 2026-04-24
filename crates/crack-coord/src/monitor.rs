@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use crack_common::models::Task;
 use tracing::{error, info, warn};
 
 use crate::scheduler::chunker;
@@ -38,96 +39,115 @@ pub async fn run_monitor(state: Arc<AppState>) {
     }
 }
 
-/// Find pending tasks, compute their keyspace and hash count, and transition
-/// them to running so they become dispatchable.
-async fn prepare_pending_tasks(state: &AppState) -> anyhow::Result<()> {
+/// Find pending tasks and spawn a preparation task for each one that isn't
+/// already being prepared. Prep can take minutes for large wordlists (hashcat
+/// --keyspace linearly scans the file), so we must not block the monitor loop
+/// or heartbeats stall for the duration of the scan.
+async fn prepare_pending_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     let pending = db::get_pending_tasks(&state.db).await?;
 
     for task in pending {
-        info!(task_id = %task.id, task_name = %task.name, "preparing pending task");
+        let task_id = task.id;
 
-        // 1. Count hashes in the hash file
-        let _hash_file = match db::get_file_record(&state.db, &task.hash_file_id).await? {
-            Some(f) => f,
-            None => {
-                error!(task_id = %task.id, "hash file {} not found, failing task", task.hash_file_id);
-                db::update_task_status(
-                    &state.db,
-                    task.id,
-                    crack_common::models::TaskStatus::Failed,
-                )
-                .await?;
+        // Claim the task for preparation. If it's already being prepared (from
+        // a prior tick), skip.
+        {
+            let mut preparing = state.preparing_tasks.write().await;
+            if !preparing.insert(task_id) {
                 continue;
             }
-        };
-
-        let file_data = match files::read_file(&state.files_dir(), &task.hash_file_id) {
-            Ok(data) => data,
-            Err(e) => {
-                error!(task_id = %task.id, error = %e, "failed to read hash file");
-                db::update_task_status(
-                    &state.db,
-                    task.id,
-                    crack_common::models::TaskStatus::Failed,
-                )
-                .await?;
-                continue;
-            }
-        };
-
-        let content = String::from_utf8_lossy(&file_data);
-        let total_hashes = content.lines().filter(|l| !l.trim().is_empty()).count() as u32;
-
-        if total_hashes == 0 {
-            error!(task_id = %task.id, "hash file is empty, failing task");
-            db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed)
-                .await?;
-            continue;
         }
 
-        // 2. Compute keyspace via hashcat
-        let keyspace = match chunker::compute_keyspace(
-            &state.hashcat_path,
-            task.hash_mode,
-            &task.attack_config,
-            &state.files_dir(),
-        )
-        .await
-        {
-            Ok(ks) => ks,
-            Err(e) => {
-                error!(task_id = %task.id, error = %e, "failed to compute keyspace");
-                db::update_task_status(
-                    &state.db,
-                    task.id,
-                    crack_common::models::TaskStatus::Failed,
-                )
-                .await?;
-                continue;
+        let state_for_spawn = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = prepare_one(&state_for_spawn, task).await {
+                warn!(%task_id, error = %e, "task preparation failed");
             }
-        };
-
-        info!(
-            task_id = %task.id,
-            total_hashes,
-            keyspace,
-            "task prepared, transitioning to running"
-        );
-
-        // 3. Store keyspace and hash count
-        db::set_task_keyspace(&state.db, task.id, keyspace, total_hashes).await?;
-
-        // 4. Transition to running
-        db::update_task_status(
-            &state.db,
-            task.id,
-            crack_common::models::TaskStatus::Running,
-        )
-        .await?;
-
-        state.emit(AppEvent::TaskUpdated { task_id: task.id });
+            state_for_spawn
+                .preparing_tasks
+                .write()
+                .await
+                .remove(&task_id);
+        });
     }
 
+    Ok(())
+}
+
+/// Prepare a single task: validate hash file, count hashes, compute keyspace,
+/// transition to Running. Runs inside a spawned task so it doesn't block the
+/// monitor loop.
+async fn prepare_one(state: &AppState, task: Task) -> anyhow::Result<()> {
+    info!(task_id = %task.id, task_name = %task.name, "preparing pending task");
+
+    // 1. Ensure the hash file still exists in the files table.
+    if db::get_file_record(&state.db, &task.hash_file_id)
+        .await?
+        .is_none()
+    {
+        error!(task_id = %task.id, "hash file {} not found, failing task", task.hash_file_id);
+        db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed)
+            .await?;
+        return Ok(());
+    }
+
+    // 2. Count hashes in the hash file.
+    let file_data = match files::read_file(&state.files_dir(), &task.hash_file_id) {
+        Ok(data) => data,
+        Err(e) => {
+            error!(task_id = %task.id, error = %e, "failed to read hash file");
+            db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let content = String::from_utf8_lossy(&file_data);
+    let total_hashes = content.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+
+    if total_hashes == 0 {
+        error!(task_id = %task.id, "hash file is empty, failing task");
+        db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed)
+            .await?;
+        return Ok(());
+    }
+
+    // 3. Compute keyspace via hashcat (cached for dictionary attacks).
+    let keyspace = match chunker::compute_keyspace(
+        &state.db,
+        &state.hashcat_path,
+        task.hash_mode,
+        &task.attack_config,
+        &state.files_dir(),
+    )
+    .await
+    {
+        Ok(ks) => ks,
+        Err(e) => {
+            error!(task_id = %task.id, error = %e, "failed to compute keyspace");
+            db::update_task_status(&state.db, task.id, crack_common::models::TaskStatus::Failed)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        task_id = %task.id,
+        total_hashes,
+        keyspace,
+        "task prepared, transitioning to running"
+    );
+
+    // 4. Store keyspace and hash count, then transition to running.
+    db::set_task_keyspace(&state.db, task.id, keyspace, total_hashes).await?;
+    db::update_task_status(
+        &state.db,
+        task.id,
+        crack_common::models::TaskStatus::Running,
+    )
+    .await?;
+
+    state.emit(AppEvent::TaskUpdated { task_id: task.id });
     Ok(())
 }
 

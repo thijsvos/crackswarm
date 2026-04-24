@@ -128,6 +128,15 @@ CREATE TABLE IF NOT EXISTS campaign_phases (
     completed_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_campaign_phase_order ON campaign_phases(campaign_id, phase_index);
+
+CREATE TABLE IF NOT EXISTS keyspace_cache (
+    wordlist_sha256 TEXT NOT NULL,
+    rules_sha256 TEXT NOT NULL DEFAULT '',
+    hash_mode INTEGER NOT NULL,
+    keyspace INTEGER NOT NULL,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (wordlist_sha256, rules_sha256, hash_mode)
+);
 "#;
 
 // ── Database init ──
@@ -1072,6 +1081,50 @@ pub async fn delete_file_record(pool: &SqlitePool, id: &str) -> Result<bool> {
 // Additional helpers (used by API, transport, scheduler, monitor)
 // ════════════════════════════════════════════════════════════════════════════
 
+pub async fn get_cached_keyspace(
+    pool: &SqlitePool,
+    wordlist_sha256: &str,
+    rules_sha256: Option<&str>,
+    hash_mode: u32,
+) -> Result<Option<u64>> {
+    let rules = rules_sha256.unwrap_or("");
+    let row = sqlx::query(
+        "SELECT keyspace FROM keyspace_cache \
+         WHERE wordlist_sha256 = ?1 AND rules_sha256 = ?2 AND hash_mode = ?3",
+    )
+    .bind(wordlist_sha256)
+    .bind(rules)
+    .bind(hash_mode as i64)
+    .fetch_optional(pool)
+    .await
+    .context("reading keyspace cache")?;
+    Ok(row.map(|r| r.get::<i64, _>("keyspace") as u64))
+}
+
+pub async fn insert_cached_keyspace(
+    pool: &SqlitePool,
+    wordlist_sha256: &str,
+    rules_sha256: Option<&str>,
+    hash_mode: u32,
+    keyspace: u64,
+) -> Result<()> {
+    let rules = rules_sha256.unwrap_or("");
+    sqlx::query(
+        "INSERT OR REPLACE INTO keyspace_cache \
+         (wordlist_sha256, rules_sha256, hash_mode, keyspace, computed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(wordlist_sha256)
+    .bind(rules)
+    .bind(hash_mode as i64)
+    .bind(keyspace as i64)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .context("writing keyspace cache")?;
+    Ok(())
+}
+
 pub async fn list_file_records(pool: &SqlitePool) -> Result<Vec<FileRecord>> {
     let rows = sqlx::query("SELECT * FROM files ORDER BY uploaded_at DESC")
         .fetch_all(pool)
@@ -1757,4 +1810,108 @@ pub async fn create_campaign_task(
     get_task(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("task not found after insert"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn mem_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::from_str(":memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::raw_sql(INIT_SQL).execute(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn keyspace_cache_miss_returns_none() {
+        let pool = mem_pool().await;
+        let result = get_cached_keyspace(&pool, "abc", None, 1000).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn keyspace_cache_roundtrip_without_rules() {
+        let pool = mem_pool().await;
+        insert_cached_keyspace(&pool, "wl_sha", None, 1000, 42_000_000)
+            .await
+            .unwrap();
+        let result = get_cached_keyspace(&pool, "wl_sha", None, 1000)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(42_000_000));
+    }
+
+    #[tokio::test]
+    async fn keyspace_cache_roundtrip_with_rules() {
+        let pool = mem_pool().await;
+        insert_cached_keyspace(&pool, "wl_sha", Some("rules_sha"), 1000, 99)
+            .await
+            .unwrap();
+        let result = get_cached_keyspace(&pool, "wl_sha", Some("rules_sha"), 1000)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(99));
+    }
+
+    #[tokio::test]
+    async fn keyspace_cache_rules_vs_no_rules_are_different_entries() {
+        let pool = mem_pool().await;
+        insert_cached_keyspace(&pool, "wl", None, 1000, 10)
+            .await
+            .unwrap();
+        insert_cached_keyspace(&pool, "wl", Some("r"), 1000, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_cached_keyspace(&pool, "wl", None, 1000).await.unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            get_cached_keyspace(&pool, "wl", Some("r"), 1000)
+                .await
+                .unwrap(),
+            Some(20)
+        );
+    }
+
+    #[tokio::test]
+    async fn keyspace_cache_hash_mode_partitions_keys() {
+        let pool = mem_pool().await;
+        insert_cached_keyspace(&pool, "wl", None, 1000, 10)
+            .await
+            .unwrap();
+        insert_cached_keyspace(&pool, "wl", None, 22000, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_cached_keyspace(&pool, "wl", None, 1000).await.unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            get_cached_keyspace(&pool, "wl", None, 22000).await.unwrap(),
+            Some(20)
+        );
+    }
+
+    #[tokio::test]
+    async fn keyspace_cache_insert_is_idempotent() {
+        let pool = mem_pool().await;
+        insert_cached_keyspace(&pool, "wl", None, 1000, 10)
+            .await
+            .unwrap();
+        insert_cached_keyspace(&pool, "wl", None, 1000, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_cached_keyspace(&pool, "wl", None, 1000).await.unwrap(),
+            Some(20)
+        );
+    }
 }

@@ -2,9 +2,10 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 use crack_common::models::AttackConfig;
+use sqlx::SqlitePool;
 use tracing::info;
 
-use crate::storage::files;
+use crate::storage::{db, files};
 
 /// Compute the total keyspace for an attack configuration.
 ///
@@ -13,6 +14,7 @@ use crate::storage::files;
 /// optimizer which may merge multiple trailing mask positions into the
 /// amplifier, resulting in a smaller base keyspace than a naive calculation.
 pub async fn compute_keyspace(
+    pool: &SqlitePool,
     hashcat_path: &str,
     hash_mode: u32,
     attack_config: &AttackConfig,
@@ -23,6 +25,8 @@ pub async fn compute_keyspace(
             mask,
             custom_charsets,
         } => {
+            // Brute-force keyspace is computed by hashcat from the mask alone
+            // (pure math, no file scan). Fast enough to skip caching.
             let keyspace = compute_keyspace_via_hashcat(
                 hashcat_path,
                 hash_mode,
@@ -35,6 +39,15 @@ pub async fn compute_keyspace(
         }
         AttackConfig::Dictionary { wordlist_file_id } => {
             let wordlist_path = files::resolve_file_path(files_dir, wordlist_file_id)?;
+            let wordlist_sha = sha256_for_file(pool, wordlist_file_id).await?;
+
+            if let Some(ref sha) = wordlist_sha {
+                if let Some(k) = db::get_cached_keyspace(pool, sha, None, hash_mode).await? {
+                    info!(wordlist = %wordlist_file_id, keyspace = k, "keyspace cache hit (dict)");
+                    return Ok(k);
+                }
+            }
+
             let keyspace = compute_dictionary_keyspace(
                 hashcat_path,
                 hash_mode,
@@ -43,6 +56,10 @@ pub async fn compute_keyspace(
             )
             .await?;
             info!(wordlist = %wordlist_file_id, keyspace, "computed dictionary keyspace via hashcat --keyspace");
+
+            if let Some(sha) = wordlist_sha {
+                db::insert_cached_keyspace(pool, &sha, None, hash_mode, keyspace).await?;
+            }
             Ok(keyspace)
         }
         AttackConfig::DictionaryWithRules {
@@ -51,6 +68,16 @@ pub async fn compute_keyspace(
         } => {
             let wordlist_path = files::resolve_file_path(files_dir, wordlist_file_id)?;
             let rules_path = files::resolve_file_path(files_dir, rules_file_id)?;
+            let wordlist_sha = sha256_for_file(pool, wordlist_file_id).await?;
+            let rules_sha = sha256_for_file(pool, rules_file_id).await?;
+
+            if let (Some(ref w), Some(ref r)) = (&wordlist_sha, &rules_sha) {
+                if let Some(k) = db::get_cached_keyspace(pool, w, Some(r), hash_mode).await? {
+                    info!(wordlist = %wordlist_file_id, rules = %rules_file_id, keyspace = k, "keyspace cache hit (dict+rules)");
+                    return Ok(k);
+                }
+            }
+
             let keyspace = compute_dictionary_keyspace(
                 hashcat_path,
                 hash_mode,
@@ -59,9 +86,22 @@ pub async fn compute_keyspace(
             )
             .await?;
             info!(wordlist = %wordlist_file_id, rules = %rules_file_id, keyspace, "computed dictionary+rules keyspace via hashcat --keyspace");
+
+            if let (Some(w), Some(r)) = (wordlist_sha, rules_sha) {
+                db::insert_cached_keyspace(pool, &w, Some(&r), hash_mode, keyspace).await?;
+            }
             Ok(keyspace)
         }
     }
+}
+
+/// Resolve a file ID to its sha256 hex, if recorded. Returns None when the
+/// file isn't in the `files` table or has no sha (legacy rows). Empty sha
+/// strings are treated as missing to avoid polluting the cache with a bogus
+/// key shared by every sha-less row.
+async fn sha256_for_file(pool: &SqlitePool, file_id: &str) -> anyhow::Result<Option<String>> {
+    let record = db::get_file_record(pool, file_id).await?;
+    Ok(record.map(|r| r.sha256).filter(|s| !s.is_empty()))
 }
 
 /// Run `hashcat --keyspace` for a dictionary attack (mode 0).
