@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 /// Streaming writer for an incoming upload. Writes to a `.partial` companion
@@ -103,6 +103,74 @@ impl FileWriter {
     pub async fn abort(self) {
         let _ = tokio::fs::remove_file(&self.partial_path).await;
     }
+}
+
+/// Hard-link an existing file on the coord's filesystem into the file store
+/// without copying bytes. The caller is responsible for verifying the source
+/// is on the same device as `files_dir` (hard links can't cross filesystems).
+///
+/// sha256 is computed by streaming the linked file; returns `(file_id, sha256, size)`.
+pub async fn hard_link_from(
+    files_dir: &Path,
+    source_path: &Path,
+    filename: &str,
+) -> Result<(String, String, u64)> {
+    tokio::fs::create_dir_all(files_dir)
+        .await
+        .with_context(|| format!("creating files directory: {}", files_dir.display()))?;
+
+    let file_id = Uuid::new_v4().to_string();
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let disk_name = if ext.is_empty() {
+        file_id.clone()
+    } else {
+        format!("{file_id}.{ext}")
+    };
+    let dest = files_dir.join(&disk_name);
+
+    tokio::fs::hard_link(source_path, &dest)
+        .await
+        .with_context(|| {
+            format!(
+                "hard-linking {} -> {}",
+                source_path.display(),
+                dest.display()
+            )
+        })?;
+
+    // Stream sha256 of the linked content. No second on-disk copy, but we
+    // still have to read all bytes once to compute the hash.
+    let mut file = tokio::fs::File::open(&dest)
+        .await
+        .with_context(|| format!("opening hard-linked {}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("reading hard-linked {}", dest.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    tracing::debug!(
+        file_id = %file_id,
+        source = %source_path.display(),
+        size,
+        sha256 = %sha256,
+        "Hard-linked file into store"
+    );
+
+    Ok((file_id, sha256, size))
 }
 
 /// Save file data to disk with a UUID-based filename.
@@ -315,5 +383,56 @@ mod tests {
 
         let on_disk = resolve_file_path(&dir.path, &file_id).unwrap();
         assert_eq!(std::fs::metadata(&on_disk).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn hard_link_from_roundtrip_computes_sha_and_size() {
+        let dir = TempDir::new();
+        let source = dir.path.join("source.txt");
+        std::fs::write(&source, b"hello world").unwrap();
+
+        let files_dir = dir.path.join("store");
+        let (file_id, sha256, size) = hard_link_from(&files_dir, &source, "source.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(size, 11);
+        assert_eq!(
+            sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+
+        let on_disk = resolve_file_path(&files_dir, &file_id).unwrap();
+        assert_eq!(std::fs::read(&on_disk).unwrap(), b"hello world");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_link_from_shares_inode_with_source() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new();
+        let source = dir.path.join("source.bin");
+        std::fs::write(&source, b"shared").unwrap();
+
+        let files_dir = dir.path.join("store");
+        let (file_id, _, _) = hard_link_from(&files_dir, &source, "source.bin")
+            .await
+            .unwrap();
+        let on_disk = resolve_file_path(&files_dir, &file_id).unwrap();
+
+        let src_inode = std::fs::metadata(&source).unwrap().ino();
+        let dst_inode = std::fs::metadata(&on_disk).unwrap().ino();
+        assert_eq!(
+            src_inode, dst_inode,
+            "hard link should share inode with source"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_link_from_missing_source_errors() {
+        let dir = TempDir::new();
+        let missing = dir.path.join("does-not-exist");
+        let result = hard_link_from(&dir.path, &missing, "x.txt").await;
+        assert!(result.is_err());
     }
 }

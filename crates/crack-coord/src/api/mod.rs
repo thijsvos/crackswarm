@@ -93,7 +93,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .get(files::list_files)
                 .layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/v1/files/hardlink", post(files::hardlink_file))
         .route("/api/v1/files/{id}", get(files::download_file))
+        .route("/api/v1/server-info", get(files::server_info))
         // Workers
         .route("/api/v1/workers", get(workers::list_workers))
         .route("/api/v1/workers/authorize", post(workers::authorize_worker))

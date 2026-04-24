@@ -74,6 +74,20 @@ struct AuthorizeWorkerPayload {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ServerInfo {
+    #[allow(dead_code)]
+    pub files_dir: String,
+    pub device_id: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct HardlinkPayload {
+    pub source_path: String,
+    pub file_type: String,
+    pub filename: String,
+}
+
 #[derive(Debug, Serialize)]
 struct EnrollWorkerPayload {
     pub name: String,
@@ -345,6 +359,14 @@ impl Client {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "upload".to_string());
 
+        // Same-host fast path: if the source file lives on the same
+        // filesystem as the coord's files_dir, ask the coord to hard-link
+        // it in place instead of transferring bytes.
+        #[cfg(unix)]
+        if let Some(record) = self.try_hardlink_upload(path, &file_name, file_type).await {
+            return Ok(record);
+        }
+
         let file = tokio::fs::File::open(path)
             .await
             .with_context(|| format!("failed to open file: {}", path.display()))?;
@@ -403,6 +425,77 @@ impl Client {
         let resp = Self::check(resp).await?;
         let record: FileRecord = resp.json().await.context("failed to parse file record")?;
         Ok(record)
+    }
+
+    /// Attempt the same-host fast path: if our local source file lives on
+    /// the same filesystem as the coord's files_dir, ask the coord to
+    /// hard-link it into the store instead of transferring bytes.
+    ///
+    /// Returns `Some(record)` on success, `None` on any failure —
+    /// non-success is always safe to interpret as "fall back to streaming
+    /// upload." This covers older coords (404 on server-info), non-Unix
+    /// clients, different filesystems, missing/unreadable files,
+    /// permission denied on hard-link, etc.
+    #[cfg(unix)]
+    async fn try_hardlink_upload(
+        &self,
+        path: &Path,
+        filename: &str,
+        file_type: &str,
+    ) -> Option<FileRecord> {
+        use std::os::unix::fs::MetadataExt;
+
+        let absolute = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+        let source_meta = match tokio::fs::metadata(&absolute).await {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        if !source_meta.is_file() {
+            return None;
+        }
+        let source_dev = source_meta.dev();
+
+        // Ask coord for its files_dir device id. If this endpoint doesn't
+        // exist (older coord), fall through to streaming.
+        let resp = self
+            .http
+            .get(self.url("/api/v1/server-info"))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let server_info: ServerInfo = resp.json().await.ok()?;
+
+        // `device_id == 0` is the "not supported" sentinel the coord
+        // returns on non-Unix hosts, and is also extremely unlikely to
+        // coincidentally match a real device. Either way: skip the fast
+        // path.
+        if server_info.device_id == 0 || source_dev != server_info.device_id {
+            return None;
+        }
+
+        let payload = HardlinkPayload {
+            source_path: absolute.to_string_lossy().to_string(),
+            file_type: file_type.to_string(),
+            filename: filename.to_string(),
+        };
+
+        let resp = self
+            .http
+            .post(self.url("/api/v1/files/hardlink"))
+            .json(&payload)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<FileRecord>().await.ok()
     }
 
     pub async fn list_files(&self) -> Result<Vec<FileRecord>> {
