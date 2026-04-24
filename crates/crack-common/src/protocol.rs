@@ -67,12 +67,23 @@ pub enum AssignChunkAttack {
         mask: String,
         custom_charsets: Option<Vec<String>>,
     },
-    Dictionary {
-        wordlist_file_id: String,
-    },
+    /// Legacy: agent receives the wordlist bytes eagerly via TransferFileChunk
+    /// before this message. Kept for backwards compatibility; new coord
+    /// code prefers `DictionaryByHash` for dictionary attacks.
+    Dictionary { wordlist_file_id: String },
+    /// Legacy: same as `Dictionary` but with a rules file also pushed eagerly.
     DictionaryWithRules {
         wordlist_file_id: String,
         rules_file_id: String,
+    },
+    /// Pull-based dispatch: the agent looks up the referenced files in its
+    /// content-addressed cache by sha256; on miss, it fetches them via
+    /// `RequestFileRange`/`FileRange` from the coord. No eager push.
+    DictionaryByHash {
+        wordlist_sha256: String,
+        wordlist_size: u64,
+        rules_sha256: Option<String>,
+        rules_size: Option<u64>,
     },
 }
 
@@ -615,6 +626,48 @@ mod tests {
         let buf = too_large.to_be_bytes();
         let result: crate::error::Result<Option<(CoordMessage, usize)>> = decode_message(&buf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn roundtrip_assign_chunk_dict_by_hash() {
+        let chunk_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let msg = CoordMessage::AssignChunk {
+            chunk_id,
+            task_id,
+            hash_mode: 0,
+            hash_file_b64: "aGY=".to_string(),
+            hash_file_id: "hf-099".to_string(),
+            skip: 0,
+            limit: 12345,
+            attack: AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: "a1b2c3".to_string(),
+                wordlist_size: 1_234_567,
+                rules_sha256: Some("deadbeef".to_string()),
+                rules_size: Some(9876),
+            },
+            extra_args: vec![],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::AssignChunk { attack, .. } => match attack {
+                AssignChunkAttack::DictionaryByHash {
+                    wordlist_sha256,
+                    wordlist_size,
+                    rules_sha256,
+                    rules_size,
+                } => {
+                    assert_eq!(wordlist_sha256, "a1b2c3");
+                    assert_eq!(wordlist_size, 1_234_567);
+                    assert_eq!(rules_sha256.as_deref(), Some("deadbeef"));
+                    assert_eq!(rules_size, Some(9876));
+                }
+                other => panic!("expected DictionaryByHash, got {other:?}"),
+            },
+            other => panic!("expected AssignChunk, got {other:?}"),
+        }
     }
 
     #[test]

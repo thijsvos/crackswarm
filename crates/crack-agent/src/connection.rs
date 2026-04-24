@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::cache::ContentCache;
 use crate::config::RunConfig;
 use crate::runner::{HashcatRunConfig, HashcatRunner, RunnerEvent};
 use crate::status;
@@ -239,6 +240,22 @@ async fn connect_and_run(
     let (runner_tx, mut runner_rx) = mpsc::channel::<(Uuid, Uuid, RunnerEvent)>(256);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
 
+    // Channel for WorkerMessages produced off-loop (e.g. by ContentCache
+    // pull tasks). The main loop drains this and writes to the Noise
+    // stream — we can't share `stream`/`transport` across tasks because
+    // snow's TransportState is `!Send`.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WorkerMessage>(64);
+
+    // Channel for "chunk is ready to run" events. When an AssignChunk
+    // arrives for DictionaryByHash we spawn a pull task that resolves
+    // the wordlist/rules paths via the ContentCache; once paths are
+    // ready, the task posts here and the main loop starts hashcat.
+    let (ready_tx, mut ready_rx) = mpsc::channel::<PendingChunk>(16);
+
+    // Content-addressed file cache for pull-based dispatch. Cheap to
+    // clone (Arc inside).
+    let content_cache = ContentCache::new(config.cache_dir());
+
     // Track running chunks: chunk_id -> kill signal sender (at most one at a time)
     let mut active_chunks: HashMap<Uuid, oneshot::Sender<()>> = HashMap::new();
     // Track chunk -> task mapping (reserved for future use, e.g. reconnection)
@@ -255,11 +272,15 @@ async fn connect_and_run(
             Heartbeat,
             RunnerEvent(Uuid, Uuid, RunnerEvent),
             TcpReadable,
+            OutboundMessage(WorkerMessage),
+            ChunkReady(PendingChunk),
         }
 
         let action = tokio::select! {
             _ = heartbeat.tick() => Action::Heartbeat,
             Some((cid, tid, ev)) = runner_rx.recv() => Action::RunnerEvent(cid, tid, ev),
+            Some(m) = outbound_rx.recv() => Action::OutboundMessage(m),
+            Some(pc) = ready_rx.recv() => Action::ChunkReady(pc),
             result = stream.readable() => {
                 result.context("TCP stream error")?;
                 Action::TcpReadable
@@ -309,6 +330,34 @@ async fn connect_and_run(
                         )
                         .await?;
                     }
+                }
+            }
+
+            Action::OutboundMessage(m) => {
+                // Message produced off-loop (e.g. by a ContentCache pull task).
+                send_message(&mut stream, &mut transport, &m).await?;
+            }
+
+            Action::ChunkReady(pending) => {
+                if active_chunks.is_empty() {
+                    start_hashcat(
+                        &pending.run_config,
+                        pending.chunk_id,
+                        pending.task_id,
+                        &mut stream,
+                        &mut transport,
+                        &mut active_chunks,
+                        &mut _chunk_task,
+                        &runner_tx,
+                    )
+                    .await?;
+                } else {
+                    info!(
+                        chunk_id = %pending.chunk_id,
+                        queue_len = pending_queue.len() + 1,
+                        "queuing resolved chunk (another hashcat is running)"
+                    );
+                    pending_queue.push_back(pending);
                 }
             }
 
@@ -428,6 +477,7 @@ async fn connect_and_run(
                             AssignChunkAttack::DictionaryWithRules { .. } => {
                                 "dict+rules".to_string()
                             }
+                            AssignChunkAttack::DictionaryByHash { .. } => "dict+hash".to_string(),
                         };
 
                         info!(
@@ -456,6 +506,98 @@ async fn connect_and_run(
                         let outfile_path = config.cache_dir().join(format!("out_{chunk_id}.txt"));
 
                         let cache_dir = config.cache_dir();
+
+                        // DictionaryByHash needs async file resolution via the
+                        // content cache — that can't run on the main loop (it
+                        // has to send RequestFileRange and consume FileRange
+                        // responses from this very loop). Spawn a task that
+                        // resolves paths and hands the ready chunk back via
+                        // ready_tx.
+                        if let AssignChunkAttack::DictionaryByHash {
+                            wordlist_sha256,
+                            wordlist_size,
+                            rules_sha256,
+                            rules_size,
+                        } = attack
+                        {
+                            let cache = content_cache.clone();
+                            let outbound = outbound_tx.clone();
+                            let ready = ready_tx.clone();
+                            let hashcat_path = config.hashcat_path.clone();
+                            tokio::spawn(async move {
+                                let wordlist_path = match cache
+                                    .ensure(&wordlist_sha256, wordlist_size, &outbound)
+                                    .await
+                                {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        error!(
+                                            %chunk_id,
+                                            error = %e,
+                                            "failed to fetch wordlist for DictionaryByHash"
+                                        );
+                                        let _ = outbound
+                                            .send(WorkerMessage::ChunkFailed {
+                                                chunk_id,
+                                                error: format!("fetch wordlist: {e}"),
+                                                exit_code: None,
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                };
+
+                                let rules_path = match rules_sha256 {
+                                    Some(rs) => {
+                                        let rz = rules_size.unwrap_or(0);
+                                        match cache.ensure(&rs, rz, &outbound).await {
+                                            Ok(p) => Some(p),
+                                            Err(e) => {
+                                                error!(
+                                                    %chunk_id,
+                                                    error = %e,
+                                                    "failed to fetch rules for DictionaryByHash"
+                                                );
+                                                let _ = outbound
+                                                    .send(WorkerMessage::ChunkFailed {
+                                                        chunk_id,
+                                                        error: format!("fetch rules: {e}"),
+                                                        exit_code: None,
+                                                    })
+                                                    .await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => None,
+                                };
+
+                                let run_config = HashcatRunConfig {
+                                    hashcat_path,
+                                    hash_file_path,
+                                    hash_mode,
+                                    attack_mode: 0,
+                                    mask: None,
+                                    skip,
+                                    limit,
+                                    custom_charsets: None,
+                                    wordlist_path: Some(wordlist_path),
+                                    rules_path,
+                                    extra_args,
+                                    outfile_path,
+                                };
+
+                                let _ = ready
+                                    .send(PendingChunk {
+                                        chunk_id,
+                                        task_id,
+                                        run_config,
+                                    })
+                                    .await;
+                            });
+                            continue;
+                        }
+
                         let run_config = match attack {
                             AssignChunkAttack::BruteForce {
                                 mask,
@@ -507,6 +649,9 @@ async fn connect_and_run(
                                 extra_args,
                                 outfile_path,
                             },
+                            AssignChunkAttack::DictionaryByHash { .. } => {
+                                unreachable!("handled via early-return + spawn above")
+                            }
                         };
 
                         // Only run one hashcat at a time to avoid GPU contention.
@@ -569,17 +714,23 @@ async fn connect_and_run(
                         return Ok(());
                     }
 
-                    // Pull-based file fetch responses (Slice 5 plumbing). Wiring
-                    // into ContentCache lands in Slice 6; for now these arrive
-                    // only if the agent speculatively requested a range, which
-                    // it doesn't yet.
+                    // Pull-based file fetch responses. Forward to the content
+                    // cache's pending-pull registry; any in-flight `ensure()`
+                    // keyed by this hash will pick it up.
                     CoordMessage::FileRange {
-                        hash, offset, eof, ..
+                        hash,
+                        offset,
+                        data_b64,
+                        eof,
                     } => {
-                        debug!(%hash, offset, eof, "received FileRange (no pending ensure yet)");
+                        debug!(%hash, offset, eof, "received FileRange");
+                        content_cache
+                            .on_file_range(&hash, offset, &data_b64, eof)
+                            .await;
                     }
                     CoordMessage::FileError { hash, reason } => {
-                        debug!(%hash, %reason, "received FileError (no pending ensure yet)");
+                        debug!(%hash, %reason, "received FileError");
+                        content_cache.on_file_error(&hash, reason).await;
                     }
                 }
             }

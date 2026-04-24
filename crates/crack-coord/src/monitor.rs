@@ -269,7 +269,8 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
                     error!(task_id = %task.id, error = %e, "failed to transfer attack files for dispatch");
                     continue;
                 }
-                match crate::transport::handler::build_assign_chunk_msg(state, &task, &chunk) {
+                match crate::transport::handler::build_assign_chunk_msg(state, &task, &chunk).await
+                {
                     Ok(msg) => {
                         let _ = conn.tx.send(msg).await;
                     }
