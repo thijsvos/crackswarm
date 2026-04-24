@@ -164,6 +164,20 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     queued_at     TEXT NOT NULL,
     attempts      INTEGER NOT NULL DEFAULT 0
 );
+
+-- Coord-side view of what each worker has in its content-addressed cache.
+-- Populated from the manifest carried on every agent heartbeat; used by
+-- the GC loop to target `EvictFile` at only the workers that hold the
+-- file, and by reconciliation (Slice 9) to correct drift across
+-- reconnects and missed messages.
+CREATE TABLE IF NOT EXISTS worker_cache_entries (
+    worker_id     TEXT NOT NULL,
+    file_sha256   TEXT NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    last_used_at  TEXT NOT NULL,
+    PRIMARY KEY (worker_id, file_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_worker_cache_sha ON worker_cache_entries(file_sha256);
 "#;
 
 // ── Database init ──
@@ -1384,6 +1398,98 @@ pub async fn set_gc_state_deleting(pool: &SqlitePool, sha256: &str) -> Result<()
     Ok(())
 }
 
+/// Replace this worker's cache manifest in `worker_cache_entries` with the
+/// new set: upsert every entry in `manifest`, remove any rows not listed.
+/// Runs as a single transaction so the coord never sees a half-synced
+/// view.
+pub async fn sync_worker_cache_manifest(
+    pool: &SqlitePool,
+    worker_id: &str,
+    manifest: &[crack_common::protocol::CacheManifestEntry],
+) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin sync tx")?;
+
+    // Remove rows whose sha isn't present in the new manifest.
+    if manifest.is_empty() {
+        sqlx::query("DELETE FROM worker_cache_entries WHERE worker_id = ?1")
+            .bind(worker_id)
+            .execute(&mut *tx)
+            .await
+            .context("clearing worker cache entries")?;
+    } else {
+        // Build "NOT IN (?, ?, ?)" with placeholders. SQLite caps bound
+        // params at 32766 per statement; heartbeats would need tens of
+        // thousands of cache entries to trip that, and the manifest
+        // payload would already be absurd before then.
+        let placeholders = (0..manifest.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM worker_cache_entries WHERE worker_id = ? AND file_sha256 NOT IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(worker_id);
+        for entry in manifest {
+            q = q.bind(&entry.sha256);
+        }
+        q.execute(&mut *tx)
+            .await
+            .context("pruning stale worker cache entries")?;
+    }
+
+    // Upsert each entry in the new manifest.
+    for entry in manifest {
+        sqlx::query(
+            "INSERT INTO worker_cache_entries \
+             (worker_id, file_sha256, size_bytes, last_used_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(worker_id, file_sha256) DO UPDATE SET \
+             size_bytes = excluded.size_bytes, \
+             last_used_at = excluded.last_used_at",
+        )
+        .bind(worker_id)
+        .bind(&entry.sha256)
+        .bind(entry.size_bytes as i64)
+        .bind(&entry.last_used_at)
+        .execute(&mut *tx)
+        .await
+        .context("upserting worker cache entry")?;
+    }
+
+    tx.commit().await.context("commit sync tx")?;
+    Ok(())
+}
+
+/// All worker IDs that reportedly hold the given sha256 in their cache.
+/// Used by the GC loop to target `EvictFile` broadcasts.
+pub async fn workers_with_file(pool: &SqlitePool, sha256: &str) -> Result<Vec<String>> {
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT worker_id FROM worker_cache_entries WHERE file_sha256 = ?1")
+            .bind(sha256)
+            .fetch_all(pool)
+            .await
+            .context("selecting workers_with_file")?;
+    Ok(rows)
+}
+
+/// Remove a single worker/sha pair. Used by reconciliation (Slice 9) to
+/// flush stale rows the agent has told us it no longer has; also handy
+/// for explicit cache-drop operator actions.
+#[allow(dead_code)]
+pub async fn remove_worker_cache_entry(
+    pool: &SqlitePool,
+    worker_id: &str,
+    sha256: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM worker_cache_entries WHERE worker_id = ?1 AND file_sha256 = ?2")
+        .bind(worker_id)
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .context("deleting worker cache entry")?;
+    Ok(())
+}
+
 /// Every `files` row sharing this sha256. A legacy deployment can have more
 /// than one — we delete all of them when the content is reclaimed.
 pub async fn files_by_sha256(pool: &SqlitePool, sha256: &str) -> Result<Vec<FileRecord>> {
@@ -2409,6 +2515,111 @@ mod tests {
         seed_file(&pool, "dup-b", "sha-x").await;
         let records = files_by_sha256(&pool, "sha-x").await.unwrap();
         assert_eq!(records.len(), 2);
+    }
+
+    fn manifest_entry(sha: &str, size: u64) -> crack_common::protocol::CacheManifestEntry {
+        crack_common::protocol::CacheManifestEntry {
+            sha256: sha.to_string(),
+            size_bytes: size,
+            last_used_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_upserts_new_entries() {
+        let pool = mem_pool().await;
+        let manifest = vec![manifest_entry("aa", 100), manifest_entry("bb", 200)];
+        sync_worker_cache_manifest(&pool, "worker-1", &manifest)
+            .await
+            .unwrap();
+
+        let workers_aa = workers_with_file(&pool, "aa").await.unwrap();
+        let workers_bb = workers_with_file(&pool, "bb").await.unwrap();
+        assert_eq!(workers_aa, vec!["worker-1".to_string()]);
+        assert_eq!(workers_bb, vec!["worker-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_prunes_removed_entries() {
+        let pool = mem_pool().await;
+        // Initial: worker has aa + bb.
+        sync_worker_cache_manifest(
+            &pool,
+            "worker-1",
+            &[manifest_entry("aa", 100), manifest_entry("bb", 200)],
+        )
+        .await
+        .unwrap();
+
+        // Later heartbeat: only aa remains (worker evicted bb locally).
+        sync_worker_cache_manifest(&pool, "worker-1", &[manifest_entry("aa", 100)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            workers_with_file(&pool, "aa").await.unwrap(),
+            vec!["worker-1".to_string()]
+        );
+        assert!(
+            workers_with_file(&pool, "bb").await.unwrap().is_empty(),
+            "bb should have been pruned from worker_cache_entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_empty_clears_all_entries_for_worker() {
+        let pool = mem_pool().await;
+        sync_worker_cache_manifest(&pool, "worker-1", &[manifest_entry("aa", 100)])
+            .await
+            .unwrap();
+        sync_worker_cache_manifest(&pool, "worker-1", &[])
+            .await
+            .unwrap();
+        assert!(workers_with_file(&pool, "aa").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_is_scoped_per_worker() {
+        let pool = mem_pool().await;
+        sync_worker_cache_manifest(&pool, "w-a", &[manifest_entry("shared", 50)])
+            .await
+            .unwrap();
+        sync_worker_cache_manifest(&pool, "w-b", &[manifest_entry("shared", 50)])
+            .await
+            .unwrap();
+
+        let mut workers = workers_with_file(&pool, "shared").await.unwrap();
+        workers.sort();
+        assert_eq!(workers, vec!["w-a".to_string(), "w-b".to_string()]);
+
+        // Clearing one worker must leave the other's entry alone.
+        sync_worker_cache_manifest(&pool, "w-a", &[]).await.unwrap();
+        assert_eq!(
+            workers_with_file(&pool, "shared").await.unwrap(),
+            vec!["w-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_updates_size_and_mtime_on_upsert() {
+        let pool = mem_pool().await;
+        sync_worker_cache_manifest(&pool, "w1", &[manifest_entry("aa", 100)])
+            .await
+            .unwrap();
+        // Updated size on next heartbeat (e.g. corrupt file now correct).
+        sync_worker_cache_manifest(&pool, "w1", &[manifest_entry("aa", 999)])
+            .await
+            .unwrap();
+
+        let row: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM worker_cache_entries WHERE worker_id = ?1 AND file_sha256 = ?2",
+        )
+        .bind("w1")
+        .bind("aa")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, 999);
     }
 
     #[tokio::test]

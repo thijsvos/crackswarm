@@ -38,6 +38,13 @@ pub enum CoordMessage {
         hash: String,
         reason: String,
     },
+    /// Instruct the worker to evict a file from its content-addressed cache.
+    /// Issued by the coord's GC loop after a file's reference count drops
+    /// to zero and pin state is clear. The worker defers eviction until no
+    /// running chunk is using the file.
+    EvictFile {
+        hash: String,
+    },
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
@@ -101,7 +108,18 @@ pub enum WorkerMessage {
         nonce: String,
         worker_name: String,
     },
-    Heartbeat,
+    /// Periodic heartbeat. Carries a compact digest of the worker's
+    /// content-addressed cache so the coord can maintain an authoritative
+    /// view of what each worker has on disk — used for targeted
+    /// `EvictFile` dispatch (Slice 8) and full reconciliation on
+    /// (re)connect (Slice 9).
+    ///
+    /// `cache_manifest` is `#[serde(default)]` for backwards compatibility
+    /// with older agents whose heartbeat carries no manifest.
+    Heartbeat {
+        #[serde(default)]
+        cache_manifest: Vec<CacheManifestEntry>,
+    },
     ChunkStarted {
         chunk_id: Uuid,
     },
@@ -143,6 +161,21 @@ pub enum WorkerMessage {
         offset: u64,
         length: u32,
     },
+}
+
+/// Compact digest of a single cached file, carried on every agent
+/// heartbeat so the coord can reconcile the agent's cache against its
+/// own view of `worker_cache_entries`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheManifestEntry {
+    /// Content hash of the cached file.
+    pub sha256: String,
+    /// Size in bytes (must match the coord's `files.size_bytes` for the
+    /// entry to be considered valid).
+    pub size_bytes: u64,
+    /// RFC3339 timestamp of last use (approximated from file mtime until
+    /// Slice 10 introduces an explicit ledger).
+    pub last_used_at: String,
 }
 
 /// Length-prefixed framing for Noise transport messages.
@@ -434,13 +467,85 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_heartbeat() {
-        let msg = WorkerMessage::Heartbeat;
+    fn roundtrip_heartbeat_empty_manifest() {
+        let msg = WorkerMessage::Heartbeat {
+            cache_manifest: vec![],
+        };
         let encoded = encode_message(&msg).unwrap();
         let (decoded, consumed): (WorkerMessage, usize) =
             decode_message(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
-        assert!(matches!(decoded, WorkerMessage::Heartbeat));
+        match decoded {
+            WorkerMessage::Heartbeat { cache_manifest } => {
+                assert!(cache_manifest.is_empty());
+            }
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_heartbeat_with_manifest() {
+        let msg = WorkerMessage::Heartbeat {
+            cache_manifest: vec![
+                CacheManifestEntry {
+                    sha256: "aa".to_string(),
+                    size_bytes: 100,
+                    last_used_at: "2026-04-24T00:00:00Z".to_string(),
+                },
+                CacheManifestEntry {
+                    sha256: "bb".to_string(),
+                    size_bytes: 200,
+                    last_used_at: "2026-04-24T01:00:00Z".to_string(),
+                },
+            ],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::Heartbeat { cache_manifest } => {
+                assert_eq!(cache_manifest.len(), 2);
+                assert_eq!(cache_manifest[0].sha256, "aa");
+                assert_eq!(cache_manifest[0].size_bytes, 100);
+                assert_eq!(cache_manifest[1].sha256, "bb");
+            }
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_legacy_heartbeat_without_manifest_field() {
+        // Simulates an old agent (pre-Slice-8) whose heartbeat carries
+        // just `{"type":"heartbeat"}`. The `#[serde(default)]` on
+        // cache_manifest should let it deserialize cleanly with an empty
+        // manifest on the new coord.
+        let legacy_json = r#"{"type":"heartbeat"}"#;
+        let len = (legacy_json.len() as u32).to_be_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(legacy_json.as_bytes());
+        let (decoded, _): (WorkerMessage, usize) = decode_message(&buf).unwrap().unwrap();
+        match decoded {
+            WorkerMessage::Heartbeat { cache_manifest } => {
+                assert!(cache_manifest.is_empty(), "legacy should deserialize empty");
+            }
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_evict_file() {
+        let msg = CoordMessage::EvictFile {
+            hash: "deadbeef".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::EvictFile { hash } => assert_eq!(hash, "deadbeef"),
+            other => panic!("expected EvictFile, got {other:?}"),
+        }
     }
 
     #[test]

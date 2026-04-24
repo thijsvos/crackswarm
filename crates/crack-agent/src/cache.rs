@@ -21,7 +21,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose;
 use base64::Engine as _;
-use crack_common::protocol::WorkerMessage;
+use chrono::{DateTime, Utc};
+use crack_common::protocol::{CacheManifestEntry, WorkerMessage};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
@@ -238,6 +239,74 @@ impl ContentCache {
         Ok(())
     }
 
+    /// Walk `<root>/cas/<hh>/<hash>` and return a compact digest of every
+    /// valid cached file. Entries the agent considers incomplete (missing,
+    /// unreadable, zero-byte `.partial` leftovers) are skipped. Called on
+    /// every heartbeat tick so the coord can reconcile its view.
+    pub async fn manifest(&self) -> Vec<CacheManifestEntry> {
+        let cas_root = self.root.join("cas");
+        let mut out = Vec::new();
+        let mut shard_entries = match tokio::fs::read_dir(&cas_root).await {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+        while let Ok(Some(shard)) = shard_entries.next_entry().await {
+            let shard_path = shard.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            let mut files_iter = match tokio::fs::read_dir(&shard_path).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = files_iter.next_entry().await {
+                let name = entry.file_name();
+                let name_str = match name.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                // Skip in-progress partials — they aren't cache entries yet.
+                if name_str.ends_with(".partial") {
+                    continue;
+                }
+                let meta = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let last_used_at = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| {
+                        DateTime::<Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                            .unwrap_or_else(Utc::now)
+                            .to_rfc3339()
+                    })
+                    .unwrap_or_else(|| Utc::now().to_rfc3339());
+                out.push(CacheManifestEntry {
+                    sha256: name_str.to_string(),
+                    size_bytes: meta.len(),
+                    last_used_at,
+                });
+            }
+        }
+        out
+    }
+
+    /// Best-effort removal of a cached file. Returns true if the canonical
+    /// entry was deleted (we also sweep any stale `.partial`). A missing
+    /// file is not an error — it means the cache was already clean.
+    pub async fn evict(&self, hash: &str) -> bool {
+        let final_path = self.path_for(hash);
+        let partial = final_path.with_extension("partial");
+        let removed_final = tokio::fs::remove_file(&final_path).await.is_ok();
+        let _ = tokio::fs::remove_file(&partial).await;
+        removed_final
+    }
+
     /// Hook for the agent's message dispatcher: forward an incoming
     /// `CoordMessage::FileRange` to the matching in-flight `ensure()`.
     /// `data_b64` is the base64 payload as wired.
@@ -442,5 +511,82 @@ mod tests {
         let err = cache.ensure(&fake_hash, 10, &tx).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("file not found"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn manifest_returns_empty_when_no_cache_dir() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let m = cache.manifest().await;
+        assert!(m.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manifest_lists_cached_files_with_size() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+
+        // Seed two entries directly on disk (as a successful pull would).
+        let data_a = vec![0u8; 123];
+        let data_b = vec![1u8; 456];
+        let hash_a = sha256_hex(&data_a);
+        let hash_b = sha256_hex(&data_b);
+        for (hash, data) in [(&hash_a, &data_a), (&hash_b, &data_b)] {
+            let p = cache.path_for(hash);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, data).unwrap();
+        }
+
+        let mut entries = cache.manifest().await;
+        entries.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        assert_eq!(entries.len(), 2);
+        let by_hash: std::collections::HashMap<_, _> = entries
+            .into_iter()
+            .map(|e| (e.sha256, e.size_bytes))
+            .collect();
+        assert_eq!(by_hash.get(&hash_a).copied(), Some(123));
+        assert_eq!(by_hash.get(&hash_b).copied(), Some(456));
+    }
+
+    #[tokio::test]
+    async fn manifest_ignores_partial_files() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let data = b"done".to_vec();
+        let hash = sha256_hex(&data);
+        let p = cache.path_for(&hash);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &data).unwrap();
+        // Stray .partial from an aborted pull.
+        std::fs::write(p.with_extension("partial"), b"halfway").unwrap();
+
+        let entries = cache.manifest().await;
+        assert_eq!(entries.len(), 1, ".partial must not appear in manifest");
+        assert_eq!(entries[0].sha256, hash);
+    }
+
+    #[tokio::test]
+    async fn evict_removes_cached_file_and_partial() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let data = b"gone".to_vec();
+        let hash = sha256_hex(&data);
+        let p = cache.path_for(&hash);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &data).unwrap();
+        std::fs::write(p.with_extension("partial"), b"stale").unwrap();
+
+        let removed = cache.evict(&hash).await;
+        assert!(removed);
+        assert!(!p.exists());
+        assert!(!p.with_extension("partial").exists());
+    }
+
+    #[tokio::test]
+    async fn evict_missing_file_returns_false_without_error() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let removed = cache.evict("nonexistent-hash").await;
+        assert!(!removed);
     }
 }

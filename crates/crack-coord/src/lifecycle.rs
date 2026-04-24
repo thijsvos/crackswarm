@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use crack_common::protocol::CoordMessage;
 use tracing::{debug, info, warn};
 
 use crate::state::AppState;
@@ -67,6 +68,42 @@ async fn gc_pass(state: &AppState) -> Result<()> {
 
         // Reserve this entry for the current pass.
         db::set_gc_state_deleting(&state.db, &sha).await?;
+
+        // Broadcast EvictFile to every connected worker that reportedly
+        // holds this file. Misses are fine: a disconnected or late worker
+        // picks it up on the next reconcile pass (Slice 9). Agents that
+        // are currently running a chunk against the file defer the
+        // eviction locally until the chunk finishes.
+        let workers = match db::workers_with_file(&state.db, &sha).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!(%sha, error = %e, "GC: workers_with_file lookup failed");
+                Vec::new()
+            }
+        };
+        if !workers.is_empty() {
+            let conns = state.worker_connections.read().await;
+            let mut dispatched = 0;
+            for worker_id in &workers {
+                if let Some(conn) = conns.get(worker_id) {
+                    if conn
+                        .tx
+                        .send(CoordMessage::EvictFile { hash: sha.clone() })
+                        .await
+                        .is_ok()
+                    {
+                        dispatched += 1;
+                    }
+                }
+            }
+            drop(conns);
+            debug!(
+                %sha,
+                workers = workers.len(),
+                dispatched,
+                "GC: sent EvictFile to workers"
+            );
+        }
 
         // Delete every files row (and disk file) sharing this sha. A legacy
         // deployment with duplicate sha rows may hit >1 here.
