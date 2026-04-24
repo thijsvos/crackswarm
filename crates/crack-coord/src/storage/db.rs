@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS files (
     uploaded_at TEXT NOT NULL
 );
 
+-- Non-unique: any existing deployment with duplicate sha256 rows would
+-- otherwise refuse to start. Uniqueness is enforced at upload time by
+-- short-circuiting on a match; new duplicates can't be introduced.
+CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -1066,6 +1071,22 @@ pub async fn get_file_record(pool: &SqlitePool, id: &str) -> Result<Option<FileR
     }
 }
 
+/// Look up a file by its sha256 content hash. Returns the oldest matching
+/// row (by uploaded_at) when multiple exist — legacy deployments may have
+/// duplicates that predate the upload-dedup short-circuit.
+pub async fn find_file_by_sha256(pool: &SqlitePool, sha256: &str) -> Result<Option<FileRecord>> {
+    let row = sqlx::query("SELECT * FROM files WHERE sha256 = ?1 ORDER BY uploaded_at ASC LIMIT 1")
+        .bind(sha256)
+        .fetch_optional(pool)
+        .await
+        .context("fetching file record by sha256")?;
+
+    match row {
+        Some(ref r) => Ok(Some(row_to_file_record(r)?)),
+        None => Ok(None),
+    }
+}
+
 #[allow(dead_code)]
 pub async fn delete_file_record(pool: &SqlitePool, id: &str) -> Result<bool> {
     let result = sqlx::query("DELETE FROM files WHERE id = ?1")
@@ -1913,5 +1934,68 @@ mod tests {
             get_cached_keyspace(&pool, "wl", None, 1000).await.unwrap(),
             Some(20)
         );
+    }
+
+    fn sample_file_record(id: &str, sha: &str, uploaded_at: DateTime<Utc>) -> FileRecord {
+        FileRecord {
+            id: id.to_string(),
+            filename: format!("{id}.txt"),
+            file_type: "wordlist".to_string(),
+            size_bytes: 100,
+            sha256: sha.to_string(),
+            disk_path: format!("/tmp/{id}"),
+            uploaded_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn find_file_by_sha256_returns_none_when_missing() {
+        let pool = mem_pool().await;
+        let result = find_file_by_sha256(&pool, "absent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_file_by_sha256_finds_match() {
+        let pool = mem_pool().await;
+        let rec = sample_file_record("aaa-111", "deadbeef", Utc::now());
+        insert_file_record(&pool, &rec).await.unwrap();
+
+        let found = find_file_by_sha256(&pool, "deadbeef")
+            .await
+            .unwrap()
+            .expect("should have found match");
+        assert_eq!(found.id, "aaa-111");
+    }
+
+    #[tokio::test]
+    async fn find_file_by_sha256_returns_oldest_when_duplicates_exist() {
+        // Simulates a legacy deployment with two rows sharing a sha (the
+        // dedup index is non-unique so this can exist). The helper must
+        // pick the oldest, which is the canonical one the upload path
+        // short-circuits to.
+        let pool = mem_pool().await;
+        let older = sample_file_record(
+            "older-id",
+            "shared-sha",
+            DateTime::parse_from_rfc3339("2026-04-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let newer = sample_file_record(
+            "newer-id",
+            "shared-sha",
+            DateTime::parse_from_rfc3339("2026-04-15T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        insert_file_record(&pool, &older).await.unwrap();
+        insert_file_record(&pool, &newer).await.unwrap();
+
+        let found = find_file_by_sha256(&pool, "shared-sha")
+            .await
+            .unwrap()
+            .expect("should have found match");
+        assert_eq!(found.id, "older-id");
     }
 }

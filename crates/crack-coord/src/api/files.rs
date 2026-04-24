@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
+use tracing::info;
 
 use crack_common::models::FileRecord;
 
@@ -52,10 +53,32 @@ pub async fn upload_file(
     let (filename, data) =
         file_data.ok_or_else(|| ApiError::BadRequest("missing 'file' field".to_string()))?;
 
-    // Save to disk
+    // Save to disk (also computes sha256).
     let files_dir = state.files_dir();
     let (file_id, sha256) = files::save_file(&files_dir, &filename, &data)
         .map_err(|e| ApiError::Internal(format!("failed to save file: {e}")))?;
+
+    // Content dedup: if we already have a file with this sha256, drop the
+    // one we just wrote and return the existing record. Keeps the operator
+    // command identical (`crackctl file upload …`) while avoiding duplicate
+    // on-disk copies of the same content across re-uploads.
+    if let Some(existing) = db::find_file_by_sha256(&state.db, &sha256).await? {
+        if let Err(e) = files::delete_file(&files_dir, &file_id) {
+            // Not fatal — disk orphan will get picked up by future GC.
+            tracing::warn!(
+                file_id = %file_id,
+                error = %e,
+                "dedup: failed to remove newly-written duplicate from disk"
+            );
+        }
+        info!(
+            existing_id = %existing.id,
+            filename = %filename,
+            sha256 = %sha256,
+            "dedup: returning existing file record for matching sha256"
+        );
+        return Ok((StatusCode::OK, Json(existing)));
+    }
 
     // Build disk path for the record
     let disk_path = files_dir.join(&file_id).to_string_lossy().to_string();
