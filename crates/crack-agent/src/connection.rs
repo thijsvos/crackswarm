@@ -568,6 +568,19 @@ async fn connect_and_run(
                         send_message(&mut stream, &mut transport, &WorkerMessage::Leaving).await?;
                         return Ok(());
                     }
+
+                    // Pull-based file fetch responses (Slice 5 plumbing). Wiring
+                    // into ContentCache lands in Slice 6; for now these arrive
+                    // only if the agent speculatively requested a range, which
+                    // it doesn't yet.
+                    CoordMessage::FileRange {
+                        hash, offset, eof, ..
+                    } => {
+                        debug!(%hash, offset, eof, "received FileRange (no pending ensure yet)");
+                    }
+                    CoordMessage::FileError { hash, reason } => {
+                        debug!(%hash, %reason, "received FileError (no pending ensure yet)");
+                    }
                 }
             }
         }

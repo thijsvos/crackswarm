@@ -1,0 +1,446 @@
+//! Content-addressed file cache for the agent.
+//!
+//! Files are stored on disk at `<root>/cas/<hh>/<hash>` where `hash` is the
+//! sha256 hex and `hh` is its first two characters (shard). Lookups go by
+//! content hash, not upload UUID — so a wordlist renamed on the coord, or
+//! re-uploaded under a new file ID, still hits the same cache entry.
+//!
+//! Missing entries are pulled from the coord via the Noise channel using
+//! the `WorkerMessage::RequestFileRange` / `CoordMessage::FileRange` RPC
+//! pair. The agent issues requests sequentially and only advances once the
+//! matching response arrives — natural backpressure, bounded memory.
+//!
+//! Concurrent calls to `ensure()` for the *same* hash serialize on a
+//! per-hash mutex; the second caller waits for the first to finish and
+//! then sees the already-cached path.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use base64::engine::general_purpose;
+use base64::Engine as _;
+use crack_common::protocol::WorkerMessage;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, Mutex};
+
+/// Bytes requested per `RequestFileRange`. Coord caps responses to this same
+/// value (see `FILE_RANGE_MAX_BYTES` in `crack-coord::transport::handler`);
+/// keeping them aligned avoids protocol-level surprises.
+const CHUNK_SIZE: u32 = 2 * 1024 * 1024;
+
+/// Content-addressed file cache. Cheap to clone via `Arc`.
+pub struct ContentCache {
+    root: PathBuf,
+    /// Per-hash serialization — prevents two concurrent `ensure()` calls
+    /// for the same hash from racing on the same `.partial` file.
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Pending pulls by hash. The dispatcher's `on_file_range` /
+    /// `on_file_error` hooks forward incoming messages through here so the
+    /// `ensure()` loop can consume them.
+    pending: Mutex<HashMap<String, mpsc::UnboundedSender<ChunkResult>>>,
+}
+
+/// Internal message the dispatcher uses to feed `ensure()`.
+enum ChunkResult {
+    Range {
+        offset: u64,
+        data: Vec<u8>,
+        eof: bool,
+    },
+    Error(String),
+}
+
+impl ContentCache {
+    pub fn new(root: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            locks: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// `<root>/cas/<first-two-chars>/<hash>`.
+    pub fn path_for(&self, hash: &str) -> PathBuf {
+        let shard = if hash.len() >= 2 { &hash[..2] } else { "xx" };
+        self.root.join("cas").join(shard).join(hash)
+    }
+
+    /// Return true when a cached file for `hash` exists on disk and its
+    /// size matches `expected_size`. Mismatched size → treat as miss.
+    pub async fn has(&self, hash: &str, expected_size: u64) -> bool {
+        match tokio::fs::metadata(self.path_for(hash)).await {
+            Ok(m) => m.is_file() && m.len() == expected_size,
+            Err(_) => false,
+        }
+    }
+
+    /// Get a local path for `hash`. If absent or size-mismatched, pull via
+    /// `RequestFileRange`. Returns the final on-disk path.
+    ///
+    /// The caller passes the outbound `WorkerMessage` sender; the
+    /// dispatcher must forward any `FileRange` / `FileError` messages for
+    /// this hash to `on_file_range` / `on_file_error` while the pull is in
+    /// flight.
+    pub async fn ensure(
+        self: &Arc<Self>,
+        hash: &str,
+        size: u64,
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> Result<PathBuf> {
+        if hash.len() < 2 {
+            anyhow::bail!("invalid hash: too short");
+        }
+
+        let hash_lock = self.per_hash_lock(hash).await;
+        let _guard = hash_lock.lock().await;
+
+        if self.has(hash, size).await {
+            return Ok(self.path_for(hash));
+        }
+
+        self.pull_to_disk(hash, size, outbound_tx).await
+    }
+
+    async fn per_hash_lock(&self, hash: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().await;
+        locks
+            .entry(hash.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn pull_to_disk(
+        &self,
+        hash: &str,
+        size: u64,
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> Result<PathBuf> {
+        let final_path = self.path_for(hash);
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating cache dir {}", parent.display()))?;
+        }
+        let partial_path = final_path.with_extension("partial");
+
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<ChunkResult>();
+        self.pending.lock().await.insert(hash.to_string(), chunk_tx);
+
+        // Do the work in a helper so we can guarantee `pending` cleanup on
+        // every exit path.
+        let result = self
+            .pull_loop(hash, size, outbound_tx, &partial_path, &mut chunk_rx)
+            .await;
+
+        self.pending.lock().await.remove(hash);
+
+        match result {
+            Ok(()) => {
+                tokio::fs::rename(&partial_path, &final_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "renaming {} -> {}",
+                            partial_path.display(),
+                            final_path.display()
+                        )
+                    })?;
+                Ok(final_path)
+            }
+            Err(e) => {
+                // Best-effort cleanup of the .partial file.
+                let _ = tokio::fs::remove_file(&partial_path).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn pull_loop(
+        &self,
+        hash: &str,
+        size: u64,
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+        partial_path: &Path,
+        chunk_rx: &mut mpsc::UnboundedReceiver<ChunkResult>,
+    ) -> Result<()> {
+        let mut file = tokio::fs::File::create(partial_path)
+            .await
+            .with_context(|| format!("creating {}", partial_path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut offset: u64 = 0;
+
+        while offset < size {
+            let remaining = size - offset;
+            let length = CHUNK_SIZE.min(remaining.min(u32::MAX as u64) as u32);
+
+            outbound_tx
+                .send(WorkerMessage::RequestFileRange {
+                    hash: hash.to_string(),
+                    offset,
+                    length,
+                })
+                .await
+                .context("sending RequestFileRange")?;
+
+            match chunk_rx.recv().await {
+                Some(ChunkResult::Range {
+                    offset: resp_offset,
+                    data,
+                    eof,
+                }) => {
+                    if resp_offset != offset {
+                        anyhow::bail!("offset mismatch: requested {}, got {}", offset, resp_offset);
+                    }
+                    if data.is_empty() && !eof {
+                        anyhow::bail!("coord returned empty non-eof chunk at offset {}", offset);
+                    }
+                    hasher.update(&data);
+                    file.write_all(&data)
+                        .await
+                        .with_context(|| format!("writing to {}", partial_path.display()))?;
+                    offset += data.len() as u64;
+                    if eof {
+                        break;
+                    }
+                }
+                Some(ChunkResult::Error(reason)) => {
+                    anyhow::bail!("coord refused file range: {reason}");
+                }
+                None => {
+                    anyhow::bail!("pending channel closed before completion");
+                }
+            }
+        }
+
+        file.flush().await?;
+        drop(file);
+
+        if offset != size {
+            anyhow::bail!(
+                "short read: expected {} bytes, got {} before eof",
+                size,
+                offset
+            );
+        }
+
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != hash {
+            anyhow::bail!(
+                "hash mismatch: expected sha256 {}, computed {}",
+                hash,
+                actual
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Hook for the agent's message dispatcher: forward an incoming
+    /// `CoordMessage::FileRange` to the matching in-flight `ensure()`.
+    /// `data_b64` is the base64 payload as wired.
+    pub async fn on_file_range(&self, hash: &str, offset: u64, data_b64: &str, eof: bool) {
+        let data = match general_purpose::STANDARD.decode(data_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                self.on_file_error(hash, format!("base64 decode: {e}"))
+                    .await;
+                return;
+            }
+        };
+        if let Some(tx) = self.pending.lock().await.get(hash) {
+            let _ = tx.send(ChunkResult::Range { offset, data, eof });
+        }
+    }
+
+    /// Hook for the agent's message dispatcher: fail the matching
+    /// in-flight `ensure()` with `reason`.
+    pub async fn on_file_error(&self, hash: &str, reason: String) {
+        if let Some(tx) = self.pending.lock().await.remove(hash) {
+            let _ = tx.send(ChunkResult::Error(reason));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("crack-agent-cache-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    #[test]
+    fn path_for_shards_by_prefix() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let p = cache.path_for("abcdef0123456789");
+        assert_eq!(p, dir.path.join("cas").join("ab").join("abcdef0123456789"));
+    }
+
+    #[tokio::test]
+    async fn has_returns_false_when_missing() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        assert!(!cache.has("deadbeef00000000", 100).await);
+    }
+
+    #[tokio::test]
+    async fn has_returns_false_on_size_mismatch() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let hash = sha256_hex(b"hello");
+        let p = cache.path_for(&hash);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"hello").unwrap();
+        assert!(cache.has(&hash, 5).await);
+        assert!(!cache.has(&hash, 6).await);
+    }
+
+    /// Spawn a task that plays the role of the coord: for each
+    /// `RequestFileRange` received on `outbound_rx`, slice `data` at the
+    /// requested offset and drive it back through `cache.on_file_range`.
+    fn spawn_fake_coord(
+        cache: Arc<ContentCache>,
+        mut outbound_rx: mpsc::Receiver<WorkerMessage>,
+        data: Vec<u8>,
+        expected_hash: String,
+    ) {
+        tokio::spawn(async move {
+            while let Some(msg) = outbound_rx.recv().await {
+                match msg {
+                    WorkerMessage::RequestFileRange {
+                        hash,
+                        offset,
+                        length,
+                    } => {
+                        assert_eq!(hash, expected_hash);
+                        let start = offset as usize;
+                        let end = (start + length as usize).min(data.len());
+                        let chunk = &data[start..end];
+                        let eof = end == data.len();
+                        let b64 = general_purpose::STANDARD.encode(chunk);
+                        cache.on_file_range(&hash, offset, &b64, eof).await;
+                    }
+                    _ => panic!("unexpected outbound message"),
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn ensure_pulls_and_caches_on_miss() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let (tx, rx) = mpsc::channel(16);
+
+        let data = b"hello world".to_vec();
+        let hash = sha256_hex(&data);
+        spawn_fake_coord(cache.clone(), rx, data.clone(), hash.clone());
+
+        let path = cache.ensure(&hash, data.len() as u64, &tx).await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), data);
+        assert!(cache.has(&hash, data.len() as u64).await);
+    }
+
+    #[tokio::test]
+    async fn ensure_hit_skips_network_roundtrip() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+
+        // Pre-seed the cache.
+        let data = b"already cached".to_vec();
+        let hash = sha256_hex(&data);
+        let p = cache.path_for(&hash);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &data).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<WorkerMessage>(1);
+        let path = cache.ensure(&hash, data.len() as u64, &tx).await.unwrap();
+        assert_eq!(path, p);
+        // No message should have been sent.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_large_file_pulls_multiple_chunks() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let (tx, rx) = mpsc::channel(64);
+
+        // 5 MiB — forces at least 3 chunks at the 2 MiB default.
+        let data: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let hash = sha256_hex(&data);
+        spawn_fake_coord(cache.clone(), rx, data.clone(), hash.clone());
+
+        let path = cache.ensure(&hash, data.len() as u64, &tx).await.unwrap();
+        let on_disk = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(on_disk.len(), data.len());
+        assert_eq!(sha256_hex(&on_disk), hash);
+    }
+
+    #[tokio::test]
+    async fn ensure_hash_mismatch_aborts_and_cleans_partial() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let (tx, rx) = mpsc::channel(16);
+
+        let correct_data = b"correct".to_vec();
+        let wrong_data = b"WRONG!".to_vec();
+        let declared_hash = sha256_hex(&correct_data); // doesn't match wrong_data
+        spawn_fake_coord(cache.clone(), rx, wrong_data.clone(), declared_hash.clone());
+
+        let result = cache
+            .ensure(&declared_hash, correct_data.len() as u64, &tx)
+            .await;
+        assert!(result.is_err(), "expected hash-mismatch error");
+
+        // Cache must not have a permanent entry, and the .partial must be gone.
+        let p = cache.path_for(&declared_hash);
+        assert!(!p.exists(), "final path should not exist after mismatch");
+        let partial = p.with_extension("partial");
+        assert!(!partial.exists(), ".partial should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn ensure_surfaces_file_error_from_coord() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone());
+        let (tx, mut rx) = mpsc::channel::<WorkerMessage>(16);
+
+        let fake_hash = sha256_hex(b"nope");
+        let cache_clone = cache.clone();
+        let hash_clone = fake_hash.clone();
+        tokio::spawn(async move {
+            if let Some(WorkerMessage::RequestFileRange { hash, .. }) = rx.recv().await {
+                assert_eq!(hash, hash_clone);
+                cache_clone
+                    .on_file_error(&hash, "file not found".to_string())
+                    .await;
+            }
+        });
+
+        let err = cache.ensure(&fake_hash, 10, &tx).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("file not found"), "got: {msg}");
+    }
+}
