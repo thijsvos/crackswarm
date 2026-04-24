@@ -142,6 +142,28 @@ CREATE TABLE IF NOT EXISTS keyspace_cache (
     computed_at TEXT NOT NULL,
     PRIMARY KEY (wordlist_sha256, rules_sha256, hash_mode)
 );
+
+-- Reference-counting lifecycle for the file store.
+--
+-- Every live claim on a file (sha256-keyed) — by a task, a campaign, a pin,
+-- or a manual tag — gets a row here. When no rows reference a given sha256
+-- and the file isn't pinned, the file becomes eligible for GC.
+CREATE TABLE IF NOT EXISTS file_refs (
+    file_sha256   TEXT NOT NULL,
+    ref_kind      TEXT NOT NULL,      -- 'task' | 'campaign' | 'pin' | 'manual'
+    ref_id        TEXT NOT NULL,      -- task_id | campaign_id | 'pin' | user tag
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (file_sha256, ref_kind, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_file_refs_sha ON file_refs(file_sha256);
+
+-- Crash-safe GC work queue. `release_refs_if_last` inserts; the GC loop
+-- drains.
+CREATE TABLE IF NOT EXISTS gc_queue (
+    file_sha256   TEXT PRIMARY KEY,
+    queued_at     TEXT NOT NULL,
+    attempts      INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 // ── Database init ──
@@ -171,6 +193,16 @@ pub async fn init_db(data_dir: &Path) -> Result<SqlitePool> {
 
     // Migration: add campaign_id to tasks (idempotent)
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN campaign_id TEXT REFERENCES campaigns(id)")
+        .execute(&pool)
+        .await;
+
+    // Migration: lifecycle columns on files (idempotent). `pinned` overrides
+    // GC; `gc_state` tracks the reclaim state machine (active → marked →
+    // deleting → row removed).
+    let _ = sqlx::query("ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE files ADD COLUMN gc_state TEXT NOT NULL DEFAULT 'active'")
         .execute(&pool)
         .await;
 
@@ -352,9 +384,69 @@ pub async fn create_task(pool: &SqlitePool, req: &CreateTaskRequest) -> Result<T
     .await
     .context("inserting task")?;
 
+    // Acquire refs for every file this task depends on. Keeps the GC loop
+    // from reclaiming them out from under us.
+    acquire_task_refs_inline(pool, id, &req.hash_file_id, &req.attack_config).await?;
+
     get_task(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("task not found after insert"))
+}
+
+/// Walk the task's referenced files and insert a ref row for each that has
+/// a sha256 on record. Silent no-op on files uploaded before Slice 2 (no
+/// sha stored) — they're grandfathered in and won't be GC'd by accident.
+async fn acquire_task_refs_inline(
+    pool: &SqlitePool,
+    task_id: Uuid,
+    hash_file_id: &str,
+    attack_config: &AttackConfig,
+) -> Result<()> {
+    let mut file_ids: Vec<&str> = vec![hash_file_id];
+    match attack_config {
+        AttackConfig::BruteForce { .. } => {}
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            file_ids.push(wordlist_file_id);
+        }
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id,
+            rules_file_id,
+        } => {
+            file_ids.push(wordlist_file_id);
+            file_ids.push(rules_file_id);
+        }
+    }
+    let task_id_str = task_id.to_string();
+    for file_id in file_ids {
+        if let Some(rec) = get_file_record(pool, file_id).await? {
+            if !rec.sha256.is_empty() {
+                insert_file_ref(pool, &rec.sha256, "task", &task_id_str).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop all refs held by `task_id` and mark any freshly-orphaned files for
+/// GC. Idempotent.
+async fn release_task_refs_inline(pool: &SqlitePool, task_id: Uuid) -> Result<()> {
+    let shas = delete_refs_by_ref(pool, "task", &task_id.to_string()).await?;
+    for sha in shas {
+        maybe_mark_orphan_for_gc(pool, &sha).await?;
+    }
+    Ok(())
+}
+
+/// If nothing references this sha and it's not pinned, queue it for GC.
+async fn maybe_mark_orphan_for_gc(pool: &SqlitePool, sha: &str) -> Result<()> {
+    if count_refs_for_sha(pool, sha).await? > 0 {
+        return Ok(());
+    }
+    if is_sha_pinned(pool, sha).await? {
+        return Ok(());
+    }
+    mark_for_gc(pool, sha).await?;
+    Ok(())
 }
 
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> Result<Option<Task>> {
@@ -405,6 +497,9 @@ pub async fn update_task_status(pool: &SqlitePool, id: Uuid, status: TaskStatus)
                 .execute(pool)
                 .await
                 .context("updating task status to terminal")?;
+            // Release this task's file refs — any now-orphan files get
+            // queued for the GC loop to reclaim on its next pass.
+            release_task_refs_inline(pool, id).await?;
         }
         _ => {
             sqlx::query("UPDATE tasks SET status = ?1 WHERE id = ?2")
@@ -1146,6 +1241,160 @@ pub async fn insert_cached_keyspace(
     Ok(())
 }
 
+// ── Reference counting + GC ──────────────────────────────────────────────────
+
+/// Insert a reference row for the given sha256 / kind / id. Idempotent
+/// (INSERT OR IGNORE) so callers can safely re-run on retry.
+pub async fn insert_file_ref(
+    pool: &SqlitePool,
+    sha256: &str,
+    ref_kind: &str,
+    ref_id: &str,
+) -> Result<()> {
+    if sha256.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO file_refs (file_sha256, ref_kind, ref_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(sha256)
+    .bind(ref_kind)
+    .bind(ref_id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .context("inserting file_ref")?;
+    Ok(())
+}
+
+/// Delete every ref row with the given kind/id. Returns the distinct set of
+/// sha256s that were released — caller should run `release_refs_if_last` on
+/// each to queue any orphans for GC.
+pub async fn delete_refs_by_ref(
+    pool: &SqlitePool,
+    ref_kind: &str,
+    ref_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT file_sha256 FROM file_refs WHERE ref_kind = ?1 AND ref_id = ?2",
+    )
+    .bind(ref_kind)
+    .bind(ref_id)
+    .fetch_all(pool)
+    .await
+    .context("selecting refs to delete")?;
+
+    sqlx::query("DELETE FROM file_refs WHERE ref_kind = ?1 AND ref_id = ?2")
+        .bind(ref_kind)
+        .bind(ref_id)
+        .execute(pool)
+        .await
+        .context("deleting file_refs")?;
+
+    Ok(rows)
+}
+
+/// How many rows in `file_refs` currently reference this sha256?
+pub async fn count_refs_for_sha(pool: &SqlitePool, sha256: &str) -> Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM file_refs WHERE file_sha256 = ?1")
+        .bind(sha256)
+        .fetch_one(pool)
+        .await
+        .context("counting refs for sha")
+}
+
+/// Returns true if any file with this sha256 has `pinned = 1`.
+pub async fn is_sha_pinned(pool: &SqlitePool, sha256: &str) -> Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE sha256 = ?1 AND pinned = 1")
+            .bind(sha256)
+            .fetch_one(pool)
+            .await
+            .context("checking pinned state")?;
+    Ok(count > 0)
+}
+
+/// Transition matching files to `gc_state = 'marked'` and enqueue for GC.
+/// Only touches rows currently in `active` state (so re-calls during the
+/// `deleting` window are no-ops).
+pub async fn mark_for_gc(pool: &SqlitePool, sha256: &str) -> Result<()> {
+    sqlx::query("UPDATE files SET gc_state = 'marked' WHERE sha256 = ?1 AND gc_state = 'active'")
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .context("marking file for gc")?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO gc_queue (file_sha256, queued_at, attempts) VALUES (?1, ?2, 0)",
+    )
+    .bind(sha256)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .context("inserting into gc_queue")?;
+    Ok(())
+}
+
+/// Drain the GC queue: returns every (sha256, attempts) currently enqueued.
+pub async fn list_gc_queue(pool: &SqlitePool) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query("SELECT file_sha256, attempts FROM gc_queue ORDER BY queued_at ASC")
+        .fetch_all(pool)
+        .await
+        .context("listing gc_queue")?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.get::<String, _>("file_sha256"),
+                r.get::<i64, _>("attempts"),
+            ))
+        })
+        .collect()
+}
+
+/// Remove a sha from the GC queue (either because it was fully collected
+/// or because refs came back).
+pub async fn remove_from_gc_queue(pool: &SqlitePool, sha256: &str) -> Result<()> {
+    sqlx::query("DELETE FROM gc_queue WHERE file_sha256 = ?1")
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .context("removing from gc_queue")?;
+    Ok(())
+}
+
+/// Increment the attempt counter for a stuck GC entry (called when a pass
+/// couldn't finish — e.g. file still open elsewhere).
+pub async fn bump_gc_attempts(pool: &SqlitePool, sha256: &str) -> Result<()> {
+    sqlx::query("UPDATE gc_queue SET attempts = attempts + 1 WHERE file_sha256 = ?1")
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .context("bumping gc_queue attempts")?;
+    Ok(())
+}
+
+/// Transition a file from `marked` → `deleting` to reserve it for an
+/// in-progress GC pass.
+pub async fn set_gc_state_deleting(pool: &SqlitePool, sha256: &str) -> Result<()> {
+    sqlx::query("UPDATE files SET gc_state = 'deleting' WHERE sha256 = ?1 AND gc_state = 'marked'")
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .context("transitioning files to deleting")?;
+    Ok(())
+}
+
+/// Every `files` row sharing this sha256. A legacy deployment can have more
+/// than one — we delete all of them when the content is reclaimed.
+pub async fn files_by_sha256(pool: &SqlitePool, sha256: &str) -> Result<Vec<FileRecord>> {
+    let rows = sqlx::query("SELECT * FROM files WHERE sha256 = ?1")
+        .bind(sha256)
+        .fetch_all(pool)
+        .await
+        .context("fetching files by sha256")?;
+    rows.iter().map(row_to_file_record).collect()
+}
+
 pub async fn list_file_records(pool: &SqlitePool) -> Result<Vec<FileRecord>> {
     let rows = sqlx::query("SELECT * FROM files ORDER BY uploaded_at DESC")
         .fetch_all(pool)
@@ -1447,6 +1696,15 @@ pub async fn create_campaign(
     .await
     .context("inserting campaign")?;
 
+    // Acquire a campaign-level ref for the original hash file. Per-phase
+    // filtered hash files and wordlists/rules get refs through the tasks
+    // the campaign engine spawns.
+    if let Some(rec) = get_file_record(pool, &req.hash_file_id).await? {
+        if !rec.sha256.is_empty() {
+            insert_file_ref(pool, &rec.sha256, "campaign", &id.to_string()).await?;
+        }
+    }
+
     get_campaign(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("campaign not found after insert"))
@@ -1503,6 +1761,11 @@ pub async fn update_campaign_status(
                 .execute(pool)
                 .await
                 .context("updating campaign status to terminal")?;
+            // Release campaign-level refs; mark any orphans for GC.
+            let shas = delete_refs_by_ref(pool, "campaign", &id_str).await?;
+            for sha in shas {
+                maybe_mark_orphan_for_gc(pool, &sha).await?;
+            }
         }
         _ => {
             sqlx::query("UPDATE campaigns SET status = ?1 WHERE id = ?2")
@@ -1828,6 +2091,11 @@ pub async fn create_campaign_task(
     .await
     .context("inserting campaign task")?;
 
+    // Campaign-spawned tasks acquire their own file refs, same as direct
+    // task creation. When the task ends, those refs release and any
+    // orphaned files hit the GC queue.
+    acquire_task_refs_inline(pool, id, &req.hash_file_id, &req.attack_config).await?;
+
     get_task(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("task not found after insert"))
@@ -1847,6 +2115,18 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(INIT_SQL).execute(&pool).await.unwrap();
+        // Match init_db's idempotent ALTER TABLE migrations so tests see the
+        // same schema a running coord does.
+        let _ =
+            sqlx::query("ALTER TABLE tasks ADD COLUMN campaign_id TEXT REFERENCES campaigns(id)")
+                .execute(&pool)
+                .await;
+        let _ = sqlx::query("ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE files ADD COLUMN gc_state TEXT NOT NULL DEFAULT 'active'")
+            .execute(&pool)
+            .await;
         pool
     }
 
@@ -1966,6 +2246,169 @@ mod tests {
             .unwrap()
             .expect("should have found match");
         assert_eq!(found.id, "aaa-111");
+    }
+
+    async fn seed_file(pool: &SqlitePool, id: &str, sha: &str) {
+        let rec = sample_file_record(id, sha, Utc::now());
+        insert_file_record(pool, &rec).await.unwrap();
+    }
+
+    async fn make_task(pool: &SqlitePool, hash_file_id: &str) -> Task {
+        let req = CreateTaskRequest {
+            name: format!("t-{}", Uuid::new_v4()),
+            hash_mode: 1000,
+            hash_file_id: hash_file_id.to_string(),
+            attack_config: AttackConfig::BruteForce {
+                mask: "?a?a".to_string(),
+                custom_charsets: None,
+            },
+            priority: 5,
+            extra_args: vec![],
+        };
+        create_task(pool, &req).await.unwrap()
+    }
+
+    async fn make_dict_task(pool: &SqlitePool, hash_file_id: &str, wordlist_file_id: &str) -> Task {
+        let req = CreateTaskRequest {
+            name: format!("t-{}", Uuid::new_v4()),
+            hash_mode: 1000,
+            hash_file_id: hash_file_id.to_string(),
+            attack_config: AttackConfig::Dictionary {
+                wordlist_file_id: wordlist_file_id.to_string(),
+            },
+            priority: 5,
+            extra_args: vec![],
+        };
+        create_task(pool, &req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_task_acquires_refs_for_referenced_files() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-001", "sha-hash").await;
+
+        let task = make_task(&pool, "hash-001").await;
+
+        assert_eq!(count_refs_for_sha(&pool, "sha-hash").await.unwrap(), 1);
+        // Verify the ref is scoped to this task.
+        let shas = delete_refs_by_ref(&pool, "task", &task.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(shas, vec!["sha-hash".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn create_task_acquires_refs_for_dict_wordlist() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-002", "sha-hash").await;
+        seed_file(&pool, "wl-001", "sha-wl").await;
+
+        let _task = make_dict_task(&pool, "hash-002", "wl-001").await;
+
+        assert_eq!(count_refs_for_sha(&pool, "sha-hash").await.unwrap(), 1);
+        assert_eq!(count_refs_for_sha(&pool, "sha-wl").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_marks_orphan_files_for_gc() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-003", "sha-orphan").await;
+
+        let task = make_task(&pool, "hash-003").await;
+        assert_eq!(count_refs_for_sha(&pool, "sha-orphan").await.unwrap(), 1);
+
+        update_task_status(&pool, task.id, TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        // Ref released, file queued for GC.
+        assert_eq!(count_refs_for_sha(&pool, "sha-orphan").await.unwrap(), 0);
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].0, "sha-orphan");
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_doesnt_gc_file_still_in_use() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-004", "sha-shared").await;
+
+        let task_a = make_task(&pool, "hash-004").await;
+        let _task_b = make_task(&pool, "hash-004").await;
+
+        // Two tasks referencing the same hash file → refcount = 2.
+        assert_eq!(count_refs_for_sha(&pool, "sha-shared").await.unwrap(), 2);
+
+        update_task_status(&pool, task_a.id, TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        // One still active, so the file must not be queued for GC.
+        assert_eq!(count_refs_for_sha(&pool, "sha-shared").await.unwrap(), 1);
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert!(
+            queue.is_empty(),
+            "expected empty GC queue while other task still references the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_file_is_never_queued_for_gc() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-005", "sha-pinned").await;
+        sqlx::query("UPDATE files SET pinned = 1 WHERE id = ?1")
+            .bind("hash-005")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let task = make_task(&pool, "hash-005").await;
+        update_task_status(&pool, task.id, TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        assert!(is_sha_pinned(&pool, "sha-pinned").await.unwrap());
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert!(queue.is_empty(), "pinned file should not enter GC queue");
+    }
+
+    #[tokio::test]
+    async fn failed_and_cancelled_tasks_also_release_refs() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-006", "sha-fail").await;
+        seed_file(&pool, "hash-007", "sha-cancel").await;
+
+        let t1 = make_task(&pool, "hash-006").await;
+        let t2 = make_task(&pool, "hash-007").await;
+
+        update_task_status(&pool, t1.id, TaskStatus::Failed)
+            .await
+            .unwrap();
+        update_task_status(&pool, t2.id, TaskStatus::Cancelled)
+            .await
+            .unwrap();
+
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mark_for_gc_is_idempotent() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-008", "sha-idem").await;
+        mark_for_gc(&pool, "sha-idem").await.unwrap();
+        mark_for_gc(&pool, "sha-idem").await.unwrap();
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert_eq!(queue.len(), 1, "duplicate mark should not duplicate queue");
+    }
+
+    #[tokio::test]
+    async fn files_by_sha256_returns_all_legacy_duplicates() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "dup-a", "sha-x").await;
+        seed_file(&pool, "dup-b", "sha-x").await;
+        let records = files_by_sha256(&pool, "sha-x").await.unwrap();
+        assert_eq!(records.len(), 2);
     }
 
     #[tokio::test]
