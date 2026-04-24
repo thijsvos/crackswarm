@@ -64,6 +64,13 @@ toml = "1"
 # Cross-platform
 dirs = "6"
 
+# Streaming utilities (for large-file upload paths)
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+# Terminal UI (CLI progress bar on big uploads)
+indicatif = "0.18"
+
 # Internal crates
 crack-common = { path = "crates/crack-common" }
 crack-agent = { path = "crates/crack-agent" }

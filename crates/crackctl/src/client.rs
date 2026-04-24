@@ -2,7 +2,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use crack_common::models::*;
+use futures_util::stream::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
+
+/// Files this size or larger get a live progress bar on upload. Smaller
+/// files stream silently — same behaviour as before, just without the
+/// full-file-in-RAM read.
+const PROGRESS_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
 // ── Types local to the CLI client ──
 
@@ -337,11 +345,43 @@ impl Client {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "upload".to_string());
 
-        let file_bytes = tokio::fs::read(path)
+        let file = tokio::fs::File::open(path)
             .await
-            .with_context(|| format!("failed to read file: {}", path.display()))?;
+            .with_context(|| format!("failed to open file: {}", path.display()))?;
+        let size = file
+            .metadata()
+            .await
+            .with_context(|| format!("stat failed for {}", path.display()))?
+            .len();
 
-        let file_part = reqwest::multipart::Part::bytes(file_bytes)
+        // A hidden progress bar still accepts `.inc(n)` calls without any
+        // output, so we can wire the stream once and let the threshold
+        // decide whether anything shows up on-screen.
+        let pb = if size >= PROGRESS_THRESHOLD_BYTES {
+            let bar = ProgressBar::new(size);
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            bar.set_message(format!("Uploading {file_name}"));
+            bar
+        } else {
+            ProgressBar::hidden()
+        };
+
+        let pb_for_stream = pb.clone();
+        let stream = ReaderStream::new(file).map(move |result| {
+            if let Ok(ref chunk) = result {
+                pb_for_stream.inc(chunk.len() as u64);
+            }
+            result
+        });
+
+        let body = reqwest::Body::wrap_stream(stream);
+        let file_part = reqwest::multipart::Part::stream_with_length(body, size)
             .file_name(file_name)
             .mime_str("application/octet-stream")
             .context("invalid MIME")?;
@@ -357,6 +397,8 @@ impl Client {
             .send()
             .await
             .context("failed to reach coordinator")?;
+
+        pb.finish_and_clear();
 
         let resp = Self::check(resp).await?;
         let record: FileRecord = resp.json().await.context("failed to parse file record")?;
