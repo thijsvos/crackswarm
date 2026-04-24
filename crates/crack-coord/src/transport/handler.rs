@@ -453,7 +453,7 @@ async fn handle_worker_message(
             if let Some(wid) = worker_id.as_deref() {
                 if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
                     send_attack_files(state, &task, outbound_tx, transferred_files).await?;
-                    let msg = build_assign_chunk_msg(state, &task, &new_chunk)?;
+                    let msg = build_assign_chunk_msg(state, &task, &new_chunk).await?;
                     let _ = outbound_tx.send(msg).await;
                 } else {
                     db::update_worker_status(&state.db, wid, WorkerStatus::Idle).await?;
@@ -736,7 +736,14 @@ async fn handle_register(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Build a CoordMessage::AssignChunk with the hash file data embedded.
-pub(crate) fn build_assign_chunk_msg(
+///
+/// For dictionary-based attacks, emits `DictionaryByHash` whenever we can
+/// look up the referenced file's sha256 + size (the common case). The
+/// agent then pulls the file from its content cache on demand. Falls
+/// back to the legacy `Dictionary` / `DictionaryWithRules` push path
+/// only if a file record is missing or has no sha — effectively never,
+/// for files uploaded via this coord.
+pub(crate) async fn build_assign_chunk_msg(
     state: &AppState,
     task: &Task,
     chunk: &Chunk,
@@ -749,16 +756,50 @@ pub(crate) fn build_assign_chunk_msg(
             mask: mask.clone(),
             custom_charsets: custom_charsets.clone(),
         },
-        AttackConfig::Dictionary { wordlist_file_id } => AssignChunkAttack::Dictionary {
-            wordlist_file_id: wordlist_file_id.clone(),
-        },
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            match file_ref(&state.db, wordlist_file_id).await? {
+                Some((sha, size)) => AssignChunkAttack::DictionaryByHash {
+                    wordlist_sha256: sha,
+                    wordlist_size: size,
+                    rules_sha256: None,
+                    rules_size: None,
+                },
+                None => {
+                    warn!(file_id = %wordlist_file_id, "no sha256 for wordlist, falling back to legacy Dictionary push");
+                    AssignChunkAttack::Dictionary {
+                        wordlist_file_id: wordlist_file_id.clone(),
+                    }
+                }
+            }
+        }
         AttackConfig::DictionaryWithRules {
             wordlist_file_id,
             rules_file_id,
-        } => AssignChunkAttack::DictionaryWithRules {
-            wordlist_file_id: wordlist_file_id.clone(),
-            rules_file_id: rules_file_id.clone(),
-        },
+        } => {
+            let wl = file_ref(&state.db, wordlist_file_id).await?;
+            let rl = file_ref(&state.db, rules_file_id).await?;
+            match (wl, rl) {
+                (Some((w_sha, w_size)), Some((r_sha, r_size))) => {
+                    AssignChunkAttack::DictionaryByHash {
+                        wordlist_sha256: w_sha,
+                        wordlist_size: w_size,
+                        rules_sha256: Some(r_sha),
+                        rules_size: Some(r_size),
+                    }
+                }
+                _ => {
+                    warn!(
+                        wordlist = %wordlist_file_id,
+                        rules = %rules_file_id,
+                        "no sha256 for wordlist/rules, falling back to legacy DictionaryWithRules push"
+                    );
+                    AssignChunkAttack::DictionaryWithRules {
+                        wordlist_file_id: wordlist_file_id.clone(),
+                        rules_file_id: rules_file_id.clone(),
+                    }
+                }
+            }
+        }
     };
 
     // Read the hash file and base64-encode it for transfer over the Noise channel.
@@ -777,6 +818,18 @@ pub(crate) fn build_assign_chunk_msg(
         attack,
         extra_args: task.extra_args.clone(),
     })
+}
+
+/// Look up a file's (sha256, size_bytes) by UUID. Returns None if the record
+/// is missing, or if sha256 is empty (would pollute the content cache).
+async fn file_ref(pool: &sqlx::SqlitePool, file_id: &str) -> anyhow::Result<Option<(String, u64)>> {
+    Ok(db::get_file_record(pool, file_id).await?.and_then(|r| {
+        if r.sha256.is_empty() || r.size_bytes < 0 {
+            None
+        } else {
+            Some((r.sha256, r.size_bytes as u64))
+        }
+    }))
 }
 
 /// Stream a file to a worker in ~40KB chunks via TransferFileChunk messages.
@@ -835,14 +888,18 @@ async fn try_assign_work(
 ) -> anyhow::Result<()> {
     if let Some((task, chunk)) = scheduler::assign_next_chunk(state, wid).await? {
         send_attack_files(state, &task, outbound_tx, transferred_files).await?;
-        let msg = build_assign_chunk_msg(state, &task, &chunk)?;
+        let msg = build_assign_chunk_msg(state, &task, &chunk).await?;
         let _ = outbound_tx.send(msg).await;
     }
     Ok(())
 }
 
-/// If the task uses a dictionary or dictionary+rules attack, transfer the
-/// wordlist and rules files to the worker before sending the chunk assignment.
+/// Transfer referenced attack files to the worker before dispatching a chunk.
+///
+/// When every file has a sha256 recorded, we skip the push entirely — the
+/// agent will pull on demand via the content-addressed cache when it sees
+/// `DictionaryByHash`. The eager `TransferFileChunk` path remains only for
+/// the legacy fallback where a file has no sha (pre-dedup rows).
 async fn send_attack_files(
     state: &AppState,
     task: &Task,
@@ -851,12 +908,20 @@ async fn send_attack_files(
 ) -> anyhow::Result<()> {
     match &task.attack_config {
         AttackConfig::Dictionary { wordlist_file_id } => {
+            if file_ref(&state.db, wordlist_file_id).await?.is_some() {
+                return Ok(());
+            }
             send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
         }
         AttackConfig::DictionaryWithRules {
             wordlist_file_id,
             rules_file_id,
         } => {
+            let both_hashed = file_ref(&state.db, wordlist_file_id).await?.is_some()
+                && file_ref(&state.db, rules_file_id).await?.is_some();
+            if both_hashed {
+                return Ok(());
+            }
             send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
             send_file_to_worker(state, rules_file_id, outbound_tx, transferred_files).await?;
         }
