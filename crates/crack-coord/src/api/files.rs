@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Path, State};
@@ -5,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crack_common::models::FileRecord;
@@ -129,6 +131,131 @@ pub async fn upload_file(
 pub async fn list_files(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<FileRecord>>> {
     let records = db::list_file_records(&state.db).await?;
     Ok(Json(records))
+}
+
+/// Returned by `GET /api/v1/server-info`. Clients use this to detect
+/// whether their upload source is on the same device as the coord's
+/// file store; on a match, they can request a hard-link instead of
+/// streaming bytes.
+#[derive(Serialize, Deserialize)]
+pub struct ServerInfo {
+    /// Absolute path to the coord's `files_dir` on disk.
+    pub files_dir: String,
+    /// Device ID of the files_dir's filesystem (0 on non-Unix platforms).
+    pub device_id: u64,
+}
+
+pub async fn server_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<ServerInfo>> {
+    let files_dir = state.files_dir();
+    tokio::fs::create_dir_all(&files_dir).await?;
+    let device_id = device_id_of(&files_dir)?;
+    Ok(Json(ServerInfo {
+        files_dir: files_dir.to_string_lossy().to_string(),
+        device_id,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct HardlinkRequest {
+    /// Absolute path on the coord's local filesystem.
+    pub source_path: String,
+    pub file_type: String,
+    pub filename: String,
+}
+
+pub async fn hardlink_file(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HardlinkRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let source_path = PathBuf::from(&req.source_path);
+    if !source_path.is_absolute() {
+        return Err(ApiError::BadRequest(
+            "source_path must be absolute".to_string(),
+        ));
+    }
+
+    let files_dir = state.files_dir();
+    tokio::fs::create_dir_all(&files_dir).await?;
+
+    // Verify source is on the same device as files_dir (hard links can't
+    // cross filesystems), and that it's a regular file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source_meta = tokio::fs::metadata(&source_path)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("source not readable: {e}")))?;
+        if !source_meta.is_file() {
+            return Err(ApiError::BadRequest(
+                "source must be a regular file".to_string(),
+            ));
+        }
+        let files_meta = tokio::fs::metadata(&files_dir).await?;
+        if source_meta.dev() != files_meta.dev() {
+            return Err(ApiError::BadRequest(
+                "source is on a different device than files_dir".to_string(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &source_path;
+        return Err(ApiError::BadRequest(
+            "hardlink fast path requires a Unix-like OS".to_string(),
+        ));
+    }
+
+    let (file_id, sha256, size_bytes) =
+        files::hard_link_from(&files_dir, &source_path, &req.filename)
+            .await
+            .map_err(|e| ApiError::Internal(format!("hard-link failed: {e}")))?;
+
+    // Dedup: if we already have this content, remove the newly-created link
+    // and return the existing record. The source file is untouched.
+    if let Some(existing) = db::find_file_by_sha256(&state.db, &sha256).await? {
+        if let Err(e) = files::delete_file(&files_dir, &file_id) {
+            tracing::warn!(
+                file_id = %file_id,
+                error = %e,
+                "dedup: failed to remove newly-created hardlink from disk"
+            );
+        }
+        info!(
+            existing_id = %existing.id,
+            filename = %req.filename,
+            sha256 = %sha256,
+            "dedup: returning existing file record for matching sha256 (hardlink path)"
+        );
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+
+    let disk_path = files_dir.join(&file_id).to_string_lossy().to_string();
+    let record = FileRecord {
+        id: file_id,
+        filename: req.filename,
+        file_type: req.file_type,
+        size_bytes: size_bytes as i64,
+        sha256,
+        disk_path,
+        uploaded_at: Utc::now(),
+    };
+    db::insert_file_record(&state.db, &record).await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+fn device_id_of(path: &std::path::Path) -> ApiResult<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| ApiError::Internal(format!("stat {}: {e}", path.display())))?;
+        Ok(meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0)
+    }
 }
 
 pub async fn download_file(
