@@ -1,6 +1,7 @@
 mod api;
 mod campaign;
 mod config;
+mod lifecycle;
 mod monitor;
 mod scheduler;
 mod state;
@@ -181,6 +182,13 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     let monitor_state = Arc::clone(&state);
     tokio::spawn(async move {
         monitor::run_monitor(monitor_state).await;
+    });
+
+    // Start GC loop: drains gc_queue and reclaims files whose refs dropped
+    // to zero while tasks/campaigns were transitioning to terminal states.
+    let gc_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        lifecycle::run_gc_loop(gc_state).await;
     });
 
     // Optionally start a local agent (pre-check hashcat availability)
