@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -23,6 +23,30 @@ struct PendingChunk {
     chunk_id: Uuid,
     task_id: Uuid,
     run_config: HashcatRunConfig,
+    /// sha256s this chunk is currently using from the content cache. The
+    /// main loop tracks these so an incoming `EvictFile` for one of these
+    /// hashes defers until the chunk finishes.
+    cache_holds: Vec<String>,
+}
+
+/// Record that `pending.chunk_id` is currently using every sha in
+/// `pending.cache_holds`. Called on `ChunkReady` before the chunk runs or
+/// is queued; matching release happens on chunk terminal state.
+fn register_cache_holds(
+    pending: &PendingChunk,
+    running_chunks_using: &mut HashMap<String, HashSet<Uuid>>,
+    chunk_cache_holds: &mut HashMap<Uuid, Vec<String>>,
+) {
+    if pending.cache_holds.is_empty() {
+        return;
+    }
+    for sha in &pending.cache_holds {
+        running_chunks_using
+            .entry(sha.clone())
+            .or_default()
+            .insert(pending.chunk_id);
+    }
+    chunk_cache_holds.insert(pending.chunk_id, pending.cache_holds.clone());
 }
 
 /// Maximum Noise transport message (plaintext side). 64 KiB is well within
@@ -263,6 +287,16 @@ async fn connect_and_run(
     // Queue for chunks waiting to run (serialized: only one hashcat at a time)
     let mut pending_queue: VecDeque<PendingChunk> = VecDeque::new();
 
+    // Per-hash set of chunk IDs currently using the cached file. EvictFile
+    // defers while this is non-empty for the target hash.
+    let mut running_chunks_using: HashMap<String, HashSet<Uuid>> = HashMap::new();
+    // Reverse map: chunk_id -> sha256s it holds. On chunk completion we
+    // drop the chunk from each hash's set and drain pending_evictions.
+    let mut chunk_cache_holds: HashMap<Uuid, Vec<String>> = HashMap::new();
+    // Hashes the coord has asked us to evict but couldn't be removed yet
+    // because a chunk was still using them.
+    let mut pending_evictions: HashSet<String> = HashSet::new();
+
     loop {
         // We use `stream.readable()` in the select to detect when there is
         // data to read, without actually borrowing `stream` mutably.  After
@@ -289,7 +323,13 @@ async fn connect_and_run(
 
         match action {
             Action::Heartbeat => {
-                send_message(&mut stream, &mut transport, &WorkerMessage::Heartbeat).await?;
+                let cache_manifest = content_cache.manifest().await;
+                send_message(
+                    &mut stream,
+                    &mut transport,
+                    &WorkerMessage::Heartbeat { cache_manifest },
+                )
+                .await?;
                 debug!("sent heartbeat");
             }
 
@@ -310,13 +350,41 @@ async fn connect_and_run(
                 )
                 .await?;
 
-                // If the chunk finished, start the next queued chunk
                 if is_terminal {
+                    // Release this chunk's hold on every sha it was using.
+                    // Any hash whose in-use set becomes empty and is on the
+                    // pending-evictions list is actually evicted now.
+                    if let Some(shas) = chunk_cache_holds.remove(&chunk_id) {
+                        for sha in shas {
+                            if let Some(users) = running_chunks_using.get_mut(&sha) {
+                                users.remove(&chunk_id);
+                                if users.is_empty() {
+                                    running_chunks_using.remove(&sha);
+                                    if pending_evictions.remove(&sha) {
+                                        let removed = content_cache.evict(&sha).await;
+                                        info!(
+                                            sha = %sha,
+                                            removed,
+                                            "deferred EvictFile flushed after chunk completion"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Start the next queued chunk, if any.
                     if let Some(next) = pending_queue.pop_front() {
                         info!(
                             chunk_id = %next.chunk_id,
                             remaining = pending_queue.len(),
                             "starting next queued chunk"
+                        );
+                        // Register this chunk's cache holds before start.
+                        register_cache_holds(
+                            &next,
+                            &mut running_chunks_using,
+                            &mut chunk_cache_holds,
                         );
                         start_hashcat(
                             &next.run_config,
@@ -339,6 +407,10 @@ async fn connect_and_run(
             }
 
             Action::ChunkReady(pending) => {
+                // Register cache holds regardless of whether we start or
+                // queue — an EvictFile arriving while the chunk is queued
+                // must still defer.
+                register_cache_holds(&pending, &mut running_chunks_using, &mut chunk_cache_holds);
                 if active_chunks.is_empty() {
                     start_hashcat(
                         &pending.run_config,
@@ -525,6 +597,7 @@ async fn connect_and_run(
                             let ready = ready_tx.clone();
                             let hashcat_path = config.hashcat_path.clone();
                             tokio::spawn(async move {
+                                let mut cache_holds: Vec<String> = Vec::new();
                                 let wordlist_path = match cache
                                     .ensure(&wordlist_sha256, wordlist_size, &outbound)
                                     .await
@@ -546,12 +619,16 @@ async fn connect_and_run(
                                         return;
                                     }
                                 };
+                                cache_holds.push(wordlist_sha256.clone());
 
-                                let rules_path = match rules_sha256 {
+                                let rules_path = match rules_sha256.clone() {
                                     Some(rs) => {
                                         let rz = rules_size.unwrap_or(0);
                                         match cache.ensure(&rs, rz, &outbound).await {
-                                            Ok(p) => Some(p),
+                                            Ok(p) => {
+                                                cache_holds.push(rs);
+                                                Some(p)
+                                            }
                                             Err(e) => {
                                                 error!(
                                                     %chunk_id,
@@ -592,6 +669,7 @@ async fn connect_and_run(
                                         chunk_id,
                                         task_id,
                                         run_config,
+                                        cache_holds,
                                     })
                                     .await;
                             });
@@ -678,6 +756,10 @@ async fn connect_and_run(
                                 chunk_id,
                                 task_id,
                                 run_config,
+                                // Legacy paths (BruteForce, pushed Dictionary)
+                                // don't use the content cache, so nothing to
+                                // hold.
+                                cache_holds: Vec::new(),
                             });
                         }
                     }
@@ -731,6 +813,23 @@ async fn connect_and_run(
                     CoordMessage::FileError { hash, reason } => {
                         debug!(%hash, %reason, "received FileError");
                         content_cache.on_file_error(&hash, reason).await;
+                    }
+
+                    CoordMessage::EvictFile { hash } => {
+                        if running_chunks_using
+                            .get(&hash)
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                        {
+                            info!(
+                                %hash,
+                                "EvictFile deferred — file is in use by a running chunk"
+                            );
+                            pending_evictions.insert(hash);
+                        } else {
+                            let removed = content_cache.evict(&hash).await;
+                            info!(%hash, removed, "EvictFile applied");
+                        }
                     }
                 }
             }

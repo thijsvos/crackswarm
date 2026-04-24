@@ -346,9 +346,17 @@ async fn handle_worker_message(
             .await
         }
 
-        WorkerMessage::Heartbeat => {
+        WorkerMessage::Heartbeat { cache_manifest } => {
             if let Some(wid) = worker_id.as_deref() {
                 db::update_worker_last_seen(&state.db, wid).await?;
+                // Sync the coord's view of this worker's cache. Entries
+                // present here but missing from the DB are upserted;
+                // entries in the DB but missing from this manifest are
+                // removed (the agent evicted them locally since last tick).
+                if let Err(e) = db::sync_worker_cache_manifest(&state.db, wid, cache_manifest).await
+                {
+                    warn!(worker = %wid, error = %e, "failed to sync cache manifest");
+                }
             }
             Ok(())
         }
