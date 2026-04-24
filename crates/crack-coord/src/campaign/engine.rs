@@ -218,9 +218,7 @@ async fn find_next_subtask(
         } => {
             // Current length = number of charset tokens in the completed mask
             let charset_len = charset.len();
-            let current_length = if charset_len > 0 {
-                completed_mask.len() / charset_len
-            } else {
+            let Some(current_length) = completed_mask.len().checked_div(charset_len) else {
                 return Ok(None);
             };
             let next_length = current_length + 1;

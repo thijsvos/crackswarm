@@ -144,7 +144,7 @@ impl PositionStats {
         }
 
         let mut sorted: Vec<(char, u32)> = self.chars.iter().map(|(&c, &n)| (c, n)).collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         let mut coverage = 0u32;
         let needed = (self.total as f64 * threshold) as u32;
@@ -200,7 +200,7 @@ pub fn analyze(
 
     // Sort by frequency descending
     let mut ranked: Vec<(Skeleton, u32)> = skeleton_counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     // Filter: minimum count threshold
     ranked.retain(|(_, count)| *count >= config.min_skeleton_count);
@@ -342,7 +342,7 @@ pub fn analyze(
     }
 
     let mut suffix_ranked: Vec<(String, u32)> = suffix_counts.into_iter().collect();
-    suffix_ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    suffix_ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     for (suffix, count) in suffix_ranked.iter().take(10) {
         if *count < config.min_skeleton_count {
