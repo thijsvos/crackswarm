@@ -20,6 +20,24 @@ pub enum CoordMessage {
         /// ~40KB of raw data, base64-encoded (fits in a single Noise frame).
         data_b64: String,
     },
+    /// Response to `WorkerMessage::RequestFileRange`. Carries a byte range
+    /// of the file identified by `hash` (sha256 hex). `eof = true` when
+    /// `offset + data.len() >= total file size`, signalling the worker to
+    /// stop its pull loop.
+    FileRange {
+        hash: String,
+        offset: u64,
+        /// Raw bytes, base64-encoded to fit the JSON wire format.
+        data_b64: String,
+        eof: bool,
+    },
+    /// Sent in place of `FileRange` when the coord can't serve the request
+    /// (file not found, read error, etc.). The worker aborts its pull and
+    /// surfaces the reason.
+    FileError {
+        hash: String,
+        reason: String,
+    },
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
@@ -104,6 +122,16 @@ pub enum WorkerMessage {
     },
     Draining,
     Leaving,
+    /// Ask the coord to send a byte range of a file identified by content
+    /// hash (sha256 hex). The coord responds with one or more
+    /// `CoordMessage::FileRange` messages, or a `CoordMessage::FileError`
+    /// if the request can't be served. The worker drives the pull loop
+    /// (next request sent after the previous response arrives).
+    RequestFileRange {
+        hash: String,
+        offset: u64,
+        length: u32,
+    },
 }
 
 /// Length-prefixed framing for Noise transport messages.
@@ -587,6 +615,76 @@ mod tests {
         let buf = too_large.to_be_bytes();
         let result: crate::error::Result<Option<(CoordMessage, usize)>> = decode_message(&buf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn roundtrip_file_range() {
+        let msg = CoordMessage::FileRange {
+            hash: "deadbeef".to_string(),
+            offset: 4096,
+            data_b64: "YWJjZA==".to_string(),
+            eof: false,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::FileRange {
+                hash,
+                offset,
+                data_b64,
+                eof,
+            } => {
+                assert_eq!(hash, "deadbeef");
+                assert_eq!(offset, 4096);
+                assert_eq!(data_b64, "YWJjZA==");
+                assert!(!eof);
+            }
+            other => panic!("expected FileRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_file_error() {
+        let msg = CoordMessage::FileError {
+            hash: "cafe".to_string(),
+            reason: "not found".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            CoordMessage::FileError { hash, reason } => {
+                assert_eq!(hash, "cafe");
+                assert_eq!(reason, "not found");
+            }
+            other => panic!("expected FileError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_request_file_range() {
+        let msg = WorkerMessage::RequestFileRange {
+            hash: "feed".to_string(),
+            offset: 0,
+            length: 2_097_152,
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, consumed): (WorkerMessage, usize) =
+            decode_message(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded {
+            WorkerMessage::RequestFileRange {
+                hash,
+                offset,
+                length,
+            } => {
+                assert_eq!(hash, "feed");
+                assert_eq!(offset, 0);
+                assert_eq!(length, 2_097_152);
+            }
+            other => panic!("expected RequestFileRange, got {other:?}"),
+        }
     }
 
     #[test]

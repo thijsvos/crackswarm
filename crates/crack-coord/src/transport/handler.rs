@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -535,7 +535,127 @@ async fn handle_worker_message(
             debug!(%peer_addr, "ignoring Enroll message in message loop (already authorized)");
             Ok(())
         }
+
+        WorkerMessage::RequestFileRange {
+            hash,
+            offset,
+            length,
+        } => {
+            handle_request_file_range(state, outbound_tx, hash, *offset, *length).await?;
+            Ok(())
+        }
     }
+}
+
+/// Cap any single `RequestFileRange` response at this many raw bytes. Larger
+/// caps bloat the Noise frame (MAX_MESSAGE_SIZE = 16 MiB, base64 adds 33%),
+/// so we keep a safe margin. The worker decides how fast to pull by issuing
+/// the next request after each response arrives.
+const FILE_RANGE_MAX_BYTES: u32 = 2 * 1024 * 1024;
+
+async fn handle_request_file_range(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    hash: &str,
+    offset: u64,
+    length: u32,
+) -> anyhow::Result<()> {
+    let record = match db::find_file_by_sha256(&state.db, hash).await? {
+        Some(r) => r,
+        None => {
+            outbound_tx
+                .send(CoordMessage::FileError {
+                    hash: hash.to_string(),
+                    reason: "file not found".to_string(),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+
+    let path = match files::resolve_file_path(&state.files_dir(), &record.id) {
+        Ok(p) => p,
+        Err(e) => {
+            outbound_tx
+                .send(CoordMessage::FileError {
+                    hash: hash.to_string(),
+                    reason: format!("resolve path: {e}"),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+
+    let total_size = record.size_bytes.max(0) as u64;
+    let capped = length.min(FILE_RANGE_MAX_BYTES) as usize;
+    // Don't read past EOF.
+    let remaining = total_size.saturating_sub(offset) as usize;
+    let to_read = capped.min(remaining);
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            outbound_tx
+                .send(CoordMessage::FileError {
+                    hash: hash.to_string(),
+                    reason: format!("open: {e}"),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        outbound_tx
+            .send(CoordMessage::FileError {
+                hash: hash.to_string(),
+                reason: format!("seek: {e}"),
+            })
+            .await
+            .ok();
+        return Ok(());
+    }
+
+    let mut buf = vec![0u8; to_read];
+    let n = match file.read(&mut buf).await {
+        Ok(n) => n,
+        Err(e) => {
+            outbound_tx
+                .send(CoordMessage::FileError {
+                    hash: hash.to_string(),
+                    reason: format!("read: {e}"),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+    buf.truncate(n);
+
+    let eof = offset.saturating_add(n as u64) >= total_size;
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+    debug!(
+        hash = %hash,
+        offset,
+        length = n,
+        eof,
+        "serving FileRange"
+    );
+
+    outbound_tx
+        .send(CoordMessage::FileRange {
+            hash: hash.to_string(),
+            offset,
+            data_b64,
+            eof,
+        })
+        .await
+        .context("send FileRange")?;
+    Ok(())
 }
 
 // ── Register ────────────────────────────────────────────────────────────────
