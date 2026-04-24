@@ -20,15 +20,11 @@ pub fn spawn_event_reader(tick_rate: Duration) -> mpsc::UnboundedReceiver<TermEv
         loop {
             if event::poll(tick_rate).unwrap_or(false) {
                 match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if tx.send(TermEvent::Key(key)).is_err() {
-                            return;
-                        }
+                    Ok(Event::Key(key)) if tx.send(TermEvent::Key(key)).is_err() => {
+                        return;
                     }
-                    Ok(Event::Resize(w, h)) => {
-                        if tx.send(TermEvent::Resize(w, h)).is_err() {
-                            return;
-                        }
+                    Ok(Event::Resize(w, h)) if tx.send(TermEvent::Resize(w, h)).is_err() => {
+                        return;
                     }
                     _ => {}
                 }
