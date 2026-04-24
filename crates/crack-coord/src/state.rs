@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +22,10 @@ pub struct AppState {
 
     /// Connected workers: worker_id → sender for Noise messages.
     pub worker_connections: RwLock<HashMap<String, WorkerConnection>>,
+
+    /// Task IDs currently being prepared by the monitor (keyspace + hash count).
+    /// Prevents double-spawn when a prep takes longer than one monitor tick.
+    pub preparing_tasks: RwLock<HashSet<Uuid>>,
 
     /// Broadcast channel for TUI events.
     pub events: broadcast::Sender<AppEvent>,
@@ -97,6 +101,7 @@ impl AppState {
             hashcat_path,
             bind_addr,
             worker_connections: RwLock::new(HashMap::new()),
+            preparing_tasks: RwLock::new(HashSet::new()),
             events,
         })
     }
