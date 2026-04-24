@@ -102,7 +102,6 @@ pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
 /// Delete a file from disk by its file_id.
 ///
 /// Tries the bare file_id first, then falls back to any file whose name starts with the file_id.
-#[allow(dead_code)]
 pub fn delete_file(files_dir: &Path, file_id: &str) -> Result<()> {
     // Try exact match first
     let exact = files_dir.join(file_id);
