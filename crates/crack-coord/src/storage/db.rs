@@ -178,6 +178,17 @@ CREATE TABLE IF NOT EXISTS worker_cache_entries (
     PRIMARY KEY (worker_id, file_sha256)
 );
 CREATE INDEX IF NOT EXISTS idx_worker_cache_sha ON worker_cache_entries(file_sha256);
+
+-- Hot-path indexes for the dispatch / monitor / TUI loops. All queries that
+-- ride these were full-table scans before; coordinator overhead grew linearly
+-- with the chunks/audit/cracked tables until added.
+CREATE INDEX IF NOT EXISTS idx_chunks_task_id           ON chunks(task_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_status            ON chunks(status);
+CREATE INDEX IF NOT EXISTS idx_chunks_assigned_status   ON chunks(assigned_worker, status);
+CREATE INDEX IF NOT EXISTS idx_audit_created_at         ON audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cracked_cracked_at       ON cracked_hashes(cracked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority    ON tasks(status, priority);
+CREATE INDEX IF NOT EXISTS idx_workers_status           ON workers(status);
 "#;
 
 // ── Database init ──
@@ -207,6 +218,9 @@ pub async fn init_db(data_dir: &Path) -> Result<SqlitePool> {
 
     // Migration: add campaign_id to tasks (idempotent)
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN campaign_id TEXT REFERENCES campaigns(id)")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_campaign_id ON tasks(campaign_id)")
         .execute(&pool)
         .await;
 
@@ -2329,6 +2343,10 @@ mod tests {
             sqlx::query("ALTER TABLE tasks ADD COLUMN campaign_id TEXT REFERENCES campaigns(id)")
                 .execute(&pool)
                 .await;
+        let _ =
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_campaign_id ON tasks(campaign_id)")
+                .execute(&pool)
+                .await;
         let _ = sqlx::query("ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             .execute(&pool)
             .await;
@@ -2971,5 +2989,32 @@ mod tests {
             .unwrap()
             .expect("should have found match");
         assert_eq!(found.id, "older-id");
+    }
+
+    #[tokio::test]
+    async fn schema_has_hot_path_indexes() {
+        // Regression guard: dispatch / monitor / TUI hot paths assume these
+        // indexes exist. Removing one silently degrades coordinator throughput
+        // back to full table scans, so tie them to a test.
+        let pool = mem_pool().await;
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let names: std::collections::HashSet<_> = names.into_iter().collect();
+        for required in [
+            "idx_chunks_task_id",
+            "idx_chunks_status",
+            "idx_chunks_assigned_status",
+            "idx_audit_created_at",
+            "idx_cracked_cracked_at",
+            "idx_tasks_status_priority",
+            "idx_tasks_campaign_id",
+            "idx_workers_status",
+        ] {
+            assert!(names.contains(required), "missing index: {required}");
+        }
     }
 }
