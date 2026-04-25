@@ -1084,11 +1084,13 @@ async fn handle_runner_event(
             .await?;
         }
         RunnerEvent::HashCracked { hash, plaintext } => {
+            // Plaintext deliberately not logged here: agent log files end up
+            // on disk under default umask. Coord persists them in the
+            // access-controlled cracked_hashes table.
             info!(
                 chunk_id = %chunk_id,
                 task_id = %task_id,
                 hash = %hash,
-                plaintext = %plaintext,
                 "sending HashCracked to coordinator"
             );
             emit(

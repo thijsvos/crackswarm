@@ -1534,24 +1534,54 @@ pub async fn sync_worker_cache_manifest(
             .await
             .context("clearing worker cache entries")?;
     } else {
-        // Build "NOT IN (?, ?, ?)" with placeholders. SQLite caps bound
-        // params at 32766 per statement; heartbeats would need tens of
-        // thousands of cache entries to trip that, and the manifest
-        // payload would already be absurd before then.
-        let placeholders = (0..manifest.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "DELETE FROM worker_cache_entries WHERE worker_id = ? AND file_sha256 NOT IN ({placeholders})"
-        );
-        let mut q = sqlx::query(&sql).bind(worker_id);
-        for entry in manifest {
-            q = q.bind(&entry.sha256);
-        }
-        q.execute(&mut *tx)
+        // Stage the keep-set in a connection-scoped temp table and pivot the
+        // DELETE through `NOT IN (SELECT …)`. This sidesteps SQLite's
+        // bound-parameter cap (defaults to 999 on pre-3.32 builds, 32766 on
+        // 3.32+). The temp table is connection-scoped, so we DROP it at the
+        // end to avoid surprising the next heartbeat on a reused pool conn.
+        sqlx::query(
+            "CREATE TEMP TABLE IF NOT EXISTS _keep_shas (sha TEXT PRIMARY KEY)",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("creating temp keep table")?;
+        sqlx::query("DELETE FROM _keep_shas")
+            .execute(&mut *tx)
             .await
-            .context("pruning stale worker cache entries")?;
+            .context("clearing temp keep table")?;
+
+        // Each multi-row VALUES insert binds one parameter per row; cap the
+        // batch well below the 999 ceiling so any older bundled libsqlite3
+        // is happy.
+        const KEEP_BATCH: usize = 500;
+        for batch in manifest.chunks(KEEP_BATCH) {
+            let placeholders = std::iter::repeat_n("(?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("INSERT OR IGNORE INTO _keep_shas(sha) VALUES {placeholders}");
+            let mut q = sqlx::query(&sql);
+            for entry in batch {
+                q = q.bind(&entry.sha256);
+            }
+            q.execute(&mut *tx)
+                .await
+                .context("populating keep set")?;
+        }
+
+        sqlx::query(
+            "DELETE FROM worker_cache_entries
+             WHERE worker_id = ?1
+               AND file_sha256 NOT IN (SELECT sha FROM _keep_shas)",
+        )
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await
+        .context("pruning stale worker cache entries")?;
+
+        sqlx::query("DROP TABLE _keep_shas")
+            .execute(&mut *tx)
+            .await
+            .context("dropping temp keep table")?;
     }
 
     // Upsert each entry in the new manifest.
@@ -2723,6 +2753,42 @@ mod tests {
         assert!(
             workers_with_file(&pool, "bb").await.unwrap().is_empty(),
             "bb should have been pruned from worker_cache_entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_handles_large_manifest_without_param_cap() {
+        // Regression for the chunked NOT IN path: a manifest larger than the
+        // 500-row insert batch must round-trip through the temp-table
+        // detour without tripping SQLite's bound-parameter ceiling.
+        let pool = mem_pool().await;
+        let initial: Vec<_> = (0..1200)
+            .map(|i| manifest_entry(&format!("sha-{i:04}"), 10 + i as u64))
+            .collect();
+        sync_worker_cache_manifest(&pool, "w", &initial)
+            .await
+            .expect("initial sync should succeed");
+
+        // Drop a couple of shas in the middle and make sure they're pruned
+        // while the rest are kept.
+        let kept: Vec<_> = initial
+            .iter()
+            .filter(|e| e.sha256 != "sha-0500" && e.sha256 != "sha-1000")
+            .cloned()
+            .collect();
+        sync_worker_cache_manifest(&pool, "w", &kept)
+            .await
+            .expect("second sync should succeed");
+
+        assert!(workers_with_file(&pool, "sha-0500").await.unwrap().is_empty());
+        assert!(workers_with_file(&pool, "sha-1000").await.unwrap().is_empty());
+        assert_eq!(
+            workers_with_file(&pool, "sha-0123").await.unwrap(),
+            vec!["w".to_string()]
+        );
+        assert_eq!(
+            workers_with_file(&pool, "sha-1199").await.unwrap(),
+            vec!["w".to_string()]
         );
     }
 

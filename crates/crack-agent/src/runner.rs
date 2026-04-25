@@ -296,7 +296,12 @@ impl HashcatRunner {
                     if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
                         let is_new = seen_hashes.lock().unwrap().insert(hash.clone());
                         if is_new {
-                            info!(hash = %hash, plaintext = %plaintext, "hash cracked (final outfile read)");
+                            // Plaintext intentionally omitted from log: agent
+                            // log files inherit default umask, and the whole
+                            // product is built around protecting these.
+                            // The audit/cracked tables on the coord persist
+                            // them under access control.
+                            info!(hash = %hash, "hash cracked (final outfile read)");
                             let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
                         }
                     }

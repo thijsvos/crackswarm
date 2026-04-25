@@ -224,7 +224,12 @@ async fn compute_keyspace_via_hashcat(
 ///   ?h = 16 (hex lower), ?H = 16 (hex upper)
 ///
 /// Custom charsets ?1..?4 are defined via the custom_charsets parameter.
-#[allow(dead_code)]
+///
+/// Production reads keyspace from `hashcat --keyspace` (see
+/// `compute_keyspace_with_hashcat`); this helper is kept only as a sanity-check
+/// counterpart for the unit tests below — gated to test builds so it doesn't
+/// ship in the coord binary.
+#[cfg(test)]
 fn compute_mask_keyspace(mask: &str, custom_charsets: Option<&[String]>) -> anyhow::Result<u64> {
     // First, collect all the charset sizes for each mask position
     let mut position_sizes: Vec<u64> = Vec::new();
@@ -285,7 +290,9 @@ fn compute_mask_keyspace(mask: &str, custom_charsets: Option<&[String]>) -> anyh
 ///
 /// Custom charsets can reference built-in charsets (e.g., "?l?d" = 36 chars)
 /// or list literal characters (e.g., "abc" = 3 chars).
-#[allow(dead_code)]
+///
+/// Test-only helper paired with `compute_mask_keyspace`.
+#[cfg(test)]
 fn custom_charset_size(idx: usize, custom_charsets: Option<&[String]>) -> anyhow::Result<u64> {
     let charsets = custom_charsets
         .ok_or_else(|| anyhow::anyhow!("mask uses ?{} but no custom charsets defined", idx + 1))?;
@@ -346,6 +353,13 @@ pub fn calculate_chunk_size(
     num_workers: usize,
 ) -> u64 {
     const MIN_CHUNK: u64 = 10_000;
+
+    // Callers (assigner) filter zero-keyspace tasks before reaching here, but
+    // make the function total in case a future caller doesn't: clamp's
+    // `min > max` panic isn't worth the chance.
+    if total_keyspace == 0 {
+        return 0;
+    }
 
     let raw = if let Some(speed) = worker_speed {
         speed.saturating_mul(600)
@@ -510,5 +524,14 @@ mod tests {
         // 10_000 / (1 * 4) = 2_500, clamp(10_000, 10_000) = 10_000
         let size = calculate_chunk_size(None, 10_000, 1);
         assert_eq!(size, 10_000);
+    }
+
+    #[test]
+    fn chunk_size_zero_keyspace_returns_zero() {
+        // Defensive: callers filter empty keyspaces before reaching here, but
+        // the function must be total — clamp(min, max) with min > max panics.
+        assert_eq!(calculate_chunk_size(None, 0, 4), 0);
+        assert_eq!(calculate_chunk_size(Some(1_000_000), 0, 4), 0);
+        assert_eq!(calculate_chunk_size(None, 0, 0), 0);
     }
 }

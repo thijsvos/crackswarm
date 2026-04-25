@@ -5,6 +5,30 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
+/// Extract a disk-safe extension from a caller-supplied filename.
+///
+/// `Path::extension` alone isn't enough — it accepts `"foo/bar"` etc., which
+/// would land outside `files_dir` once joined. Whitelist `[A-Za-z0-9]{1,16}`
+/// (ascii alnum, length-bounded). Anything else collapses to no extension —
+/// the file is still stored, just under the bare UUID.
+fn safe_disk_ext(filename: &str) -> Option<String> {
+    let ext = Path::new(filename).extension()?.to_str()?;
+    if ext.is_empty() || ext.len() > 16 {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_string())
+}
+
+fn disk_name_for(file_id: &str, filename: &str) -> String {
+    match safe_disk_ext(filename) {
+        Some(ext) => format!("{file_id}.{ext}"),
+        None => file_id.to_string(),
+    }
+}
+
 /// Streaming writer for an incoming upload. Writes to a `.partial` companion
 /// file so a crash or error leaves no half-finished entry in the canonical
 /// name slot; only a successful `finalize()` does the atomic rename.
@@ -28,17 +52,7 @@ impl FileWriter {
             .with_context(|| format!("creating files directory: {}", files_dir.display()))?;
 
         let file_id = Uuid::new_v4().to_string();
-
-        let ext = Path::new(filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        let disk_name = if ext.is_empty() {
-            file_id.clone()
-        } else {
-            format!("{file_id}.{ext}")
-        };
+        let disk_name = disk_name_for(&file_id, filename);
 
         let final_path = files_dir.join(&disk_name);
         let partial_path = files_dir.join(format!("{disk_name}.partial"));
@@ -65,6 +79,13 @@ impl FileWriter {
         self.hasher.update(bytes);
         self.size += bytes.len() as u64;
         Ok(())
+    }
+
+    /// Total bytes written so far. Used by the upload handler to enforce a
+    /// per-request size cap as the stream arrives — no buffering, no
+    /// post-finalize cleanup.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
     /// Finish the upload: flush to disk, rename `.partial` to the final name,
@@ -120,15 +141,7 @@ pub async fn hard_link_from(
         .with_context(|| format!("creating files directory: {}", files_dir.display()))?;
 
     let file_id = Uuid::new_v4().to_string();
-    let ext = Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let disk_name = if ext.is_empty() {
-        file_id.clone()
-    } else {
-        format!("{file_id}.{ext}")
-    };
+    let disk_name = disk_name_for(&file_id, filename);
     let dest = files_dir.join(&disk_name);
 
     tokio::fs::hard_link(source_path, &dest)
@@ -322,6 +335,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn safe_disk_ext_accepts_normal_extensions() {
+        assert_eq!(safe_disk_ext("foo.txt"), Some("txt".into()));
+        assert_eq!(safe_disk_ext("bar.HASH"), Some("HASH".into()));
+        assert_eq!(safe_disk_ext("rule.rule"), Some("rule".into()));
+        assert_eq!(safe_disk_ext("dump.7z"), Some("7z".into()));
+    }
+
+    #[test]
+    fn safe_disk_ext_rejects_path_components() {
+        // `Path::extension` on a path with separators returns `None` on Unix
+        // for the easy cases — but a backslash on Unix is treated as a
+        // literal in the last component, so `Path::new("y.foo\\bar")` reports
+        // an extension of `"foo\\bar"`. The whitelist catches it via the
+        // ascii-alnum filter even though `Path` itself does not.
+        assert_eq!(safe_disk_ext("x.foo/bar"), None);
+        assert_eq!(safe_disk_ext("y.foo\\bar"), None);
+        assert_eq!(safe_disk_ext("../../etc/passwd"), None);
+    }
+
+    #[test]
+    fn safe_disk_ext_rejects_overlong_or_empty() {
+        assert_eq!(safe_disk_ext("noext"), None);
+        assert_eq!(safe_disk_ext("foo."), None);
+        let long = format!("foo.{}", "a".repeat(17));
+        assert_eq!(safe_disk_ext(&long), None);
+        // Right at the boundary, 16 chars is allowed.
+        let max = format!("foo.{}", "a".repeat(16));
+        assert_eq!(safe_disk_ext(&max), Some("a".repeat(16)));
+    }
+
+    #[test]
+    fn safe_disk_ext_rejects_non_ascii_or_punctuation() {
+        assert_eq!(safe_disk_ext("foo.tar.gz"), Some("gz".into())); // ok
+        assert_eq!(safe_disk_ext("foo.t-x"), None);
+        assert_eq!(safe_disk_ext("foo.tä"), None);
+        assert_eq!(safe_disk_ext("foo. "), None);
+    }
+
+    #[test]
+    fn disk_name_collapses_unsafe_extensions() {
+        assert_eq!(disk_name_for("uuid", "x.foo/bar"), "uuid");
+        assert_eq!(disk_name_for("uuid", "x.txt"), "uuid.txt");
     }
 
     #[tokio::test]

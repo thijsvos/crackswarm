@@ -24,6 +24,9 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -54,6 +57,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match &self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 

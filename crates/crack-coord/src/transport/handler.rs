@@ -11,7 +11,7 @@ use uuid::Uuid;
 use std::collections::HashSet;
 
 use base64::Engine;
-use crack_common::auth::{build_responder, encode_public_key};
+use crack_common::auth::{build_responder, encode_public_key, pubkey_fingerprint};
 use crack_common::models::*;
 use crack_common::protocol::{AssignChunkAttack, CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
 
@@ -59,6 +59,7 @@ async fn run_connection(
         .context("noise handshake: no remote static key")?
         .to_vec();
     let pubkey_b64 = encode_public_key(&remote_static);
+    let pubkey_fp = pubkey_fingerprint(&pubkey_b64);
 
     // Check authorization.
     let authorized = db::is_worker_authorized(&state.db, &pubkey_b64)
@@ -81,11 +82,13 @@ async fn run_connection(
         .into_transport_mode()
         .context("failed to enter noise transport mode")?;
 
-    info!(%peer_addr, pubkey = %pubkey_b64, "noise handshake complete");
+    // Log a fingerprint, not the full pubkey: tracing output lands on disk
+    // under default umask; the audit_log table keeps the full key.
+    info!(%peer_addr, pubkey_fp = %pubkey_fp, "noise handshake complete");
 
     // If not authorized, wait for an Enroll message (with timeout).
     if !authorized {
-        info!(%peer_addr, pubkey = %pubkey_b64, "worker not pre-authorized, waiting for enrollment");
+        info!(%peer_addr, pubkey_fp = %pubkey_fp, "worker not pre-authorized, waiting for enrollment");
 
         let enroll_result =
             tokio::time::timeout(std::time::Duration::from_secs(5), read_noise_frame(stream)).await;
@@ -97,7 +100,7 @@ async fn run_connection(
                 return Ok(());
             }
             Err(_) => {
-                warn!(%peer_addr, pubkey = %pubkey_b64, "enrollment timeout, disconnecting");
+                warn!(%peer_addr, pubkey_fp = %pubkey_fp, "enrollment timeout, disconnecting");
                 db::insert_audit(
                     &state.db,
                     "auth_rejected",
@@ -172,7 +175,7 @@ async fn run_connection(
                 }
             }
             _ => {
-                warn!(%peer_addr, pubkey = %pubkey_b64, "unauthorized worker sent non-Enroll message, disconnecting");
+                warn!(%peer_addr, pubkey_fp = %pubkey_fp, "unauthorized worker sent non-Enroll message, disconnecting");
                 db::insert_audit(
                     &state.db,
                     "auth_rejected",
