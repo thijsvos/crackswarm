@@ -2,6 +2,34 @@
 
 All notable changes to Crackswarm are documented here.
 
+## [0.9.0] - 2026-04-25
+
+### Added
+- Pull-based file RPC over the Noise channel: agents fetch hash files, wordlists, and rules on demand instead of receiving them over a push stream
+- Content-addressed agent cache keyed by sha256, with hardlink fast path for same-host coord/agent setups
+- `DictionaryByHash` dispatch — wordlists are referenced by hash and fetched lazily by agents
+- Reference-counted file lifecycle on the coordinator with background garbage collection of unreferenced files
+- Agent-side `EvictFile` protocol message and per-heartbeat cache manifest
+- Cache reconciliation on (re)connect — coord and agent agree on what each side has after disconnect
+- LRU eviction with configurable disk budget on the agent
+- Operator cache controls in `crackctl`: `file pin`, `file unpin`, `file gc`, plus cache visibility commands
+- Same-host hardlink fast path for local file uploads (avoids redundant copies)
+- Streaming end-to-end byte transfer with progress bar on uploads
+- Upload deduplication by sha256 content hash on the coordinator
+- Keyspace cache and non-blocking task preparation (large keyspace tasks no longer stall the API loop)
+
+### Fixed
+- Race between GC and heartbeat-driven cache sync that could evict files mid-use
+- GC eligibility now re-evaluated on unpin (a file pinned then unpinned would otherwise linger)
+- Soft-delete used during GC to avoid foreign-key violations on in-flight references
+- Clippy 1.95 lints and rustls-webpki CVE patches
+
+### Changed
+- Dependabot auto-merges patch/minor bumps when CI passes
+- Bumped fetch-metadata to v3, polished dependabot config
+- Workspace cargo update — 53 patch/minor dependency bumps
+- Comprehensive rustdoc audit: drift fixes, `# Errors` sections on `Result`-returning public APIs, full public-API coverage
+
 ## [0.8.2] - 2026-03-29
 
 ### Added

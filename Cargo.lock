@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "crack-agent"
-version = "0.8.4"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "crack-common"
-version = "0.8.4"
+version = "0.9.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "crack-coord"
-version = "0.8.4"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "crackctl"
-version = "0.8.4"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64",
