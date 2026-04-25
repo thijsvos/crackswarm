@@ -552,6 +552,27 @@ async fn handle_worker_message(
             handle_request_file_range(state, outbound_tx, hash, *offset, *length).await?;
             Ok(())
         }
+
+        WorkerMessage::CacheAck { kept, evicted } => {
+            // The agent has already evicted what we asked. Drop the
+            // evicted shas from our coord-side view immediately so the
+            // GC loop doesn't keep re-targeting this worker. The next
+            // heartbeat will deliver the full ground-truth manifest.
+            if let Some(wid) = worker_id.as_deref() {
+                for sha in evicted {
+                    if let Err(e) = db::remove_worker_cache_entry(&state.db, wid, sha).await {
+                        warn!(worker = %wid, %sha, error = %e, "remove_worker_cache_entry failed");
+                    }
+                }
+                debug!(
+                    worker = %wid,
+                    kept = kept.len(),
+                    evicted_count = evicted.len(),
+                    "received CacheAck"
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -734,6 +755,26 @@ async fn handle_register(
         Some(&wid),
     )
     .await?;
+
+    // Cache reconciliation: tell the (re)connecting worker which sha256s
+    // we still consider live. Anything in its cache that's not on this
+    // list gets evicted (deferred if currently in use). Catches missed
+    // EvictFile messages from prior sessions and any drift while the
+    // agent was disconnected.
+    match db::list_active_file_shas(&state.db).await {
+        Ok(expected) => {
+            let count = expected.len();
+            if let Err(e) = outbound_tx
+                .send(CoordMessage::CacheReconcile { expected })
+                .await
+            {
+                debug!(error = %e, "failed to send CacheReconcile");
+            } else {
+                debug!(worker = %wid, expected_count = count, "sent CacheReconcile");
+            }
+        }
+        Err(e) => warn!(error = %e, "failed to list active file shas for reconcile"),
+    }
 
     // Try to immediately assign work to the newly registered worker.
     try_assign_work(state, &wid, outbound_tx, transferred_files).await?;

@@ -1398,6 +1398,20 @@ pub async fn set_gc_state_deleting(pool: &SqlitePool, sha256: &str) -> Result<()
     Ok(())
 }
 
+/// All sha256s currently considered "live" on the coord — i.e. files with
+/// `gc_state = 'active'`. Used by reconciliation to tell a (re)connecting
+/// worker which content it's still allowed to keep cached.
+pub async fn list_active_file_shas(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT sha256 FROM files \
+         WHERE sha256 != '' AND gc_state = 'active'",
+    )
+    .fetch_all(pool)
+    .await
+    .context("listing active file shas")?;
+    Ok(rows)
+}
+
 /// Replace this worker's cache manifest in `worker_cache_entries` with the
 /// new set: upsert every entry in `manifest`, remove any rows not listed.
 /// Runs as a single transaction so the coord never sees a half-synced
@@ -1472,10 +1486,9 @@ pub async fn workers_with_file(pool: &SqlitePool, sha256: &str) -> Result<Vec<St
     Ok(rows)
 }
 
-/// Remove a single worker/sha pair. Used by reconciliation (Slice 9) to
+/// Remove a single worker/sha pair. Called by the `CacheAck` handler to
 /// flush stale rows the agent has told us it no longer has; also handy
 /// for explicit cache-drop operator actions.
-#[allow(dead_code)]
 pub async fn remove_worker_cache_entry(
     pool: &SqlitePool,
     worker_id: &str,
@@ -2598,6 +2611,54 @@ mod tests {
             workers_with_file(&pool, "shared").await.unwrap(),
             vec!["w-b".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn list_active_file_shas_returns_active_only() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "f-active", "sha-a").await;
+        seed_file(&pool, "f-marked", "sha-m").await;
+        seed_file(&pool, "f-deleting", "sha-d").await;
+        seed_file(&pool, "f-empty", "").await;
+
+        sqlx::query("UPDATE files SET gc_state = 'marked' WHERE id = 'f-marked'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET gc_state = 'deleting' WHERE id = 'f-deleting'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let shas = list_active_file_shas(&pool).await.unwrap();
+        assert_eq!(shas, vec!["sha-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_active_file_shas_dedups_legacy_duplicates() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "dup-a", "sha-x").await;
+        seed_file(&pool, "dup-b", "sha-x").await;
+        let shas = list_active_file_shas(&pool).await.unwrap();
+        assert_eq!(shas, vec!["sha-x".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remove_worker_cache_entry_targets_only_one_worker() {
+        let pool = mem_pool().await;
+        sync_worker_cache_manifest(&pool, "w-a", &[manifest_entry("shared", 50)])
+            .await
+            .unwrap();
+        sync_worker_cache_manifest(&pool, "w-b", &[manifest_entry("shared", 50)])
+            .await
+            .unwrap();
+
+        remove_worker_cache_entry(&pool, "w-a", "shared")
+            .await
+            .unwrap();
+
+        let workers = workers_with_file(&pool, "shared").await.unwrap();
+        assert_eq!(workers, vec!["w-b".to_string()]);
     }
 
     #[tokio::test]
