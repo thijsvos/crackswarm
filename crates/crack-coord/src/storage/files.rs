@@ -228,45 +228,26 @@ pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(Strin
     Ok((file_id, sha256))
 }
 
-/// Read a file from disk by its file_id.
+/// Resolve a `file_id` to the actual path on disk.
 ///
-/// Tries the bare file_id first, then falls back to any file whose name starts with the file_id
-/// (to handle files stored with an extension).
-pub fn read_file(files_dir: &Path, file_id: &str) -> Result<Vec<u8>> {
-    // Try exact match first
-    let exact = files_dir.join(file_id);
-    if exact.is_file() {
-        return std::fs::read(&exact).with_context(|| format!("reading file {}", exact.display()));
-    }
-
-    // Fall back: look for file_id.* (with extension)
-    let prefix = format!("{file_id}.");
-    if let Ok(entries) = std::fs::read_dir(files_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
-                    return std::fs::read(entry.path())
-                        .with_context(|| format!("reading file {}", entry.path().display()));
-                }
-            }
-        }
-    }
-
-    anyhow::bail!("file not found: {file_id} in {}", files_dir.display())
-}
-
-/// Resolve a file_id to its full path on disk.
+/// Tries `<files_dir>/<file_id>` first (uploads with no extension), then
+/// scans for the first entry matching `<file_id>.*` (uploads with an
+/// extension — the on-disk name carries `<uuid>.<ext>`, but the DB's
+/// `disk_path` column predates the extension fix-up and currently doesn't
+/// include it).
 ///
-/// Tries the bare file_id first, then falls back to any file whose name starts with the file_id
-/// (to handle files stored with an extension).
-pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
-    // Try exact match first
+/// Returns `Ok(path)` on the first match, `Err` if neither form exists.
+///
+/// The prefix scan is bounded in practice by `safe_disk_ext` (uploads
+/// can't write filenames outside `<uuid>.[A-Za-z0-9]{1,16}`), but it is
+/// still O(files_count) per call and a clean candidate for retirement
+/// once the upload path stores the full disk path in DB.
+fn locate_existing(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
     let exact = files_dir.join(file_id);
     if exact.is_file() {
         return Ok(exact);
     }
 
-    // Fall back: look for file_id.* (with extension)
     let prefix = format!("{file_id}.");
     if let Ok(entries) = std::fs::read_dir(files_dir) {
         for entry in entries.flatten() {
@@ -281,36 +262,22 @@ pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
     anyhow::bail!("file not found: {file_id} in {}", files_dir.display())
 }
 
+/// Read a file from disk by its file_id.
+pub fn read_file(files_dir: &Path, file_id: &str) -> Result<Vec<u8>> {
+    let path = locate_existing(files_dir, file_id)?;
+    std::fs::read(&path).with_context(|| format!("reading file {}", path.display()))
+}
+
+/// Resolve a file_id to its full path on disk.
+pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
+    locate_existing(files_dir, file_id)
+}
+
 /// Delete a file from disk by its file_id.
-///
-/// Tries the bare file_id first, then falls back to any file whose name starts with the file_id.
 pub fn delete_file(files_dir: &Path, file_id: &str) -> Result<()> {
-    // Try exact match first
-    let exact = files_dir.join(file_id);
-    if exact.is_file() {
-        std::fs::remove_file(&exact)
-            .with_context(|| format!("deleting file {}", exact.display()))?;
-        return Ok(());
-    }
-
-    // Fall back: look for file_id.* (with extension)
-    let prefix = format!("{file_id}.");
-    if let Ok(entries) = std::fs::read_dir(files_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
-                    std::fs::remove_file(entry.path())
-                        .with_context(|| format!("deleting file {}", entry.path().display()))?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "file not found for deletion: {file_id} in {}",
-        files_dir.display()
-    )
+    let path = locate_existing(files_dir, file_id)
+        .with_context(|| format!("file not found for deletion: {file_id}"))?;
+    std::fs::remove_file(&path).with_context(|| format!("deleting file {}", path.display()))
 }
 
 #[cfg(test)]

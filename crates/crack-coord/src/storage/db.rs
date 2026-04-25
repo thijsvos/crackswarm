@@ -255,19 +255,25 @@ pub async fn init_db(data_dir: &Path) -> Result<SqlitePool> {
 
 // ── Helper: parse DateTime from ISO 8601 string ──
 
-fn parse_dt(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| {
-            // Fall back to parsing without timezone suffix
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-                .map(|ndt| ndt.and_utc())
-                .unwrap_or_default()
-        })
+/// Parse an ISO-8601 timestamp from a `TEXT` column.
+///
+/// Tries RFC 3339 first (the format `now_iso()` writes); falls back to a
+/// no-tz `YYYY-MM-DDTHH:MM:SS[.f]` form for any rows still around from an
+/// older write path. Anything that doesn't match either form is a corrupt
+/// timestamp — propagate as an error rather than collapse to UNIX_EPOCH,
+/// because callers (heartbeat-timeout, abandoned-chunk reassignment, audit
+/// ordering) make load-bearing decisions based on these values.
+fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    let ndt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .with_context(|| format!("unparseable timestamp: {s:?}"))?;
+    Ok(ndt.and_utc())
 }
 
-fn parse_dt_opt(s: Option<String>) -> Option<DateTime<Utc>> {
-    s.map(|s| parse_dt(&s))
+fn parse_dt_opt(s: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    s.map(|s| parse_dt(&s)).transpose()
 }
 
 fn now_iso() -> String {
@@ -304,9 +310,9 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> Result<Task> {
         cracked_count: row.get::<u32, _>("cracked_count"),
         extra_args: serde_json::from_str(&extra_args_json).context("parsing extra_args JSON")?,
         campaign_id,
-        created_at: parse_dt(row.get("created_at")),
-        started_at: parse_dt_opt(row.get("started_at")),
-        completed_at: parse_dt_opt(row.get("completed_at")),
+        created_at: parse_dt(row.get("created_at"))?,
+        started_at: parse_dt_opt(row.get("started_at"))?,
+        completed_at: parse_dt_opt(row.get("completed_at"))?,
     })
 }
 
@@ -319,8 +325,8 @@ fn row_to_chunk(row: &sqlx::sqlite::SqliteRow) -> Result<Chunk> {
         limit: row.get::<i64, _>("limit") as u64,
         status: ChunkStatus::from_str(&status_str).map_err(|e| anyhow::anyhow!(e))?,
         assigned_worker: row.get("assigned_worker"),
-        assigned_at: parse_dt_opt(row.get("assigned_at")),
-        completed_at: parse_dt_opt(row.get("completed_at")),
+        assigned_at: parse_dt_opt(row.get("assigned_at"))?,
+        completed_at: parse_dt_opt(row.get("completed_at"))?,
         progress: row.get("progress"),
         speed: row.get::<i64, _>("speed") as u64,
         cracked_count: row.get::<u32, _>("cracked_count"),
@@ -338,8 +344,8 @@ fn row_to_worker(row: &sqlx::sqlite::SqliteRow) -> Result<Worker> {
         hashcat_version: row.get("hashcat_version"),
         os: row.get("os"),
         status: WorkerStatus::from_str(&status_str).map_err(|e| anyhow::anyhow!(e))?,
-        created_at: parse_dt(row.get("created_at")),
-        last_seen_at: parse_dt(row.get("last_seen_at")),
+        created_at: parse_dt(row.get("created_at"))?,
+        last_seen_at: parse_dt(row.get("last_seen_at"))?,
     })
 }
 
@@ -350,7 +356,7 @@ fn row_to_cracked(row: &sqlx::sqlite::SqliteRow) -> Result<CrackedHash> {
         hash: row.get("hash"),
         plaintext: row.get("plaintext"),
         worker_id: row.get("worker_id"),
-        cracked_at: parse_dt(row.get("cracked_at")),
+        cracked_at: parse_dt(row.get("cracked_at"))?,
     })
 }
 
@@ -359,7 +365,7 @@ fn row_to_benchmark(row: &sqlx::sqlite::SqliteRow) -> Result<WorkerBenchmark> {
         worker_id: row.get("worker_id"),
         hash_mode: row.get::<u32, _>("hash_mode"),
         speed: row.get::<i64, _>("speed") as u64,
-        measured_at: parse_dt(row.get("measured_at")),
+        measured_at: parse_dt(row.get("measured_at"))?,
     })
 }
 
@@ -370,7 +376,7 @@ fn row_to_audit(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEntry> {
         details: row.get("details"),
         source_ip: row.get("source_ip"),
         worker_id: row.get("worker_id"),
-        created_at: parse_dt(row.get("created_at")),
+        created_at: parse_dt(row.get("created_at"))?,
     })
 }
 
@@ -382,7 +388,7 @@ fn row_to_file_record(row: &sqlx::sqlite::SqliteRow) -> Result<FileRecord> {
         size_bytes: row.get("size_bytes"),
         sha256: row.get("sha256"),
         disk_path: row.get("disk_path"),
-        uploaded_at: parse_dt(row.get("uploaded_at")),
+        uploaded_at: parse_dt(row.get("uploaded_at"))?,
     })
 }
 
@@ -1895,9 +1901,9 @@ fn row_to_campaign(row: &sqlx::sqlite::SqliteRow) -> Result<Campaign> {
         priority: row.get::<u8, _>("priority"),
         extra_args: serde_json::from_str(&extra_args_json)
             .context("parsing campaign extra_args JSON")?,
-        created_at: parse_dt(row.get("created_at")),
-        started_at: parse_dt_opt(row.get("started_at")),
-        completed_at: parse_dt_opt(row.get("completed_at")),
+        created_at: parse_dt(row.get("created_at"))?,
+        started_at: parse_dt_opt(row.get("started_at"))?,
+        completed_at: parse_dt_opt(row.get("completed_at"))?,
     })
 }
 
@@ -1917,9 +1923,9 @@ fn row_to_phase(row: &sqlx::sqlite::SqliteRow) -> Result<CampaignPhase> {
         task_id,
         hash_file_id: row.get("hash_file_id"),
         cracked_count: row.get::<i32, _>("cracked_count") as u32,
-        created_at: parse_dt(row.get("created_at")),
-        started_at: parse_dt_opt(row.get("started_at")),
-        completed_at: parse_dt_opt(row.get("completed_at")),
+        created_at: parse_dt(row.get("created_at"))?,
+        started_at: parse_dt_opt(row.get("started_at"))?,
+        completed_at: parse_dt_opt(row.get("completed_at"))?,
     })
 }
 
@@ -2384,6 +2390,31 @@ mod tests {
             .execute(&pool)
             .await;
         pool
+    }
+
+    #[test]
+    fn parse_dt_accepts_rfc3339_and_naive_forms() {
+        let rfc = parse_dt("2026-04-25T10:00:00Z").unwrap();
+        assert_eq!(rfc.to_rfc3339(), "2026-04-25T10:00:00+00:00");
+        let naive = parse_dt("2026-04-25T10:00:00.500").unwrap();
+        assert_eq!(naive.to_rfc3339(), "2026-04-25T10:00:00.500+00:00");
+    }
+
+    #[test]
+    fn parse_dt_propagates_garbage_instead_of_silent_epoch() {
+        // Pre-S13 behaviour: unparseable strings collapsed to UNIX_EPOCH
+        // and the monitor treated old chunks as eligible for reassignment.
+        // Now they must surface as errors so the row mapper fails loudly.
+        assert!(parse_dt("not a timestamp").is_err());
+        assert!(parse_dt("").is_err());
+        assert!(parse_dt("1970-01-01").is_err());
+    }
+
+    #[test]
+    fn parse_dt_opt_handles_none_and_some() {
+        assert!(parse_dt_opt(None).unwrap().is_none());
+        assert!(parse_dt_opt(Some("2026-04-25T10:00:00Z".into())).unwrap().is_some());
+        assert!(parse_dt_opt(Some("garbage".into())).is_err());
     }
 
     #[tokio::test]

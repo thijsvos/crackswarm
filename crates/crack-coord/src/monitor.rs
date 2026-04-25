@@ -275,14 +275,27 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
         );
     }
 
-    // Try to assign pending chunks to idle workers
+    // Try to assign pending chunks to idle workers.
+    //
+    // The dispatch is intentionally *sequential* even though this is a hot
+    // path: `assign_next_chunk` has a read-modify-write race on
+    // `tasks.next_skip` (read cursor → INSERT chunk → UPDATE cursor) that
+    // is masked by serial execution. Two concurrent calls would both
+    // observe the same cursor and dispatch overlapping chunks. Parallel
+    // fanout requires that race be closed first (wrap the steps in a
+    // single transaction with a conditional UPDATE), tracked by the
+    // 2026-04-25 audit roadmap as part of PR 4 (X6).
+    //
+    // What we *can* cheaply do here is acquire the connections-map read
+    // guard once instead of re-acquiring per worker, so a slow
+    // `worker_connections.write()` (new-worker registration) doesn't
+    // serialize behind 8 dispatches.
     let idle_workers = crate::scheduler::assigner::find_idle_workers(state).await?;
+    let conns = state.worker_connections.read().await;
     for worker_id in idle_workers {
         if let Some((task, chunk)) =
             crate::scheduler::assigner::assign_next_chunk(state, &worker_id).await?
         {
-            // Send the chunk to the worker if connected
-            let conns = state.worker_connections.read().await;
             if let Some(conn) = conns.get(&worker_id) {
                 // Transfer wordlist/rules files before assigning the chunk
                 if let Err(e) =
