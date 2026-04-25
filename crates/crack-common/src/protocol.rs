@@ -45,6 +45,15 @@ pub enum CoordMessage {
     EvictFile {
         hash: String,
     },
+    /// Sent once when a worker (re)connects: the authoritative list of
+    /// sha256s the coord still has on its end. The agent compares against
+    /// its own cache manifest and evicts anything not in `expected` —
+    /// catches missed `EvictFile` messages from prior sessions and any
+    /// drift accumulated while the agent was disconnected. Eviction
+    /// defers as usual when a sha is in use by a running chunk.
+    CacheReconcile {
+        expected: Vec<String>,
+    },
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
@@ -160,6 +169,14 @@ pub enum WorkerMessage {
         hash: String,
         offset: u64,
         length: u32,
+    },
+    /// Response to `CoordMessage::CacheReconcile`. `kept` is the set of
+    /// sha256s the worker still has after the reconcile pass; `evicted`
+    /// is what was removed (informational). The coord uses `kept` to
+    /// rewrite `worker_cache_entries` for this worker.
+    CacheAck {
+        kept: Vec<String>,
+        evicted: Vec<String>,
     },
 }
 
@@ -531,6 +548,40 @@ mod tests {
                 assert!(cache_manifest.is_empty(), "legacy should deserialize empty");
             }
             other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_cache_reconcile() {
+        let msg = CoordMessage::CacheReconcile {
+            expected: vec!["aa".to_string(), "bb".to_string(), "cc".to_string()],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, _): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            CoordMessage::CacheReconcile { expected } => {
+                assert_eq!(expected.len(), 3);
+                assert_eq!(expected[0], "aa");
+                assert_eq!(expected[2], "cc");
+            }
+            other => panic!("expected CacheReconcile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_cache_ack() {
+        let msg = WorkerMessage::CacheAck {
+            kept: vec!["aa".to_string()],
+            evicted: vec!["bb".to_string(), "cc".to_string()],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, _): (WorkerMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            WorkerMessage::CacheAck { kept, evicted } => {
+                assert_eq!(kept, vec!["aa".to_string()]);
+                assert_eq!(evicted.len(), 2);
+            }
+            other => panic!("expected CacheAck, got {other:?}"),
         }
     }
 

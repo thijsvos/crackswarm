@@ -831,6 +831,39 @@ async fn connect_and_run(
                             info!(%hash, removed, "EvictFile applied");
                         }
                     }
+
+                    CoordMessage::CacheReconcile { expected } => {
+                        let expected_set: HashSet<String> = expected.into_iter().collect();
+                        let manifest = content_cache.manifest().await;
+                        let mut kept: Vec<String> = Vec::new();
+                        let mut evicted: Vec<String> = Vec::new();
+                        for entry in manifest {
+                            if expected_set.contains(&entry.sha256) {
+                                kept.push(entry.sha256);
+                            } else if running_chunks_using
+                                .get(&entry.sha256)
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                            {
+                                // In use right now — defer eviction. Treated
+                                // as kept for the Ack so the coord doesn't
+                                // think it disappeared.
+                                pending_evictions.insert(entry.sha256.clone());
+                                kept.push(entry.sha256);
+                            } else if content_cache.evict(&entry.sha256).await {
+                                evicted.push(entry.sha256);
+                            }
+                        }
+                        info!(
+                            kept = kept.len(),
+                            evicted_count = evicted.len(),
+                            expected = expected_set.len(),
+                            "cache reconciled"
+                        );
+                        let _ = outbound_tx
+                            .send(WorkerMessage::CacheAck { kept, evicted })
+                            .await;
+                    }
                 }
             }
         }
