@@ -178,6 +178,16 @@ pub enum WorkerMessage {
         kept: Vec<String>,
         evicted: Vec<String>,
     },
+    /// Worker couldn't fetch a file required by a chunk (insufficient
+    /// disk after LRU eviction, content cache budget exhausted, etc.).
+    /// Coord treats this like `ChunkFailed` but with a clearer reason —
+    /// the chunk gets reassigned, ideally to a worker with more cache
+    /// headroom.
+    PullFailed {
+        chunk_id: Uuid,
+        hash: String,
+        reason: String,
+    },
 }
 
 /// Compact digest of a single cached file, carried on every agent
@@ -548,6 +558,30 @@ mod tests {
                 assert!(cache_manifest.is_empty(), "legacy should deserialize empty");
             }
             other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_pull_failed() {
+        let chunk_id = Uuid::new_v4();
+        let msg = WorkerMessage::PullFailed {
+            chunk_id,
+            hash: "deadbeef".to_string(),
+            reason: "insufficient disk after LRU".to_string(),
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let (decoded, _): (WorkerMessage, usize) = decode_message(&encoded).unwrap().unwrap();
+        match decoded {
+            WorkerMessage::PullFailed {
+                chunk_id: cid,
+                hash,
+                reason,
+            } => {
+                assert_eq!(cid, chunk_id);
+                assert_eq!(hash, "deadbeef");
+                assert!(reason.contains("disk"));
+            }
+            other => panic!("expected PullFailed, got {other:?}"),
         }
     }
 

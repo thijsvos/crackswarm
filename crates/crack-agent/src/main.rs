@@ -188,6 +188,10 @@ async fn cmd_enroll(
         data_dir: data_dir.to_path_buf(),
         hashcat_path: hashcat_path.to_string(),
         headless: false,
+        cache_max_bytes: std::env::var("CRACK_AGENT_CACHE_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(80 * 1024 * 1024 * 1024),
     };
 
     // Create cache directory

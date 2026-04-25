@@ -276,6 +276,13 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
                 data_dir: agent_data_dir,
                 hashcat_path: hc_path,
                 headless: true,
+                // Built-in agent shares the coord's data dir; default
+                // 80 GiB cache budget is fine for most local setups
+                // (operator can set CRACK_AGENT_CACHE_MAX to override).
+                cache_max_bytes: std::env::var("CRACK_AGENT_CACHE_MAX")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(80 * 1024 * 1024 * 1024),
             };
 
             if let Err(e) = crack_agent::connection::run_connection(&run_config, None).await {
