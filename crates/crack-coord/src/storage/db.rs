@@ -1429,6 +1429,16 @@ pub async fn set_file_gc_state_deleted(pool: &SqlitePool, file_id: &str) -> Resu
 
 /// Toggle the `pinned` flag on a single file. Pinned files are skipped
 /// by the GC loop even when their refcount is zero.
+///
+/// On unpin, also re-evaluate GC eligibility. The release path
+/// (`maybe_mark_orphan_for_gc`) skips marking while a file is pinned,
+/// so a file whose refs dropped to zero while pinned never lands in
+/// the queue. Without the post-unpin re-check, `crackctl file unpin`
+/// is a silent no-op for reclaim — the file stays at
+/// `gc_state='active'` with refs=0 forever.
+/// `maybe_mark_orphan_for_gc` short-circuits if refs>0 OR pinned, so
+/// calling it unconditionally on every unpin is safe (only
+/// orphan-eligible files get queued).
 pub async fn set_file_pinned(pool: &SqlitePool, file_id: &str, pinned: bool) -> Result<bool> {
     let result = sqlx::query("UPDATE files SET pinned = ?1 WHERE id = ?2")
         .bind(if pinned { 1i64 } else { 0 })
@@ -1436,6 +1446,14 @@ pub async fn set_file_pinned(pool: &SqlitePool, file_id: &str, pinned: bool) -> 
         .execute(pool)
         .await
         .context("updating files.pinned")?;
+
+    if !pinned && result.rows_affected() > 0 {
+        if let Some(rec) = get_file_record(pool, file_id).await? {
+            if !rec.sha256.is_empty() {
+                maybe_mark_orphan_for_gc(pool, &rec.sha256).await?;
+            }
+        }
+    }
     Ok(result.rows_affected() > 0)
 }
 
@@ -2741,6 +2759,75 @@ mod tests {
 
         // Missing file id returns false.
         assert!(!set_file_pinned(&pool, "nonexistent", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unpin_orphan_requeues_for_gc() {
+        // Regression for issue #44: file pinned before its task completes
+        // never lands in gc_queue (release path's pin gate skips
+        // mark_for_gc). Unpinning afterwards must re-evaluate eligibility.
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-44a", "sha-44a").await;
+        set_file_pinned(&pool, "hash-44a", true).await.unwrap();
+
+        let task = make_task(&pool, "hash-44a").await;
+        update_task_status(&pool, task.id, TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        // Pre-unpin baseline: no refs, pinned, queue empty.
+        assert_eq!(count_refs_for_sha(&pool, "sha-44a").await.unwrap(), 0);
+        assert!(is_sha_pinned(&pool, "sha-44a").await.unwrap());
+        assert!(list_gc_queue(&pool).await.unwrap().is_empty());
+
+        // Unpin — must re-evaluate and queue the now-orphan file.
+        assert!(set_file_pinned(&pool, "hash-44a", false).await.unwrap());
+
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert_eq!(queue.len(), 1, "unpin must requeue an orphan file");
+        assert_eq!(queue[0].0, "sha-44a");
+    }
+
+    #[tokio::test]
+    async fn unpin_file_with_active_refs_does_not_queue() {
+        // The refcount gate must still win — unpinning a file that's
+        // actively in use by a running task must not queue it.
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-44b", "sha-44b").await;
+        set_file_pinned(&pool, "hash-44b", true).await.unwrap();
+        let _task = make_task(&pool, "hash-44b").await;
+
+        assert_eq!(count_refs_for_sha(&pool, "sha-44b").await.unwrap(), 1);
+        assert!(set_file_pinned(&pool, "hash-44b", false).await.unwrap());
+
+        assert!(
+            list_gc_queue(&pool).await.unwrap().is_empty(),
+            "file with live refs must not be queued for GC even after unpin"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpin_file_with_no_refs_and_no_prior_pin_still_queues() {
+        // Boundary: a file with no refs and no pin is genuinely orphan.
+        // Calling unpin on an already-unpinned file must still queue it
+        // (the operation is the right trigger to re-evaluate even when
+        // it's a no-op on the column).
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-44c", "sha-44c").await;
+
+        assert!(set_file_pinned(&pool, "hash-44c", false).await.unwrap());
+
+        let queue = list_gc_queue(&pool).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].0, "sha-44c");
+    }
+
+    #[tokio::test]
+    async fn unpin_nonexistent_file_is_safe_noop() {
+        // Missing file id must not panic, must not queue anything.
+        let pool = mem_pool().await;
+        assert!(!set_file_pinned(&pool, "no-such-id", false).await.unwrap());
+        assert!(list_gc_queue(&pool).await.unwrap().is_empty());
     }
 
     async fn seed_worker(pool: &SqlitePool, id: &str, name: &str) {
