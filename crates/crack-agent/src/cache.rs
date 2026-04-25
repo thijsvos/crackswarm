@@ -494,7 +494,7 @@ impl ContentCache {
                 });
             }
         }
-        out.sort_by(|a, b| a.last_used_at.cmp(&b.last_used_at));
+        out.sort_by_key(|c| c.last_used_at);
         out
     }
 
