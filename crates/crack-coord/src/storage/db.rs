@@ -587,14 +587,80 @@ pub async fn set_task_keyspace(
     Ok(())
 }
 
-pub async fn advance_task_cursor(pool: &SqlitePool, id: Uuid, new_skip: u64) -> Result<()> {
-    sqlx::query("UPDATE tasks SET next_skip = ?1 WHERE id = ?2")
-        .bind(new_skip as i64)
-        .bind(id.to_string())
-        .execute(pool)
+/// Outcome of a transactional dispatch attempt — see [`try_dispatch_new_chunk`].
+pub enum DispatchOutcome {
+    /// All four operations committed.
+    Dispatched,
+    /// Another caller advanced `tasks.next_skip` between the SELECT and the
+    /// conditional UPDATE; nothing was written. Retry by re-reading the
+    /// task and computing a fresh chunk.
+    CursorMoved,
+}
+
+/// Atomically advance a task's cursor, insert a new dispatched chunk, and
+/// flip the worker to `Working` — or do none of those.
+///
+/// The caller has already SELECTed the task (so it observed
+/// `expected_next_skip`) and computed `chunk` covering
+/// `[expected_next_skip, expected_next_skip + chunk.limit)`. This function
+/// runs the four steps inside one transaction with a *conditional* UPDATE
+/// keyed on `next_skip = ?expected_next_skip`. If another caller advanced
+/// the cursor in the meantime the UPDATE affects 0 rows, the transaction
+/// rolls back, and we return `CursorMoved` so the caller can retry.
+///
+/// Without this, two parallel `assign_next_chunk` calls could both observe
+/// the same cursor, dispatch overlapping `[skip, skip+limit)` ranges, and
+/// double-assign a stretch of keyspace.
+pub async fn try_dispatch_new_chunk(
+    pool: &SqlitePool,
+    task_id: Uuid,
+    expected_next_skip: u64,
+    chunk: &Chunk,
+    worker_id: &str,
+) -> Result<DispatchOutcome> {
+    let new_skip = expected_next_skip.saturating_add(chunk.limit);
+    let mut tx = pool.begin().await.context("begin dispatch tx")?;
+
+    let cursor_update = sqlx::query(
+        "UPDATE tasks SET next_skip = ?1 WHERE id = ?2 AND next_skip = ?3",
+    )
+    .bind(new_skip as i64)
+    .bind(task_id.to_string())
+    .bind(expected_next_skip as i64)
+    .execute(&mut *tx)
+    .await
+    .context("conditional cursor advance")?;
+
+    if cursor_update.rows_affected() == 0 {
+        // Lost the race; let the caller retry against the moved cursor.
+        return Ok(DispatchOutcome::CursorMoved);
+    }
+
+    let now = now_iso();
+    sqlx::query(
+        "INSERT INTO chunks (id, task_id, skip, \"limit\", status, assigned_worker, assigned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(chunk.id.to_string())
+    .bind(chunk.task_id.to_string())
+    .bind(chunk.skip as i64)
+    .bind(chunk.limit as i64)
+    .bind(chunk.status.to_string())
+    .bind(&chunk.assigned_worker)
+    .bind(chunk.assigned_at.map(|t| t.to_rfc3339()).or(Some(now)))
+    .execute(&mut *tx)
+    .await
+    .context("inserting dispatched chunk")?;
+
+    sqlx::query("UPDATE workers SET status = ?1 WHERE id = ?2")
+        .bind(WorkerStatus::Working.to_string())
+        .bind(worker_id)
+        .execute(&mut *tx)
         .await
-        .context("advancing task cursor")?;
-    Ok(())
+        .context("flipping worker to working")?;
+
+    tx.commit().await.context("commit dispatch tx")?;
+    Ok(DispatchOutcome::Dispatched)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3086,6 +3152,84 @@ mod tests {
             .unwrap()
             .expect("should have found match");
         assert_eq!(found.id, "older-id");
+    }
+
+    async fn make_dispatchable_task(pool: &SqlitePool, hash_file_id: &str, keyspace: u64) -> Task {
+        let task = make_task(pool, hash_file_id).await;
+        set_task_keyspace(pool, task.id, keyspace, 100).await.unwrap();
+        update_task_status(pool, task.id, TaskStatus::Running).await.unwrap();
+        get_task(pool, task.id).await.unwrap().unwrap()
+    }
+
+    fn sample_chunk(task_id: Uuid, skip: u64, limit: u64, worker_id: &str) -> Chunk {
+        Chunk {
+            id: Uuid::new_v4(),
+            task_id,
+            skip,
+            limit,
+            status: ChunkStatus::Dispatched,
+            assigned_worker: Some(worker_id.to_string()),
+            assigned_at: Some(Utc::now()),
+            completed_at: None,
+            progress: 0.0,
+            speed: 0,
+            cracked_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_dispatch_advances_cursor_inserts_chunk_and_flips_worker() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-disp-1", "sha-disp-1").await;
+        seed_worker(&pool, "w-1", "Worker One").await;
+        let task = make_dispatchable_task(&pool, "hash-disp-1", 1_000_000).await;
+        let chunk = sample_chunk(task.id, task.next_skip, 50_000, "w-1");
+
+        let outcome =
+            try_dispatch_new_chunk(&pool, task.id, task.next_skip, &chunk, "w-1").await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Dispatched));
+
+        // Cursor advanced by limit.
+        let task_after = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(task_after.next_skip, 50_000);
+
+        // Chunk inserted.
+        assert!(get_chunk(&pool, chunk.id).await.unwrap().is_some());
+
+        // Worker flipped to working.
+        let workers = get_workers_by_status(&pool, WorkerStatus::Working).await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w-1");
+    }
+
+    #[tokio::test]
+    async fn try_dispatch_returns_cursor_moved_when_expected_skip_stale() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "hash-disp-2", "sha-disp-2").await;
+        seed_worker(&pool, "w-2", "Worker Two").await;
+        let task = make_dispatchable_task(&pool, "hash-disp-2", 1_000_000).await;
+
+        // Simulate another dispatcher having moved the cursor first.
+        sqlx::query("UPDATE tasks SET next_skip = ?1 WHERE id = ?2")
+            .bind(123_i64)
+            .bind(task.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Our caller still thinks next_skip is 0; the conditional UPDATE
+        // must miss and the whole transaction must roll back.
+        let chunk = sample_chunk(task.id, 0, 50_000, "w-2");
+        let outcome = try_dispatch_new_chunk(&pool, task.id, 0, &chunk, "w-2")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::CursorMoved));
+
+        // No chunk row written.
+        assert!(get_chunk(&pool, chunk.id).await.unwrap().is_none());
+        // Worker not flipped.
+        let task_after = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(task_after.next_skip, 123, "cursor must remain at competing value");
     }
 
     #[tokio::test]

@@ -277,19 +277,16 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
 
     // Try to assign pending chunks to idle workers.
     //
-    // The dispatch is intentionally *sequential* even though this is a hot
-    // path: `assign_next_chunk` has a read-modify-write race on
-    // `tasks.next_skip` (read cursor → INSERT chunk → UPDATE cursor) that
-    // is masked by serial execution. Two concurrent calls would both
-    // observe the same cursor and dispatch overlapping chunks. Parallel
-    // fanout requires that race be closed first (wrap the steps in a
-    // single transaction with a conditional UPDATE), tracked by the
-    // 2026-04-25 audit roadmap as part of PR 4 (X6).
-    //
-    // What we *can* cheaply do here is acquire the connections-map read
-    // guard once instead of re-acquiring per worker, so a slow
-    // `worker_connections.write()` (new-worker registration) doesn't
-    // serialize behind 8 dispatches.
+    // `assign_next_chunk` is now transaction-safe — the read-modify-write
+    // on `tasks.next_skip` is wrapped in `try_dispatch_new_chunk` with an
+    // optimistic conditional UPDATE — so parallel fanout via
+    // `for_each_concurrent` is unblocked from a correctness standpoint.
+    // Keeping the loop sequential here for now because the bigger latency
+    // win sits in `build_assign_chunk_msg` and `send_attack_files_via_tx`
+    // (those still re-read the hash file every dispatch — see X4 / P3 in
+    // the audit roadmap). Acquire the connections-map read guard once
+    // instead of per-iteration so a slow `worker_connections.write()`
+    // (new-worker registration) doesn't serialize behind 8 dispatches.
     let idle_workers = crate::scheduler::assigner::find_idle_workers(state).await?;
     let conns = state.worker_connections.read().await;
     for worker_id in idle_workers {
