@@ -1,3 +1,16 @@
+//! Noise IK identity handling: keypair generation, on-disk storage, and
+//! handshake builders for the coord (responder) and agent (initiator).
+//!
+//! Trust model: the coord publishes its static public key out-of-band
+//! (encoded in `EnrollmentToken`). The agent must know that key to
+//! initiate IK; the coord recognizes the agent by the static public key
+//! it presents in the first handshake message and matches it against
+//! the `workers` table.
+//!
+//! On-disk layout under a data directory: `private.key` + `public.key`.
+//! Private key files are created with mode `0o600` on Unix; the `Drop`
+//! impl on `Keypair` zeroizes private-key memory.
+
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -11,12 +24,19 @@ use crate::error::{CrackError, Result};
 /// and the coordinator is authenticated by its known static key.
 pub static NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
-/// Parse the noise pattern string.
+/// Parse [`NOISE_PATTERN`] into a [`NoiseParams`].
+///
+/// # Panics
+/// Panics if [`NOISE_PATTERN`] is not a valid Noise descriptor — but the
+/// string is a compile-time constant, so this is a programmer error, not
+/// a runtime concern.
 pub fn noise_params() -> NoiseParams {
     NOISE_PATTERN.parse().expect("valid noise pattern")
 }
 
-/// A keypair for Noise protocol identity.
+/// A Curve25519 keypair backing one party's Noise IK identity. Holds
+/// raw key bytes; `Drop` zeroizes `private_key` to keep secret material
+/// out of freed allocations. `public_key` is safe to share/serialize.
 pub struct Keypair {
     pub private_key: Vec<u8>,
     pub public_key: Vec<u8>,
@@ -30,6 +50,10 @@ impl Drop for Keypair {
 
 impl Keypair {
     /// Generate a new Curve25519 keypair.
+    ///
+    /// # Errors
+    /// Returns `CrackError::Noise` if the underlying snow builder fails
+    /// to produce a keypair (e.g. the OS RNG is unavailable).
     pub fn generate() -> Result<Self> {
         let builder = snow::Builder::new(noise_params());
         let dh = builder.generate_keypair().map_err(CrackError::Noise)?;
@@ -44,7 +68,18 @@ impl Keypair {
         base64::engine::general_purpose::STANDARD.encode(&self.public_key)
     }
 
-    /// Save keypair to a directory (private.key + public.key files).
+    /// Persist this keypair under `dir` as `private.key` + `public.key`.
+    ///
+    /// On Unix, `private.key` is created with mode `0o600` atomically
+    /// (single `OpenOptions::open` call) so it is never world-readable
+    /// in between creation and a separate chmod. On non-Unix platforms
+    /// permissions follow the process umask — harden the parent
+    /// directory's ACLs if that matters in your deployment.
+    /// `public.key` is written without restricted permissions.
+    ///
+    /// # Errors
+    /// Any `std::io::Error` from `create_dir_all`, `OpenOptions::open`,
+    /// or `write` propagates unchanged.
     pub fn save_to_dir(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
 
@@ -76,7 +111,15 @@ impl Keypair {
         Ok(())
     }
 
-    /// Load keypair from a directory.
+    /// Load a keypair previously saved by `save_to_dir`. Reads
+    /// `dir/private.key` and `dir/public.key` and returns the
+    /// reconstructed `Keypair`. The private key is wiped on `Drop`.
+    ///
+    /// # Errors
+    /// - `CrackError::Config` when either key file is absent (suggests
+    ///   the user run `init` first).
+    /// - Any `std::io::Error` from `std::fs::read` if the files exist
+    ///   but can't be read.
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
         let priv_path = dir.join("private.key");
         let pub_path = dir.join("public.key");
@@ -99,6 +142,9 @@ impl Keypair {
 }
 
 /// Decode a base64-encoded public key.
+///
+/// # Errors
+/// Returns `CrackError::Base64` if `b64` is not valid base64.
 pub fn decode_public_key(b64: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -124,7 +170,16 @@ pub fn agent_data_dir() -> PathBuf {
         .join("crack-agent")
 }
 
-/// Save a remote public key (coordinator's key on agent, or authorized worker key on coordinator).
+/// Persist a peer's static public key under `dir/filename`.
+///
+/// Used by the coord to remember each authorized worker's key
+/// (`<workers_dir>/<worker_id>.pub`) and by the agent to remember the
+/// coord's key (`coordinator.pub`). Public keys carry no secret material
+/// so no special permissions are applied.
+///
+/// # Errors
+/// Any `std::io::Error` from `create_dir_all` or `write` propagates
+/// unchanged.
 pub fn save_remote_key(dir: &Path, filename: &str, key: &[u8]) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(filename);
@@ -132,7 +187,11 @@ pub fn save_remote_key(dir: &Path, filename: &str, key: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Load a remote public key.
+/// Load a remote public key previously stored under `dir/filename`.
+///
+/// # Errors
+/// - `CrackError::Config` if the file does not exist.
+/// - Any `std::io::Error` from `std::fs::read`.
 pub fn load_remote_key(dir: &Path, filename: &str) -> Result<Vec<u8>> {
     let path = dir.join(filename);
     if !path.exists() {
@@ -144,7 +203,14 @@ pub fn load_remote_key(dir: &Path, filename: &str) -> Result<Vec<u8>> {
     Ok(std::fs::read(&path)?)
 }
 
-/// Build a Noise responder (coordinator side) for IK handshake.
+/// Build a Noise IK responder (coordinator side) using `keypair` as the
+/// local static. The responder learns the initiator's static public key
+/// from the first handshake message — this is how the coord
+/// authenticates the worker.
+///
+/// # Errors
+/// Returns `CrackError::Noise` if snow rejects the supplied private key
+/// or fails to construct the responder state.
 pub fn build_responder(keypair: &Keypair) -> Result<snow::HandshakeState> {
     snow::Builder::new(noise_params())
         .local_private_key(&keypair.private_key)
@@ -153,8 +219,16 @@ pub fn build_responder(keypair: &Keypair) -> Result<snow::HandshakeState> {
         .map_err(CrackError::Noise)
 }
 
-/// Build a Noise initiator (worker side) for IK handshake.
-/// The worker must know the coordinator's static public key (IK pattern).
+/// Build a Noise IK initiator (worker side).
+///
+/// The worker must know `remote_static` (the coord's static public key,
+/// distributed via `EnrollmentToken`) before initiating — the IK pattern
+/// offers no in-band way to discover it. Mismatched keys cause the
+/// handshake to fail at `read_message` time.
+///
+/// # Errors
+/// Returns `CrackError::Noise` if snow rejects either key (wrong length
+/// or invalid encoding) or fails to construct the initiator state.
 pub fn build_initiator(keypair: &Keypair, remote_static: &[u8]) -> Result<snow::HandshakeState> {
     snow::Builder::new(noise_params())
         .local_private_key(&keypair.private_key)

@@ -161,6 +161,24 @@ impl ContentCache {
     ///
     /// Both cache hits and successful pulls touch the LRU ledger so the
     /// most-recently-used entries float to the top.
+    ///
+    /// Concurrent calls for the same `hash` serialize on a per-hash mutex —
+    /// the second caller waits and then sees the cached entry.
+    ///
+    /// # Errors
+    /// - `hash` shorter than 2 hex chars (used as the shard prefix).
+    /// - Failure creating the shard directory or writing the `.partial`
+    ///   file.
+    /// - The `outbound_tx` channel is closed before the pull completes.
+    /// - The coord answers with `FileError` (surfaced as
+    ///   `"coord refused file range: <reason>"`).
+    /// - The coord delivers a chunk at the wrong offset, or an empty
+    ///   non-EOF chunk.
+    /// - Total bytes received before EOF differ from the declared `size`.
+    /// - The sha256 of the assembled bytes doesn't match `hash`.
+    /// - The atomic rename `<hash>.partial` → `<hash>` fails.
+    ///
+    /// On any error the in-progress `.partial` is best-effort removed.
     pub async fn ensure(
         self: &Arc<Self>,
         hash: &str,
@@ -324,6 +342,11 @@ impl ContentCache {
     /// valid cached file. Entries the agent considers incomplete (missing,
     /// unreadable, zero-byte `.partial` leftovers) are skipped. Called on
     /// every heartbeat tick so the coord can reconcile its view.
+    ///
+    /// Note: `last_used_at` here is filesystem `mtime`, NOT the in-memory
+    /// LRU ledger consulted by `lru_candidates()`. mtime is "good enough"
+    /// for the coord's reconciliation pass; for in-process LRU ordering
+    /// prefer `lru_candidates()`.
     pub async fn manifest(&self) -> Vec<CacheManifestEntry> {
         let cas_root = self.root.join("cas");
         let mut out = Vec::new();

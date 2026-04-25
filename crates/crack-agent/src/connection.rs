@@ -1,3 +1,12 @@
+//! Agent main loop: TCP + Noise IK handshake, registration/enrollment,
+//! and the long-lived `select!` that multiplexes heartbeats, runner
+//! events, off-loop outbound messages, content-cache pulls, and
+//! incoming `CoordMessage`s.
+//!
+//! Everything stays on a single task because `snow::TransportState` is
+//! `!Send`. Off-loop work (cache pulls, hashcat subprocesses) hands
+//! results back via mpsc channels the main loop polls.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,10 +115,18 @@ fn emit(tx: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
 
 /// Main entry point: connect to the coordinator and run the message loop.
 ///
-/// On disconnect the function returns an `Err` so the caller can apply
-/// exponential backoff and reconnect.
+/// Loops forever, transparently reconnecting after disconnects with
+/// exponential backoff (capped at 60s) — the caller never sees a transient
+/// failure. Returns `Ok(())` only when the coordinator sends `Shutdown`,
+/// at which point the agent should exit cleanly.
 ///
 /// When `event_tx` is `Some`, agent TUI events are emitted for live display.
+///
+/// # Errors
+/// Returns `Err` only for unrecoverable startup errors (failed to load
+/// the agent keypair or coordinator public key from `data_dir`).
+/// Transient errors during the lifetime of the connection drive the
+/// internal reconnect loop instead.
 pub async fn run_connection(
     config: &RunConfig,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
