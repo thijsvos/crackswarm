@@ -6,16 +6,23 @@
 //! `db::update_campaign_status` call automatically maintains `file_refs`.
 //!
 //! This module runs the GC pass: drains `gc_queue`, deletes coord-side
-//! files whose ref count truly reached zero, removes the DB rows. The
-//! state machine (`active` → `marked` → `deleting` → removed) plus the
-//! queue row survive a coord restart, so an interrupted GC resumes on the
-//! next pass.
+//! files whose ref count truly reached zero, then tombstones the DB rows.
+//! The state machine (`active` → `marked` → `deleting` → `deleted`) plus
+//! the queue row survive a coord restart, so an interrupted GC resumes on
+//! the next pass. The terminal `deleted` state is a soft tombstone, not a
+//! row removal: the `tasks.hash_file_id NOT NULL REFERENCES files(id)` FK
+//! forbids a hard `DELETE` for any file ever consumed by a task.
+//! Tombstoned rows are invisible to dedup (`find_file_by_sha256` /
+//! `get_file_record` filter them out) but remain resolvable as FK targets
+//! for historical joins.
 //!
-//! Slice 7 is coord-side only. Agent-side cache eviction and
-//! reconciliation arrive in Slices 8 and 9. Until then, a file reclaimed
-//! here stays resident in any agent that already cached it — the on-disk
-//! staleness is bounded but non-zero, and fully resolved once those two
-//! slices ship.
+//! Together with Slice 8 (`EvictFile`, `dispatch_evict_for_sha`) and
+//! Slice 9 (`CacheReconcile`), the GC pass closes the loop end-to-end:
+//! reclaimed coord-side files are mirrored into agent caches via
+//! targeted-or-broadcast `EvictFile` and reconciled on every (re)connect.
+//! Agents defer eviction for any sha actively held by a running chunk —
+//! see `crack-agent::ContentCache::evict` and the `running_chunks_using`
+//! map in `crack-agent::connection`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

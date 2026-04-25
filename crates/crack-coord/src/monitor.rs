@@ -1,3 +1,16 @@
+//! Coordinator background monitor.
+//!
+//! One ticker (`HEARTBEAT_CHECK_INTERVAL`) drives four orthogonal passes
+//! in sequence: prepare pending tasks, check worker liveness, reassign
+//! abandoned chunks, and advance campaign phases. Each pass logs its
+//! errors but never propagates — the ticker keeps running so a transient
+//! DB hiccup can't take the loop down.
+//!
+//! Task preparation runs in spawned subtasks because hashcat `--keyspace`
+//! on a large wordlist can take minutes — blocking this loop would also
+//! stall heartbeat checks and the GC pass that shares the same cadence
+//! (see `lifecycle::run_gc_loop`).
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,9 +87,21 @@ async fn prepare_pending_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prepare a single task: validate hash file, count hashes, compute keyspace,
-/// transition to Running. Runs inside a spawned task so it doesn't block the
-/// monitor loop.
+/// Prepare a single task: validate the hash file, count hashes, compute
+/// the keyspace, then transition the task to `Running`. Runs inside a
+/// spawned task so it doesn't block the monitor loop.
+///
+/// Side-effects: on any of the validation failures (hash-file row
+/// missing, hash file unreadable, file empty, keyspace computation
+/// failing) the task is transitioned to `TaskStatus::Failed` and the
+/// function returns `Ok(())`. Callers must not treat success as
+/// "task is now Running" — re-read the task status if that matters.
+///
+/// # Errors
+/// Returns the underlying `db::*` error only when the failure-path
+/// status update *itself* fails (i.e. we couldn't even mark the task
+/// `Failed`). Validation failures are reported via the task status,
+/// not the return value.
 async fn prepare_one(state: &AppState, task: Task) -> anyhow::Result<()> {
     info!(task_id = %task.id, task_name = %task.name, "preparing pending task");
 

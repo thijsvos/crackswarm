@@ -1,3 +1,11 @@
+//! Wire protocol between coordinator and worker.
+//!
+//! All messages travel over a Noise IK channel as length-framed JSON:
+//! `[4 bytes BE length][serialized payload]`. [`CoordMessage`] originates
+//! at the coord; [`WorkerMessage`] at the worker. See [`encode_message`]
+//! / [`decode_message`] for the framing helpers and [`MAX_MESSAGE_SIZE`]
+//! for the per-frame ceiling.
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -7,9 +15,10 @@ use crate::models::DeviceInfo;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoordMessage {
-    Welcome {
-        worker_id: String,
-    },
+    /// First message the coord sends after a successful Noise handshake
+    /// and `WorkerMessage::Register`. Conveys the worker's authoritative
+    /// ID (the coord's view, used by the agent for log correlation).
+    Welcome { worker_id: String },
     /// Stream a file to the worker in chunks. The agent reconstructs
     /// the file from ordered chunks and caches it by file_id.
     TransferFileChunk {
@@ -34,26 +43,25 @@ pub enum CoordMessage {
     /// Sent in place of `FileRange` when the coord can't serve the request
     /// (file not found, read error, etc.). The worker aborts its pull and
     /// surfaces the reason.
-    FileError {
-        hash: String,
-        reason: String,
-    },
+    FileError { hash: String, reason: String },
     /// Instruct the worker to evict a file from its content-addressed cache.
     /// Issued by the coord's GC loop after a file's reference count drops
     /// to zero and pin state is clear. The worker defers eviction until no
     /// running chunk is using the file.
-    EvictFile {
-        hash: String,
-    },
+    EvictFile { hash: String },
     /// Sent once when a worker (re)connects: the authoritative list of
     /// sha256s the coord still has on its end. The agent compares against
     /// its own cache manifest and evicts anything not in `expected` —
     /// catches missed `EvictFile` messages from prior sessions and any
     /// drift accumulated while the agent was disconnected. Eviction
     /// defers as usual when a sha is in use by a running chunk.
-    CacheReconcile {
-        expected: Vec<String>,
-    },
+    CacheReconcile { expected: Vec<String> },
+    /// Dispatch a single chunk of work to the worker. The agent runs
+    /// hashcat against the supplied (eagerly inlined) hash file with the
+    /// attack-specific parameters in `attack`. `skip`/`limit` are passed
+    /// through to hashcat as restore points; `extra_args` is appended
+    /// verbatim. Only one chunk runs at a time per agent — additional
+    /// assignments queue locally.
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
@@ -66,12 +74,17 @@ pub enum CoordMessage {
         attack: AssignChunkAttack,
         extra_args: Vec<String>,
     },
-    AbortChunk {
-        chunk_id: Uuid,
-    },
-    RequestBenchmark {
-        hash_mode: u32,
-    },
+    /// Cancel a running or queued chunk. The agent kills the hashcat
+    /// process (if started) or removes the assignment from its pending
+    /// queue. Idempotent: a duplicate or stale `chunk_id` is a no-op.
+    AbortChunk { chunk_id: Uuid },
+    /// Ask the worker to run `hashcat --benchmark -m <hash_mode>` and
+    /// reply with `WorkerMessage::BenchmarkResult`. The coord uses the
+    /// result to size future chunks (target ~10 minutes per chunk).
+    RequestBenchmark { hash_mode: u32 },
+    /// Tell the worker to terminate. The agent kills any running hashcat
+    /// processes, sends `WorkerMessage::Leaving`, and exits cleanly
+    /// without triggering the reconnect/backoff loop.
     Shutdown,
 }
 
@@ -79,6 +92,9 @@ pub enum CoordMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum AssignChunkAttack {
+    /// Mask attack (hashcat `-a 3`). `mask` uses hashcat's mask language
+    /// (e.g. `?l?l?d?d`); `custom_charsets` populates `?1`..`?4` in mask
+    /// position order.
     BruteForce {
         mask: String,
         custom_charsets: Option<Vec<String>>,
@@ -107,16 +123,24 @@ pub enum AssignChunkAttack {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
+    /// First message the worker sends after the Noise handshake completes
+    /// (or after `Enroll` on a new worker). Carries the agent-chosen
+    /// friendly name plus capability info (hashcat version, OS, devices)
+    /// used by the coord for chunk dispatch decisions. The coord replies
+    /// with `CoordMessage::Welcome`.
     Register {
         worker_name: String,
         hashcat_version: String,
         os: String,
         devices: Vec<DeviceInfo>,
     },
-    Enroll {
-        nonce: String,
-        worker_name: String,
-    },
+    /// One-shot enrollment proof sent in place of `Register` on a brand-
+    /// new worker's first connection. `nonce` matches a value from a
+    /// coord-issued enrollment token (single-use, time-limited);
+    /// `worker_name` must match the token. The coord authorizes the
+    /// worker's static public key on success, after which subsequent
+    /// connections use `Register`.
+    Enroll { nonce: String, worker_name: String },
     /// Periodic heartbeat. Carries a compact digest of the worker's
     /// content-addressed cache so the coord can maintain an authoritative
     /// view of what each worker has on disk — used for targeted
@@ -129,36 +153,59 @@ pub enum WorkerMessage {
         #[serde(default)]
         cache_manifest: Vec<CacheManifestEntry>,
     },
-    ChunkStarted {
-        chunk_id: Uuid,
-    },
+    /// Acknowledgment that the worker has spawned hashcat for `chunk_id`.
+    /// The coord transitions the chunk from `dispatched` to `running`.
+    ChunkStarted { chunk_id: Uuid },
+    /// Periodic progress update emitted while hashcat is running.
+    /// `progress_pct` is the floating-point completion percentage
+    /// (0–100), `speed` is the current hash rate in H/s, and
+    /// `estimated_remaining_secs` is hashcat's ETA when it can compute one.
     ChunkProgress {
         chunk_id: Uuid,
         progress_pct: f64,
         speed: u64,
         estimated_remaining_secs: Option<u64>,
     },
+    /// One cracked hash result. Sent eagerly as hashcat discovers each
+    /// plaintext, not batched at chunk completion — operators see results
+    /// in real time. The coord persists the pair and counts toward
+    /// `tasks.cracked_count`.
     HashCracked {
         chunk_id: Uuid,
         task_id: Uuid,
         hash: String,
         plaintext: String,
     },
+    /// Hashcat exited normally for `chunk_id`. `exit_code` mirrors
+    /// hashcat's status (0 = exhausted, 1 = cracked, etc.).
+    /// `total_cracked` is informational — the coord trusts the stream of
+    /// `HashCracked` messages.
     ChunkCompleted {
         chunk_id: Uuid,
         exit_code: i32,
         total_cracked: u32,
     },
+    /// Hashcat could not be started, was killed, or exited with an
+    /// unrecognized error. `exit_code` is `None` when the failure
+    /// happened before the process produced one (e.g. spawn error). The
+    /// coord requeues the chunk for reassignment.
     ChunkFailed {
         chunk_id: Uuid,
         error: String,
         exit_code: Option<i32>,
     },
-    BenchmarkResult {
-        hash_mode: u32,
-        speed: u64,
-    },
+    /// Reply to `CoordMessage::RequestBenchmark`. `speed` is the
+    /// aggregate hash rate in H/s across all of the worker's devices for
+    /// `hash_mode`. Persisted in `worker_benchmarks` and used to size
+    /// future chunks.
+    BenchmarkResult { hash_mode: u32, speed: u64 },
+    /// Worker is winding down: it will not accept new chunks but is still
+    /// finishing in-flight work. Coord stops dispatch and waits for
+    /// `Leaving`.
     Draining,
+    /// Worker is about to disconnect cleanly. Sent in response to
+    /// `CoordMessage::Shutdown` or before voluntary exit. Coord marks the
+    /// worker disconnected without raising a timeout alarm.
     Leaving,
     /// Ask the coord to send a byte range of a file identified by content
     /// hash (sha256 hex). The coord responds with one or more
@@ -205,11 +252,19 @@ pub struct CacheManifestEntry {
     pub last_used_at: String,
 }
 
-/// Length-prefixed framing for Noise transport messages.
-/// Wire format: [4 bytes big-endian length][encrypted payload]
+/// Hard ceiling on a single decoded message body. Decoder rejects any
+/// length-prefix exceeding this — protects against memory exhaustion from
+/// a malformed or hostile frame. 16 MiB matches the largest
+/// `TransferFileChunk` envelope the protocol can carry.
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
-/// Encode a message to bytes for transmission.
+/// Serialize `msg` as JSON and prepend the 4-byte big-endian length
+/// header used by the wire protocol. Output goes straight onto the
+/// (eventually Noise-encrypted) wire.
+///
+/// # Errors
+/// Returns any `serde_json` serialization failure encountered while
+/// rendering `msg` to JSON.
 pub fn encode_message<T: Serialize>(msg: &T) -> crate::error::Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)?;
     let len = (json.len() as u32).to_be_bytes();
@@ -219,8 +274,18 @@ pub fn encode_message<T: Serialize>(msg: &T) -> crate::error::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read a length-prefixed message from a stream of bytes.
-/// Returns the deserialized message and the number of bytes consumed.
+/// Decode one length-prefixed message from the front of `buf`.
+///
+/// Returns:
+/// - `Ok(Some((msg, n)))` — successfully deserialized; `n` is the number
+///   of bytes consumed (4-byte header + payload). Caller advances past.
+/// - `Ok(None)` — `buf` doesn't yet hold a complete frame (header
+///   truncated or payload incomplete). Caller refills and retries.
+///
+/// # Errors
+/// - `CrackError::Protocol` if the framed length exceeds
+///   `MAX_MESSAGE_SIZE`.
+/// - `CrackError::Json` if the payload bytes do not deserialize into `T`.
 pub fn decode_message<T: for<'de> Deserialize<'de>>(
     buf: &[u8],
 ) -> crate::error::Result<Option<(T, usize)>> {

@@ -1,9 +1,24 @@
+//! Shared data model: tasks, chunks, workers, campaigns, and the REST
+//! request/response shapes wrapping them.
+//!
+//! Every type here is `Serialize + Deserialize` and crosses two
+//! boundaries: the SQLite tables behind `crack-coord::storage::db` and
+//! the public REST API. Field names are wire-format contracts —
+//! renaming is a breaking change for both the agent build and any
+//! external API consumer.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ── Task ──
 
+/// A cracking task: a single attack configuration applied to a single
+/// hash file. Has a lifecycle (`TaskStatus`) driven by the coord's
+/// monitor loop; `next_skip` tracks the cursor used to allocate the next
+/// chunk. `total_keyspace` is filled in during preparation by
+/// `hashcat --keyspace`. A task may belong to a `Campaign` (multi-phase
+/// orchestration) or stand alone (`campaign_id == None`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
@@ -24,14 +39,21 @@ pub struct Task {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// Lifecycle states of a [`Task`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    /// Created, awaiting preparation (hash count + keyspace).
     Pending,
+    /// Prepared, no chunk has been dispatched yet.
     Ready,
+    /// At least one chunk has been dispatched or is in flight.
     Running,
+    /// Keyspace fully exhausted (or all hashes cracked).
     Completed,
+    /// Prep failed or all chunks failed.
     Failed,
+    /// Manually stopped via the API.
     Cancelled,
 }
 
@@ -65,6 +87,10 @@ impl std::str::FromStr for TaskStatus {
 
 // ── Attack Config ──
 
+/// Attack mode for a [`Task`]. Maps onto hashcat attack modes 3 (mask),
+/// 0 (dictionary), and 0 + `-r` (dictionary with rules). The chunker
+/// uses this both to compute keyspace and to assemble the per-chunk
+/// `AssignChunkAttack` sent to the worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttackConfig {
@@ -83,6 +109,11 @@ pub enum AttackConfig {
 
 // ── Chunk ──
 
+/// A unit of work assigned to a single worker. `skip`/`limit` are
+/// hashcat restore points carved out of the parent task's keyspace;
+/// `assigned_worker` is `None` until dispatch. `progress` is a 0–100
+/// percentage updated from `WorkerMessage::ChunkProgress`. `speed` is
+/// the most recent observed hash rate (H/s).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
     pub id: Uuid,
@@ -98,15 +129,24 @@ pub struct Chunk {
     pub cracked_count: u32,
 }
 
+/// Lifecycle of a [`Chunk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChunkStatus {
+    /// Carved out but not yet dispatched.
     Pending,
+    /// Assignment was sent; no `ChunkStarted` ack received yet.
     Dispatched,
+    /// Worker has spawned hashcat for this chunk.
     Running,
+    /// Hashcat exited with results found.
     Completed,
+    /// Hashcat exited without finding any hashes (keyspace consumed).
     Exhausted,
+    /// Hashcat failed (spawn error, killed, or unrecognized exit).
     Failed,
+    /// Worker stopped sending heartbeats with the chunk in flight; the
+    /// chunk is re-cut and re-dispatched.
     Abandoned,
 }
 
@@ -142,6 +182,11 @@ impl std::str::FromStr for ChunkStatus {
 
 // ── Worker ──
 
+/// A registered cracking node. `id` is the coord's stable identifier
+/// (derived from the worker's static public key); `public_key` is the
+/// authorized Noise static key (base64) used to authenticate every
+/// reconnect. `last_seen_at` is updated on every heartbeat and drives
+/// the disconnect-on-timeout logic in the monitor loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worker {
     pub id: String,
@@ -155,6 +200,8 @@ pub struct Worker {
     pub last_seen_at: DateTime<Utc>,
 }
 
+/// One compute device attached to a worker (CPU/GPU). `speed` is `None`
+/// until a benchmark has run for the device's preferred hash mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub id: u32,
@@ -163,13 +210,19 @@ pub struct DeviceInfo {
     pub speed: Option<u64>,
 }
 
+/// Liveness state for a [`Worker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
+    /// Connected, no chunk in flight.
     Idle,
+    /// At least one chunk is being processed.
     Working,
+    /// Currently running `hashcat --benchmark`.
     Benchmarking,
+    /// Heartbeat timeout exceeded; chunks are reassigned.
     Disconnected,
+    /// Will not accept new chunks but is finishing in-flight work.
     Draining,
 }
 
@@ -201,6 +254,9 @@ impl std::str::FromStr for WorkerStatus {
 
 // ── Cracked Hash ──
 
+/// One discovered (hash, plaintext) pair. Inserted as soon as the
+/// worker emits `WorkerMessage::HashCracked` so operators see results
+/// in real time rather than at chunk completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrackedHash {
     pub id: Option<i64>,
@@ -213,6 +269,11 @@ pub struct CrackedHash {
 
 // ── File Record ──
 
+/// A file stored under the coord's content-addressed cache. `id` is a
+/// per-row UUID; `sha256` is the content hash used for dedup and for
+/// agent-side cache addressing. Soft-deleted rows (`gc_state =
+/// 'deleted'`) are filtered out by the lookup helpers in
+/// `storage::db` but remain as FK targets for historical joins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
     pub id: String,
@@ -226,6 +287,9 @@ pub struct FileRecord {
 
 // ── Worker Benchmark ──
 
+/// Most recent measured hash rate for a `(worker, hash_mode)` pair.
+/// Used by `chunker::calculate_chunk_size` to target ~10 minutes of
+/// work per chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerBenchmark {
     pub worker_id: String,
@@ -236,6 +300,9 @@ pub struct WorkerBenchmark {
 
 // ── Audit Log ──
 
+/// One row of the security/operations audit log. Recorded for any state
+/// transition that crosses a trust boundary (worker enrollment,
+/// authorization, task creation, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: Option<i64>,
@@ -248,6 +315,8 @@ pub struct AuditEntry {
 
 // ── System Status ──
 
+/// Coord-wide counters returned by `GET /api/v1/status` for the TUI and
+/// `crackctl status`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStatus {
     pub total_tasks: u32,
@@ -260,14 +329,29 @@ pub struct SystemStatus {
 
 // ── Enrollment Token ──
 
+/// One-shot bootstrap credential the operator hands to a new worker.
+///
+/// Bundles everything an unenrolled agent needs for first contact: the
+/// coord's static public key (so the IK handshake authenticates the
+/// responder), the single-use `nonce` the coord expects in the
+/// worker's `Enroll` message, the assigned `worker_name`, an expiry,
+/// and the coord's transport address.
+///
+/// `server_addr` is `#[serde(default)]` for backwards compatibility
+/// with tokens issued before the field was added.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentToken {
-    pub coord_pubkey: String, // base64
-    pub nonce: String,        // hex 16 bytes
+    /// Coordinator's static public key, base64-encoded.
+    pub coord_pubkey: String,
+    /// Single-use, 16-byte hex nonce.
+    pub nonce: String,
+    /// Friendly name assigned to this worker on enrollment.
     pub worker_name: String,
-    pub expires_at: String, // ISO 8601
+    /// ISO 8601 expiry timestamp (rejected after this).
+    pub expires_at: String,
+    /// Coordinator transport address as `host:port`.
     #[serde(default)]
-    pub server_addr: String, // coordinator transport address (host:port)
+    pub server_addr: String,
 }
 
 // ── API request/response types ──
@@ -295,6 +379,9 @@ pub struct UpdateTaskRequest {
 
 // ── Campaign ──
 
+/// Multi-phase orchestration over a single hash file. Each phase
+/// produces a downstream `Task`; remaining-hashes are passed forward so
+/// later phases only attack what earlier phases didn't crack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Campaign {
     pub id: Uuid,
@@ -313,13 +400,19 @@ pub struct Campaign {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// Lifecycle states of a [`Campaign`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CampaignStatus {
+    /// Created but not yet started.
     Draft,
+    /// At least one phase has been launched.
     Running,
+    /// All phases completed (or all hashes cracked).
     Completed,
+    /// A phase failed terminally and the campaign aborted.
     Failed,
+    /// Manually stopped via the API.
     Cancelled,
 }
 
@@ -351,6 +444,9 @@ impl std::str::FromStr for CampaignStatus {
 
 // ── Campaign Phase ──
 
+/// One attack phase within a [`Campaign`]. Spawns a `Task` when
+/// activated; `hash_file_id` is the (possibly remaining-only) input
+/// for this phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignPhase {
     pub id: Uuid,
@@ -367,14 +463,21 @@ pub struct CampaignPhase {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// Lifecycle states of a [`CampaignPhase`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseStatus {
+    /// Not yet activated.
     Pending,
+    /// Phase task is in flight.
     Running,
+    /// Phase task completed with results found.
     Completed,
+    /// Phase task ran but found nothing.
     Exhausted,
+    /// Phase task failed; campaign aborted.
     Failed,
+    /// Auto-skipped (e.g. all hashes already cracked by a prior phase).
     Skipped,
 }
 
@@ -439,6 +542,8 @@ pub enum PhaseConfig {
     },
 }
 
+/// One mask in a `MultiMask` phase. `increment` toggles hashcat's
+/// `--increment` flag for variable-length attacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaskEntry {
     pub mask: String,
@@ -449,6 +554,9 @@ pub struct MaskEntry {
 
 // ── Campaign Template ──
 
+/// A reusable named recipe for a campaign — produces a series of
+/// [`TemplatePhase`]s when instantiated. Loaded from
+/// `<data_dir>/templates/`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignTemplate {
     pub name: String,
@@ -457,6 +565,8 @@ pub struct CampaignTemplate {
     pub phases: Vec<TemplatePhase>,
 }
 
+/// One phase entry inside a [`CampaignTemplate`]. Materializes into a
+/// [`CampaignPhase`] at instantiation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplatePhase {
     pub name: String,

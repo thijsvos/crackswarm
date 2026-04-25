@@ -1,3 +1,11 @@
+//! Keyspace and chunk-sizing math.
+//!
+//! Bridges hashcat's `--keyspace` output with the coord's `skip`/`limit`
+//! accounting and owns the heuristic that decides how big each per-worker
+//! chunk should be. Dictionary keyspaces are cached by
+//! `(wordlist_sha, rules_sha, hash_mode)` so the slow scan over a large
+//! wordlist runs at most once per (effective-input, mode) tuple.
+
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -104,7 +112,14 @@ async fn sha256_for_file(pool: &SqlitePool, file_id: &str) -> anyhow::Result<Opt
     Ok(record.map(|r| r.sha256).filter(|s| !s.is_empty()))
 }
 
-/// Run `hashcat --keyspace` for a dictionary attack (mode 0).
+/// Run `hashcat --keyspace` for a dictionary attack (`-a 0`) against
+/// `hash_mode`, optionally applying a rules file. Returns the parsed
+/// keyspace integer.
+///
+/// # Errors
+/// - Process spawn failure (with hashcat path context).
+/// - Non-zero hashcat exit (carries captured stderr).
+/// - Stdout that doesn't parse as `u64`.
 async fn compute_dictionary_keyspace(
     hashcat_path: &str,
     hash_mode: u32,
@@ -146,7 +161,14 @@ async fn compute_dictionary_keyspace(
     Ok(keyspace)
 }
 
-/// Run `hashcat --keyspace` to get the exact restore-point count.
+/// Run `hashcat --keyspace -a 3 -m <hash_mode> <mask>` and return the
+/// exact restore-point count hashcat will use for `--skip`/`--limit`.
+/// Custom charsets `?1..?N` are passed via `-1`/`-2`/... in order.
+///
+/// # Errors
+/// - Process spawn failure (with hashcat path context).
+/// - Non-zero hashcat exit (carries captured stderr).
+/// - Stdout that doesn't parse as `u64`.
 async fn compute_keyspace_via_hashcat(
     hashcat_path: &str,
     hash_mode: u32,
@@ -305,13 +327,19 @@ fn custom_charset_size(idx: usize, custom_charsets: Option<&[String]>) -> anyhow
 /// Calculate how large each chunk should be for a given worker.
 ///
 /// Strategy:
-/// - If the worker has a known benchmark speed, target 10 minutes of work per chunk:
-///   `worker_speed * 600`.
-/// - Otherwise, divide the keyspace evenly across workers with a 4x multiplier for
-///   granularity: `total_keyspace / (num_workers * 4)`.
-/// - The result is clamped to `[10_000, total_keyspace]`.
-/// - Additionally, when the speed-based chunk exceeds the remaining keyspace divided
-///   by the number of workers, we cap it to ensure all workers get a share.
+/// - If the worker has a known benchmark speed, target 10 minutes of work
+///   per chunk: `worker_speed * 600` (saturating).
+/// - Otherwise, divide the keyspace evenly across workers with a 4x
+///   multiplier for granularity: `total_keyspace / (num_workers * 4)`.
+/// - When more than one worker is available and the speed-based chunk
+///   would exceed `total_keyspace / num_workers`, the chunk is capped to
+///   `fair_share` so every worker gets a slice (only applied when
+///   `fair_share >= MIN_CHUNK`).
+/// - The result is clamped to
+///   `[min(MIN_CHUNK, total_keyspace), total_keyspace]`. When
+///   `total_keyspace < MIN_CHUNK = 10_000` the lower bound collapses to
+///   `total_keyspace` so the chunk is exactly the keyspace.
+/// - `num_workers == 0` is treated as `1` via `.max(1)`.
 pub fn calculate_chunk_size(
     worker_speed: Option<u64>,
     total_keyspace: u64,
