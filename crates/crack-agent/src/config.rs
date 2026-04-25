@@ -65,6 +65,17 @@ pub struct RunConfig {
     /// Run without TUI (log output only)
     #[arg(long)]
     pub headless: bool,
+
+    /// Maximum bytes the content-addressed cache may consume on disk.
+    /// When a new pull would push past this ceiling, the cache evicts
+    /// least-recently-used entries (skipping any that are currently in
+    /// use by a running chunk) to make room. If still insufficient, the
+    /// chunk is reported as `PullFailed` and the coord reassigns it.
+    ///
+    /// Default: 80 GiB. Override with `--cache-max-bytes` or
+    /// `CRACK_AGENT_CACHE_MAX` (raw bytes).
+    #[arg(long, env = "CRACK_AGENT_CACHE_MAX", default_value_t = 80 * 1024 * 1024 * 1024)]
+    pub cache_max_bytes: u64,
 }
 
 impl RunConfig {

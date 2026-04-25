@@ -553,6 +553,41 @@ async fn handle_worker_message(
             Ok(())
         }
 
+        WorkerMessage::PullFailed {
+            chunk_id,
+            hash,
+            reason,
+        } => {
+            // The agent couldn't fetch a file required by this chunk
+            // (cache budget, disk full, etc.). Treat it like a chunk
+            // failure so the abandoned-chunk reassigner picks it up
+            // for a different worker.
+            db::update_chunk_status(&state.db, *chunk_id, ChunkStatus::Failed).await?;
+
+            let wid = worker_id.as_deref().unwrap_or("unknown");
+            warn!(
+                %chunk_id,
+                worker_id = %wid,
+                %hash,
+                %reason,
+                "pull failed: chunk will be reassigned"
+            );
+
+            db::insert_audit(
+                &state.db,
+                "pull_failed",
+                &format!("Worker {wid} couldn't fetch {hash} for chunk {chunk_id}: {reason}"),
+                None,
+                Some(wid),
+            )
+            .await?;
+
+            if let Some(wid) = worker_id.as_deref() {
+                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
+            }
+            Ok(())
+        }
+
         WorkerMessage::CacheAck { kept, evicted } => {
             // The agent has already evicted what we asked. Drop the
             // evicted shas from our coord-side view immediately so the

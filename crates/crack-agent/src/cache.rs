@@ -23,6 +23,7 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crack_common::protocol::{CacheManifestEntry, WorkerMessage};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
@@ -32,9 +33,33 @@ use tokio::sync::{mpsc, Mutex};
 /// keeping them aligned avoids protocol-level surprises.
 const CHUNK_SIZE: u32 = 2 * 1024 * 1024;
 
+/// On-disk record of when each cached entry was last used. Persisted to
+/// `<root>/cas-ledger.json` after every update so the LRU order survives
+/// agent restarts. mtime would be a free fallback but isn't reliably
+/// updated by every filesystem on read.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Ledger {
+    /// Map sha256 → RFC3339 timestamp of last use.
+    entries: HashMap<String, String>,
+}
+
+/// One LRU candidate returned to the agent main loop for eviction
+/// decisions: which sha to drop, how big it is, and when it was last
+/// used.
+#[derive(Debug, Clone)]
+pub struct LruCandidate {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub last_used_at: DateTime<Utc>,
+}
+
 /// Content-addressed file cache. Cheap to clone via `Arc`.
 pub struct ContentCache {
     root: PathBuf,
+    /// Hard ceiling on bytes stored under `<root>/cas/`. The main loop
+    /// uses `lru_candidates()` to make room before issuing a pull;
+    /// `cache_max_bytes` is the budget that decision is measured against.
+    cache_max_bytes: u64,
     /// Per-hash serialization — prevents two concurrent `ensure()` calls
     /// for the same hash from racing on the same `.partial` file.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -42,6 +67,9 @@ pub struct ContentCache {
     /// `on_file_error` hooks forward incoming messages through here so the
     /// `ensure()` loop can consume them.
     pending: Mutex<HashMap<String, mpsc::UnboundedSender<ChunkResult>>>,
+    /// In-memory mirror of the on-disk LRU ledger. Touched on every
+    /// `ensure()` (hit or miss) and persisted after each update.
+    ledger: Mutex<Ledger>,
 }
 
 /// Internal message the dispatcher uses to feed `ensure()`.
@@ -55,12 +83,57 @@ enum ChunkResult {
 }
 
 impl ContentCache {
-    pub fn new(root: PathBuf) -> Arc<Self> {
+    pub fn new(root: PathBuf, cache_max_bytes: u64) -> Arc<Self> {
+        let ledger_path = root.join("cas-ledger.json");
+        let ledger = std::fs::read(&ledger_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Ledger>(&bytes).ok())
+            .unwrap_or_default();
         Arc::new(Self {
             root,
+            cache_max_bytes,
             locks: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            ledger: Mutex::new(ledger),
         })
+    }
+
+    pub fn cache_max_bytes(&self) -> u64 {
+        self.cache_max_bytes
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.root.join("cas-ledger.json")
+    }
+
+    /// Mark `hash` as used now. Persists the ledger to disk best-effort.
+    pub async fn touch(&self, hash: &str) {
+        let mut ledger = self.ledger.lock().await;
+        ledger
+            .entries
+            .insert(hash.to_string(), Utc::now().to_rfc3339());
+        let snapshot = match serde_json::to_vec(&*ledger) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        drop(ledger);
+        if let Some(parent) = self.ledger_path().parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(self.ledger_path(), snapshot).await;
+    }
+
+    async fn ledger_remove(&self, hash: &str) {
+        let mut ledger = self.ledger.lock().await;
+        if ledger.entries.remove(hash).is_none() {
+            return;
+        }
+        let snapshot = match serde_json::to_vec(&*ledger) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        drop(ledger);
+        let _ = tokio::fs::write(self.ledger_path(), snapshot).await;
     }
 
     /// `<root>/cas/<first-two-chars>/<hash>`.
@@ -85,6 +158,9 @@ impl ContentCache {
     /// dispatcher must forward any `FileRange` / `FileError` messages for
     /// this hash to `on_file_range` / `on_file_error` while the pull is in
     /// flight.
+    ///
+    /// Both cache hits and successful pulls touch the LRU ledger so the
+    /// most-recently-used entries float to the top.
     pub async fn ensure(
         self: &Arc<Self>,
         hash: &str,
@@ -99,10 +175,15 @@ impl ContentCache {
         let _guard = hash_lock.lock().await;
 
         if self.has(hash, size).await {
+            self.touch(hash).await;
             return Ok(self.path_for(hash));
         }
 
-        self.pull_to_disk(hash, size, outbound_tx).await
+        let result = self.pull_to_disk(hash, size, outbound_tx).await;
+        if result.is_ok() {
+            self.touch(hash).await;
+        }
+        result
     }
 
     async fn per_hash_lock(&self, hash: &str) -> Arc<Mutex<()>> {
@@ -297,14 +378,124 @@ impl ContentCache {
     }
 
     /// Best-effort removal of a cached file. Returns true if the canonical
-    /// entry was deleted (we also sweep any stale `.partial`). A missing
-    /// file is not an error — it means the cache was already clean.
+    /// entry was deleted (we also sweep any stale `.partial` and the
+    /// matching ledger entry). A missing file is not an error — it means
+    /// the cache was already clean.
     pub async fn evict(&self, hash: &str) -> bool {
         let final_path = self.path_for(hash);
         let partial = final_path.with_extension("partial");
         let removed_final = tokio::fs::remove_file(&final_path).await.is_ok();
         let _ = tokio::fs::remove_file(&partial).await;
+        if removed_final {
+            self.ledger_remove(hash).await;
+        }
         removed_final
+    }
+
+    /// Total bytes currently consumed by canonical cache entries (skips
+    /// `.partial` companions). Walks the cas/ tree once per call — fine
+    /// for budget checks on the assignment path; not a hot loop.
+    pub async fn total_size(&self) -> u64 {
+        let cas_root = self.root.join("cas");
+        let mut total: u64 = 0;
+        let mut shards = match tokio::fs::read_dir(&cas_root).await {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        while let Ok(Some(shard)) = shards.next_entry().await {
+            let p = shard.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let mut files = match tokio::fs::read_dir(&p).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = files.next_entry().await {
+                let name = entry.file_name();
+                let name_str = match name.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if name_str.ends_with(".partial") {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata().await {
+                    if meta.is_file() {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// LRU-sorted snapshot of every canonical cache entry, oldest-used
+    /// first. Entries without a ledger record fall back to file mtime.
+    /// Returned `last_used_at` is what the caller should compare against
+    /// "is older than" — the agent's main loop walks this list, skipping
+    /// any sha currently in use, evicting until enough room is free.
+    pub async fn lru_candidates(&self) -> Vec<LruCandidate> {
+        let ledger = self.ledger.lock().await;
+        let ledger_snapshot: HashMap<String, String> = ledger.entries.clone();
+        drop(ledger);
+
+        let cas_root = self.root.join("cas");
+        let mut out = Vec::new();
+        let mut shards = match tokio::fs::read_dir(&cas_root).await {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+        while let Ok(Some(shard)) = shards.next_entry().await {
+            let p = shard.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let mut files = match tokio::fs::read_dir(&p).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = files.next_entry().await {
+                let name = entry.file_name();
+                let name_str = match name.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if name_str.ends_with(".partial") {
+                    continue;
+                }
+                let meta = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let last_used_at = ledger_snapshot
+                    .get(name_str)
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&Utc))
+                    .or_else(|| {
+                        meta.modified()
+                            .ok()
+                            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                            .and_then(|d| {
+                                DateTime::<Utc>::from_timestamp(
+                                    d.as_secs() as i64,
+                                    d.subsec_nanos(),
+                                )
+                            })
+                    })
+                    .unwrap_or_else(Utc::now);
+                out.push(LruCandidate {
+                    sha256: name_str.to_string(),
+                    size_bytes: meta.len(),
+                    last_used_at,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.last_used_at);
+        out
     }
 
     /// Hook for the agent's message dispatcher: forward an incoming
@@ -361,7 +552,7 @@ mod tests {
     #[test]
     fn path_for_shards_by_prefix() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let p = cache.path_for("abcdef0123456789");
         assert_eq!(p, dir.path.join("cas").join("ab").join("abcdef0123456789"));
     }
@@ -369,14 +560,14 @@ mod tests {
     #[tokio::test]
     async fn has_returns_false_when_missing() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         assert!(!cache.has("deadbeef00000000", 100).await);
     }
 
     #[tokio::test]
     async fn has_returns_false_on_size_mismatch() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let hash = sha256_hex(b"hello");
         let p = cache.path_for(&hash);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -419,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_pulls_and_caches_on_miss() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let (tx, rx) = mpsc::channel(16);
 
         let data = b"hello world".to_vec();
@@ -434,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_hit_skips_network_roundtrip() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
 
         // Pre-seed the cache.
         let data = b"already cached".to_vec();
@@ -453,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_large_file_pulls_multiple_chunks() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let (tx, rx) = mpsc::channel(64);
 
         // 5 MiB — forces at least 3 chunks at the 2 MiB default.
@@ -470,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_hash_mismatch_aborts_and_cleans_partial() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let (tx, rx) = mpsc::channel(16);
 
         let correct_data = b"correct".to_vec();
@@ -493,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_surfaces_file_error_from_coord() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let (tx, mut rx) = mpsc::channel::<WorkerMessage>(16);
 
         let fake_hash = sha256_hex(b"nope");
@@ -516,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_returns_empty_when_no_cache_dir() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let m = cache.manifest().await;
         assert!(m.is_empty());
     }
@@ -524,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_lists_cached_files_with_size() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
 
         // Seed two entries directly on disk (as a successful pull would).
         let data_a = vec![0u8; 123];
@@ -551,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_ignores_partial_files() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let data = b"done".to_vec();
         let hash = sha256_hex(&data);
         let p = cache.path_for(&hash);
@@ -568,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn evict_removes_cached_file_and_partial() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let data = b"gone".to_vec();
         let hash = sha256_hex(&data);
         let p = cache.path_for(&hash);
@@ -585,8 +776,85 @@ mod tests {
     #[tokio::test]
     async fn evict_missing_file_returns_false_without_error() {
         let dir = TempDir::new();
-        let cache = ContentCache::new(dir.path.clone());
+        let cache = ContentCache::new(dir.path.clone(), 100 * 1024 * 1024);
         let removed = cache.evict("nonexistent-hash").await;
         assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn total_size_sums_canonical_files_only() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone(), 1_000_000);
+
+        for (sha, payload) in [("aabb", vec![0u8; 100]), ("ccdd", vec![1u8; 250])] {
+            let p = cache.path_for(sha);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &payload).unwrap();
+        }
+        // .partial files are excluded.
+        let p = cache.path_for("eeff");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p.with_extension("partial"), vec![9u8; 999]).unwrap();
+
+        assert_eq!(cache.total_size().await, 350);
+    }
+
+    #[tokio::test]
+    async fn touch_persists_ledger_across_new() {
+        let dir = TempDir::new();
+        {
+            let cache = ContentCache::new(dir.path.clone(), 1_000_000);
+            cache.touch("aabb").await;
+        }
+        // New instance over the same root should pick up the ledger.
+        let cache = ContentCache::new(dir.path.clone(), 1_000_000);
+        let ledger = cache.ledger.lock().await;
+        assert!(
+            ledger.entries.contains_key("aabb"),
+            "ledger entry should survive new() over same root"
+        );
+    }
+
+    #[tokio::test]
+    async fn lru_candidates_orders_by_last_used_ascending() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone(), 1_000_000);
+
+        for (sha, size) in [("aaone", 100u64), ("aatwo", 200), ("aathree", 300)] {
+            let p = cache.path_for(sha);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![0u8; size as usize]).unwrap();
+        }
+        // Touch in a deliberate order: three (oldest), one, two (newest).
+        cache.touch("aathree").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cache.touch("aaone").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cache.touch("aatwo").await;
+
+        let cands = cache.lru_candidates().await;
+        let order: Vec<&str> = cands.iter().map(|c| c.sha256.as_str()).collect();
+        assert_eq!(order, vec!["aathree", "aaone", "aatwo"]);
+        // Sizes round-trip through the candidate metadata.
+        assert_eq!(cands[0].size_bytes, 300);
+        assert_eq!(cands[1].size_bytes, 100);
+        assert_eq!(cands[2].size_bytes, 200);
+    }
+
+    #[tokio::test]
+    async fn evict_clears_ledger_entry() {
+        let dir = TempDir::new();
+        let cache = ContentCache::new(dir.path.clone(), 1_000_000);
+        let p = cache.path_for("aabb");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+        cache.touch("aabb").await;
+
+        assert!(cache.ledger.lock().await.entries.contains_key("aabb"));
+        assert!(cache.evict("aabb").await);
+        assert!(
+            !cache.ledger.lock().await.entries.contains_key("aabb"),
+            "ledger should be cleaned up after eviction"
+        );
     }
 }

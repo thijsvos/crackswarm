@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -47,6 +48,49 @@ fn register_cache_holds(
             .insert(pending.chunk_id);
     }
     chunk_cache_holds.insert(pending.chunk_id, pending.cache_holds.clone());
+}
+
+/// Best-effort LRU eviction to free `needed` bytes in the content cache,
+/// skipping any sha currently in use by a running chunk. Stops once the
+/// cache has room for `needed` bytes (cache budget − current size ≥
+/// needed) or no more candidates exist.
+///
+/// Returns the cache headroom after eviction. Caller compares against
+/// `needed` to decide whether the pull can proceed.
+async fn evict_lru_for_budget(
+    cache: &Arc<ContentCache>,
+    needed: u64,
+    running_chunks_using: &HashMap<String, HashSet<Uuid>>,
+) -> u64 {
+    let budget = cache.cache_max_bytes();
+    let mut current = cache.total_size().await;
+    let mut headroom = budget.saturating_sub(current);
+    if headroom >= needed {
+        return headroom;
+    }
+
+    let candidates = cache.lru_candidates().await;
+    for c in candidates {
+        if headroom >= needed {
+            break;
+        }
+        // Skip files actively in use; the deferred-eviction path will
+        // pick them up later but they can't be reclaimed right now.
+        if running_chunks_using
+            .get(&c.sha256)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if cache.evict(&c.sha256).await {
+            // Recompute conservatively: a concurrent writer could have
+            // shifted total_size during eviction.
+            current = current.saturating_sub(c.size_bytes);
+            headroom = budget.saturating_sub(current);
+        }
+    }
+    budget.saturating_sub(cache.total_size().await)
 }
 
 /// Maximum Noise transport message (plaintext side). 64 KiB is well within
@@ -278,7 +322,7 @@ async fn connect_and_run(
 
     // Content-addressed file cache for pull-based dispatch. Cheap to
     // clone (Arc inside).
-    let content_cache = ContentCache::new(config.cache_dir());
+    let content_cache = ContentCache::new(config.cache_dir(), config.cache_max_bytes);
 
     // Track running chunks: chunk_id -> kill signal sender (at most one at a time)
     let mut active_chunks: HashMap<Uuid, oneshot::Sender<()>> = HashMap::new();
@@ -592,6 +636,63 @@ async fn connect_and_run(
                             rules_size,
                         } = attack
                         {
+                            // Pre-flight budget check: how much new disk
+                            // does this chunk need, and is the cache going
+                            // to accommodate it after LRU eviction?
+                            let mut needed: u64 = 0;
+                            if !content_cache.has(&wordlist_sha256, wordlist_size).await {
+                                needed = needed.saturating_add(wordlist_size);
+                            }
+                            if let Some(ref rs) = rules_sha256 {
+                                let rz = rules_size.unwrap_or(0);
+                                if !content_cache.has(rs, rz).await {
+                                    needed = needed.saturating_add(rz);
+                                }
+                            }
+
+                            if needed > content_cache.cache_max_bytes() {
+                                warn!(
+                                    %chunk_id,
+                                    needed,
+                                    budget = content_cache.cache_max_bytes(),
+                                    "PullFailed: requested file exceeds cache budget"
+                                );
+                                let _ = outbound_tx
+                                    .send(WorkerMessage::PullFailed {
+                                        chunk_id,
+                                        hash: wordlist_sha256.clone(),
+                                        reason: "file size exceeds cache budget".to_string(),
+                                    })
+                                    .await;
+                                continue;
+                            }
+
+                            if needed > 0 {
+                                let headroom = evict_lru_for_budget(
+                                    &content_cache,
+                                    needed,
+                                    &running_chunks_using,
+                                )
+                                .await;
+                                if headroom < needed {
+                                    warn!(
+                                        %chunk_id,
+                                        needed,
+                                        headroom,
+                                        "PullFailed: insufficient disk after LRU eviction"
+                                    );
+                                    let _ = outbound_tx
+                                        .send(WorkerMessage::PullFailed {
+                                            chunk_id,
+                                            hash: wordlist_sha256.clone(),
+                                            reason: "insufficient disk after LRU eviction"
+                                                .to_string(),
+                                        })
+                                        .await;
+                                    continue;
+                                }
+                            }
+
                             let cache = content_cache.clone();
                             let outbound = outbound_tx.clone();
                             let ready = ready_tx.clone();
