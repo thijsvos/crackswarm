@@ -219,8 +219,7 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
                 worker_id: worker.id.clone(),
             });
 
-            db::insert_audit(
-                &state.db,
+            state.emit_audit(
                 "worker_timeout",
                 &format!(
                     "Worker {} timed out after {}s",
@@ -229,8 +228,7 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
                 ),
                 None,
                 Some(&worker.id),
-            )
-            .await?;
+            );
         }
     }
 

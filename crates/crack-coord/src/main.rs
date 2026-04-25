@@ -1,4 +1,5 @@
 mod api;
+mod audit;
 mod campaign;
 mod config;
 mod lifecycle;
@@ -137,7 +138,7 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         .unwrap_or_else(|| "hashcat".to_string());
 
     // Create shared state
-    let state = state::AppState::new(
+    let (state, audit_rx) = state::AppState::new(
         db,
         data_dir.clone(),
         keypair,
@@ -145,15 +146,18 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         bind.clone(),
     );
 
-    // Audit log: coordinator started
-    let _ = storage::db::insert_audit(
-        &state.db,
+    // Spin up the audit-log batcher before we emit the first event.
+    let audit_pool = state.db.clone();
+    tokio::spawn(async move {
+        audit::run_audit_flusher(audit_pool, audit_rx).await;
+    });
+
+    state.emit_audit(
         "coordinator_started",
         &format!("Coordinator started on {bind}"),
         None,
         None,
-    )
-    .await;
+    );
 
     // Start worker transport listener
     let transport_state = Arc::clone(&state);

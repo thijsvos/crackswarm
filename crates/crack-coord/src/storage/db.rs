@@ -1193,31 +1193,6 @@ pub async fn get_benchmark(
 // Audit log
 // ════════════════════════════════════════════════════════════════════════════
 
-pub async fn insert_audit(
-    pool: &SqlitePool,
-    event_type: &str,
-    details: &str,
-    source_ip: Option<&str>,
-    worker_id: Option<&str>,
-) -> Result<()> {
-    let now = now_iso();
-
-    sqlx::query(
-        "INSERT INTO audit_log (event_type, details, source_ip, worker_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )
-    .bind(event_type)
-    .bind(details)
-    .bind(source_ip)
-    .bind(worker_id)
-    .bind(&now)
-    .execute(pool)
-    .await
-    .context("inserting audit entry")?;
-
-    Ok(())
-}
-
 pub async fn get_recent_audit(pool: &SqlitePool, limit: u32) -> Result<Vec<AuditEntry>> {
     let rows = sqlx::query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?1")
         .bind(limit)

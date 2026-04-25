@@ -2,11 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Utc;
 use crack_common::auth::Keypair;
+use crack_common::models::AuditEntry;
 use crack_common::protocol::CoordMessage;
 use sqlx::SqlitePool;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use uuid::Uuid;
+
+/// Buffer depth for the audit-log channel feeding the background flusher.
+/// Sized to absorb a reconnect storm (every connect emits an audit event)
+/// without blocking the producer; events drop with a `warn!` past this.
+const AUDIT_CHANNEL_CAPACITY: usize = 4096;
 
 /// Shared application state accessible from REST API, transport handler, scheduler, and TUI.
 pub struct AppState {
@@ -29,6 +36,11 @@ pub struct AppState {
 
     /// Broadcast channel for TUI events.
     pub events: broadcast::Sender<AppEvent>,
+
+    /// Outbound side of the audit log channel. Drained by
+    /// `crate::audit::run_audit_flusher`, which batches inserts every
+    /// ~500ms or 64 events. Use [`Self::emit_audit`] to send.
+    pub audit_tx: mpsc::Sender<AuditEntry>,
 }
 
 #[allow(dead_code)]
@@ -86,15 +98,21 @@ pub enum AppEvent {
 }
 
 impl AppState {
+    /// Construct shared coord state and the audit-log receiver that the
+    /// caller hands to [`crate::audit::run_audit_flusher`] in a spawned
+    /// task. The receiver is returned (not owned by `AppState`) because
+    /// `Receiver` is single-consumer and threading it through `Arc`
+    /// would require interior mutability.
     pub fn new(
         db: SqlitePool,
         data_dir: PathBuf,
         keypair: Keypair,
         hashcat_path: String,
         bind_addr: String,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, mpsc::Receiver<AuditEntry>) {
         let (events, _) = broadcast::channel(1024);
-        Arc::new(Self {
+        let (audit_tx, audit_rx) = mpsc::channel(AUDIT_CHANNEL_CAPACITY);
+        let state = Arc::new(Self {
             db,
             data_dir,
             keypair,
@@ -103,13 +121,48 @@ impl AppState {
             worker_connections: RwLock::new(HashMap::new()),
             preparing_tasks: RwLock::new(HashSet::new()),
             events,
-        })
+            audit_tx,
+        });
+        (state, audit_rx)
     }
 
     /// Emit an event to the TUI broadcast channel.
     pub fn emit(&self, event: AppEvent) {
         // Ignore send errors (no TUI subscribers in headless mode)
         let _ = self.events.send(event);
+    }
+
+    /// Queue an audit-log entry for the background flusher.
+    ///
+    /// Best-effort: drops with a `warn!` if the channel buffer (4096 events)
+    /// is full. Audit is a side-channel — if we're sustained-overrunning a
+    /// 4k-deep buffer, the system has bigger problems than a few missing
+    /// audit rows.
+    pub fn emit_audit(
+        &self,
+        event_type: &str,
+        details: &str,
+        source_ip: Option<&str>,
+        worker_id: Option<&str>,
+    ) {
+        let entry = AuditEntry {
+            id: None,
+            event_type: event_type.to_string(),
+            details: details.to_string(),
+            source_ip: source_ip.map(String::from),
+            worker_id: worker_id.map(String::from),
+            created_at: Utc::now(),
+        };
+        if let Err(err) = self.audit_tx.try_send(entry) {
+            match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    tracing::warn!(event_type, "audit channel full, dropping event");
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    tracing::warn!(event_type, "audit channel closed, dropping event");
+                }
+            }
+        }
     }
 
     /// Get the files storage directory.

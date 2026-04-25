@@ -101,15 +101,12 @@ async fn run_connection(
             }
             Err(_) => {
                 warn!(%peer_addr, pubkey_fp = %pubkey_fp, "enrollment timeout, disconnecting");
-                db::insert_audit(
-                    &state.db,
+                state.emit_audit(
                     "auth_rejected",
                     &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
                     Some(&peer_addr.to_string()),
                     None,
-                )
-                .await
-                .ok();
+                );
                 return Ok(());
             }
         };
@@ -144,47 +141,38 @@ async fn run_connection(
                         db::mark_nonce_used(&state.db, &nonce, &pubkey_b64).await?;
                         db::authorize_worker(&state.db, &pubkey_b64, &token_name).await?;
 
-                        db::insert_audit(
-                            &state.db,
+                        state.emit_audit(
                             "worker_enrolled",
                             &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
                             Some(&peer_addr.to_string()),
                             None,
-                        )
-                        .await
-                        .ok();
+                        );
 
                         info!(%peer_addr, name = %token_name, "worker enrolled successfully via token");
                         // Fall through to the normal message loop
                     }
                     None => {
                         warn!(%peer_addr, "invalid or expired enrollment nonce");
-                        db::insert_audit(
-                            &state.db,
+                        state.emit_audit(
                             "enroll_rejected",
                             &format!(
                                 "Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"
                             ),
                             Some(&peer_addr.to_string()),
                             None,
-                        )
-                        .await
-                        .ok();
+                        );
                         return Ok(());
                     }
                 }
             }
             _ => {
                 warn!(%peer_addr, pubkey_fp = %pubkey_fp, "unauthorized worker sent non-Enroll message, disconnecting");
-                db::insert_audit(
-                    &state.db,
+                state.emit_audit(
                     "auth_rejected",
                     &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
                     Some(&peer_addr.to_string()),
                     None,
-                )
-                .await
-                .ok();
+                );
                 return Ok(());
             }
         }
@@ -520,14 +508,12 @@ async fn handle_worker_message(
                 "chunk failed"
             );
 
-            db::insert_audit(
-                &state.db,
+            state.emit_audit(
                 "chunk_failed",
                 &format!("Chunk {chunk_id} failed: {err_msg}"),
                 None,
                 Some(wid),
-            )
-            .await?;
+            );
 
             // Try to assign next work to keep the worker busy.
             if let Some(wid) = worker_id.as_deref() {
@@ -602,14 +588,12 @@ async fn handle_worker_message(
                 "pull failed: chunk will be reassigned"
             );
 
-            db::insert_audit(
-                &state.db,
+            state.emit_audit(
                 "pull_failed",
                 &format!("Worker {wid} couldn't fetch {hash} for chunk {chunk_id}: {reason}"),
                 None,
                 Some(wid),
-            )
-            .await?;
+            );
 
             if let Some(wid) = worker_id.as_deref() {
                 try_assign_work(state, wid, outbound_tx, transferred_files).await?;
@@ -811,14 +795,12 @@ async fn handle_register(
         "worker registered"
     );
 
-    db::insert_audit(
-        &state.db,
+    state.emit_audit(
         "worker_registered",
         &format!("Worker {worker_name} ({wid}) connected from {peer_addr}"),
         Some(&peer_addr.to_string()),
         Some(&wid),
-    )
-    .await?;
+    );
 
     // Cache reconciliation: tell the (re)connecting worker which sha256s
     // we still consider live. Anything in its cache that's not on this
