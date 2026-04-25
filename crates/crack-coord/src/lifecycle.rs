@@ -112,33 +112,35 @@ async fn gc_pass(state: &AppState) -> Result<()> {
             );
         }
 
-        // Delete every files row (and disk file) sharing this sha. A legacy
-        // deployment with duplicate sha rows may hit >1 here.
+        // Reclaim every files row (and disk file) sharing this sha. A
+        // legacy deployment with duplicate sha rows may hit >1 here.
+        // Disk: best-effort delete (tolerate "already gone").
+        // DB: soft-delete via `gc_state = 'deleted'` instead of hard
+        // DELETE. The `tasks.hash_file_id NOT NULL REFERENCES files(id)`
+        // FK blocks hard deletes for any file ever consumed by a task,
+        // so the row stays as a tombstone — invisible to dedup
+        // (`find_file_by_sha256` / `get_file_record` filter out
+        // non-active rows) but still resolvable as an FK target for
+        // historical joins.
         let records = db::files_by_sha256(&state.db, &sha).await?;
-        let mut delete_ok = true;
         let files_dir = state.files_dir();
         for rec in &records {
             if let Err(e) = files::delete_file(&files_dir, &rec.id) {
-                // Tolerate "not found" — the file was already gone from
-                // disk; we still want to drop the row.
                 debug!(
                     file_id = %rec.id,
                     error = %e,
                     "GC: file already absent on disk (continuing)"
                 );
             }
-            if let Err(e) = db::delete_file_record(&state.db, &rec.id).await {
-                warn!(file_id = %rec.id, error = %e, "GC: failed to delete files row");
-                delete_ok = false;
-            }
+            db::set_file_gc_state_deleted(&state.db, &rec.id).await?;
         }
 
-        if delete_ok {
-            db::remove_from_gc_queue(&state.db, &sha).await?;
-            info!(%sha, deleted_rows = records.len(), "GC: reclaimed file");
-        } else {
-            db::bump_gc_attempts(&state.db, &sha).await?;
-        }
+        db::remove_from_gc_queue(&state.db, &sha).await?;
+        info!(
+            %sha,
+            tombstoned_rows = records.len(),
+            "GC: reclaimed file (disk freed, rows soft-deleted)"
+        );
     }
     Ok(())
 }
