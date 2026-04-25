@@ -310,6 +310,27 @@ pub fn print_status(status: &SystemStatus) {
     );
 }
 
+/// Per-worker content cache summary appended to `crackctl status --cache`.
+pub fn print_cache_status(entries: &[crate::client::WorkerCacheStatus]) {
+    println!();
+    println!("\u{2550}\u{2550}\u{2550} Cache (per worker) \u{2550}\u{2550}\u{2550}");
+    println!();
+    if entries.is_empty() {
+        println!("  (no workers known to the coordinator)");
+        return;
+    }
+    println!("  {:<40} {:>8} {:>14}", "WORKER ID", "FILES", "BYTES");
+    println!("  {}", "-".repeat(64));
+    for e in entries {
+        println!(
+            "  {:<40} {:>8} {:>14}",
+            short_id(&e.worker_id),
+            e.file_count,
+            human_size(e.total_bytes)
+        );
+    }
+}
+
 // ── Potfile ──
 
 pub fn print_potfile_stats(stats: &PotfileStats) {

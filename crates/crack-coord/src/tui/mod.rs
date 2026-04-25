@@ -110,6 +110,12 @@ fn spawn_data_refresher(
                 .unwrap_or_default();
             let status = db::get_system_status(&state.db).await.ok();
             let campaigns = db::list_campaigns(&state.db).await.unwrap_or_default();
+            let cache_summary = db::cache_summary_per_worker(&state.db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(wid, count, bytes)| (wid, (count, bytes)))
+                .collect::<std::collections::HashMap<_, _>>();
 
             let chunks = if let Some(tid) = selected_task_id {
                 Some(
@@ -140,6 +146,7 @@ fn spawn_data_refresher(
                 status,
                 campaigns,
                 campaign_phases,
+                cache_summary,
             };
 
             if data_tx.send(data).is_err() {
