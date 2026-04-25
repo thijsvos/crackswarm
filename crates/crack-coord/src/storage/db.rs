@@ -1167,8 +1167,12 @@ pub async fn insert_file_record(pool: &SqlitePool, record: &FileRecord) -> Resul
     Ok(())
 }
 
+/// Fetch a file row by ID. Tombstoned rows (`gc_state != 'active'`) are
+/// hidden — they exist only as FK targets for historical tasks/campaigns
+/// and have no on-disk content, so callers (dedup, monitor, transport)
+/// must not see them.
 pub async fn get_file_record(pool: &SqlitePool, id: &str) -> Result<Option<FileRecord>> {
-    let row = sqlx::query("SELECT * FROM files WHERE id = ?1")
+    let row = sqlx::query("SELECT * FROM files WHERE id = ?1 AND gc_state = 'active'")
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -1181,14 +1185,19 @@ pub async fn get_file_record(pool: &SqlitePool, id: &str) -> Result<Option<FileR
 }
 
 /// Look up a file by its sha256 content hash. Returns the oldest matching
-/// row (by uploaded_at) when multiple exist — legacy deployments may have
-/// duplicates that predate the upload-dedup short-circuit.
+/// active row (by uploaded_at) when multiple exist — legacy deployments
+/// may have duplicates that predate the upload-dedup short-circuit.
+/// Tombstoned rows are skipped so dedup never returns a row whose
+/// content has been reclaimed.
 pub async fn find_file_by_sha256(pool: &SqlitePool, sha256: &str) -> Result<Option<FileRecord>> {
-    let row = sqlx::query("SELECT * FROM files WHERE sha256 = ?1 ORDER BY uploaded_at ASC LIMIT 1")
-        .bind(sha256)
-        .fetch_optional(pool)
-        .await
-        .context("fetching file record by sha256")?;
+    let row = sqlx::query(
+        "SELECT * FROM files WHERE sha256 = ?1 AND gc_state = 'active' \
+         ORDER BY uploaded_at ASC LIMIT 1",
+    )
+    .bind(sha256)
+    .fetch_optional(pool)
+    .await
+    .context("fetching file record by sha256")?;
 
     match row {
         Some(ref r) => Ok(Some(row_to_file_record(r)?)),
@@ -1377,7 +1386,12 @@ pub async fn remove_from_gc_queue(pool: &SqlitePool, sha256: &str) -> Result<()>
 }
 
 /// Increment the attempt counter for a stuck GC entry (called when a pass
-/// couldn't finish — e.g. file still open elsewhere).
+/// couldn't finish — e.g. file still open elsewhere). Currently
+/// vestigial: soft-delete via `set_file_gc_state_deleted` always
+/// succeeds, so the GC pass no longer needs to retry. Kept as a
+/// primitive for future transient-failure modes (disk I/O hiccups
+/// during the on-disk file delete, SQLite contention, etc.).
+#[allow(dead_code)]
 pub async fn bump_gc_attempts(pool: &SqlitePool, sha256: &str) -> Result<()> {
     sqlx::query("UPDATE gc_queue SET attempts = attempts + 1 WHERE file_sha256 = ?1")
         .bind(sha256)
@@ -1395,6 +1409,21 @@ pub async fn set_gc_state_deleting(pool: &SqlitePool, sha256: &str) -> Result<()
         .execute(pool)
         .await
         .context("transitioning files to deleting")?;
+    Ok(())
+}
+
+/// Soft-delete a file row: the disk file has been reclaimed but the row
+/// stays as a tombstone because FK constraints from completed
+/// `tasks.hash_file_id` / `campaigns.*` block hard deletion. The row is
+/// filtered out of `find_file_by_sha256` and `get_file_record` so dedup
+/// never returns a row whose content is gone, while historical joins
+/// (audit log, finished tasks listing past hash files) still resolve.
+pub async fn set_file_gc_state_deleted(pool: &SqlitePool, file_id: &str) -> Result<()> {
+    sqlx::query("UPDATE files SET gc_state = 'deleted' WHERE id = ?1")
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .context("transitioning file to deleted")?;
     Ok(())
 }
 
@@ -2407,6 +2436,46 @@ mod tests {
             .unwrap()
             .expect("should have found match");
         assert_eq!(found.id, "aaa-111");
+    }
+
+    #[tokio::test]
+    async fn find_file_by_sha256_skips_deleted_rows() {
+        let pool = mem_pool().await;
+        let rec = sample_file_record("tomb-1", "tombsha", Utc::now());
+        insert_file_record(&pool, &rec).await.unwrap();
+        set_file_gc_state_deleted(&pool, "tomb-1").await.unwrap();
+
+        let found = find_file_by_sha256(&pool, "tombsha").await.unwrap();
+        assert!(
+            found.is_none(),
+            "tombstoned row must be invisible to dedup lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_record_skips_deleted_rows() {
+        let pool = mem_pool().await;
+        let rec = sample_file_record("tomb-2", "tombsha2", Utc::now());
+        insert_file_record(&pool, &rec).await.unwrap();
+        set_file_gc_state_deleted(&pool, "tomb-2").await.unwrap();
+
+        let found = get_file_record(&pool, "tomb-2").await.unwrap();
+        assert!(
+            found.is_none(),
+            "tombstoned row must be invisible to id lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_file_gc_state_deleted_is_idempotent() {
+        let pool = mem_pool().await;
+        let rec = sample_file_record("tomb-3", "tombsha3", Utc::now());
+        insert_file_record(&pool, &rec).await.unwrap();
+        set_file_gc_state_deleted(&pool, "tomb-3").await.unwrap();
+        set_file_gc_state_deleted(&pool, "tomb-3").await.unwrap();
+        // Second call must not error and the row stays tombstoned.
+        let found = get_file_record(&pool, "tomb-3").await.unwrap();
+        assert!(found.is_none());
     }
 
     async fn seed_file(pool: &SqlitePool, id: &str, sha: &str) {
