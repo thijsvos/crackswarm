@@ -357,6 +357,32 @@ async fn handle_worker_message(
                 {
                     warn!(worker = %wid, error = %e, "failed to sync cache manifest");
                 }
+
+                // Drift-correction tick (issue #45). If the manifest carries
+                // a sha that is no longer active on the coord, tell the agent
+                // to evict it. Catches: missed `EvictFile` (mpsc backpressure
+                // / transient drop), post-coord-restart staleness, and any
+                // other cause of view divergence between coord and agent.
+                // Same-cycle double-fires (this PR's gc_pass fallback +
+                // heartbeat re-evict) are harmless: agent's `evict` is
+                // idempotent and no-ops a second call.
+                match db::list_active_file_shas(&state.db).await {
+                    Ok(active) => {
+                        let active: std::collections::HashSet<_> = active.into_iter().collect();
+                        for entry in cache_manifest {
+                            if !active.contains(&entry.sha256) {
+                                let _ = outbound_tx
+                                    .send(CoordMessage::EvictFile {
+                                        hash: entry.sha256.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(worker = %wid, error = %e, "drift-correction lookup failed")
+                    }
+                }
             }
             Ok(())
         }
