@@ -56,7 +56,12 @@ enum Commands {
         action: PotfileAction,
     },
     /// Show system overview
-    Status,
+    Status {
+        /// Append a per-worker content-cache summary (file count and
+        /// total bytes for each connected worker).
+        #[arg(long)]
+        cache: bool,
+    },
 }
 
 // ── Task subcommands ──
@@ -153,6 +158,19 @@ enum FileAction {
     },
     /// List uploaded files
     List,
+    /// Pin a file so it's never auto-GC'd by the coord
+    Pin {
+        /// File ID (from `file list`)
+        id: String,
+    },
+    /// Unpin a file: GC may reclaim it once no task/campaign references it
+    Unpin {
+        /// File ID (from `file list`)
+        id: String,
+    },
+    /// Trigger an immediate GC pass on the coord (drains the queue
+    /// instead of waiting for the periodic 60s tick)
+    Gc,
 }
 
 // ── Worker subcommands ──
@@ -295,7 +313,7 @@ async fn main() -> Result<()> {
         Commands::Worker { action } => handle_worker(&client, action).await?,
         Commands::Campaign { action } => handle_campaign(&client, action).await?,
         Commands::Potfile { action } => handle_potfile(&client, action).await?,
-        Commands::Status => handle_status(&client).await?,
+        Commands::Status { cache } => handle_status(&client, cache).await?,
     }
 
     Ok(())
@@ -414,6 +432,21 @@ async fn handle_file(client: &Client, action: FileAction) -> Result<()> {
         FileAction::List => {
             let files = client.list_files().await?;
             display::print_files(&files);
+        }
+
+        FileAction::Pin { id } => {
+            client.pin_file(&id).await?;
+            println!("File {id} pinned (GC will skip it).");
+        }
+
+        FileAction::Unpin { id } => {
+            client.unpin_file(&id).await?;
+            println!("File {id} unpinned.");
+        }
+
+        FileAction::Gc => {
+            client.gc_now().await?;
+            println!("GC pass complete.");
         }
     }
 
@@ -587,8 +620,12 @@ async fn handle_potfile(client: &Client, action: PotfileAction) -> Result<()> {
     Ok(())
 }
 
-async fn handle_status(client: &Client) -> Result<()> {
+async fn handle_status(client: &Client, with_cache: bool) -> Result<()> {
     let status = client.get_status().await?;
     display::print_status(&status);
+    if with_cache {
+        let entries = client.cache_status().await?;
+        display::print_cache_status(&entries);
+    }
     Ok(())
 }

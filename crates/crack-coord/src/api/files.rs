@@ -258,6 +258,67 @@ fn device_id_of(path: &std::path::Path) -> ApiResult<u64> {
     }
 }
 
+/// Pin a file so it's never auto-GC'd. Idempotent.
+pub async fn pin_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if !db::set_file_pinned(&state.db, &id, true).await? {
+        return Err(ApiError::NotFound(format!("file {id} not found")));
+    }
+    info!(file_id = %id, "pinned file");
+    Ok((StatusCode::OK, Json(serde_json::json!({"pinned": true}))))
+}
+
+/// Unpin a file. Subsequent terminal task transitions can mark it for
+/// GC in the normal way.
+pub async fn unpin_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if !db::set_file_pinned(&state.db, &id, false).await? {
+        return Err(ApiError::NotFound(format!("file {id} not found")));
+    }
+    info!(file_id = %id, "unpinned file");
+    Ok((StatusCode::OK, Json(serde_json::json!({"pinned": false}))))
+}
+
+/// Trigger a GC pass right now instead of waiting for the periodic
+/// loop. Returns once the pass completes (or errors).
+pub async fn gc_now(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    crate::lifecycle::run_gc_once(&state)
+        .await
+        .map_err(|e| ApiError::Internal(format!("gc_pass failed: {e}")))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "completed"})),
+    ))
+}
+
+#[derive(Serialize)]
+pub struct WorkerCacheStatus {
+    pub worker_id: String,
+    pub file_count: i64,
+    pub total_bytes: i64,
+}
+
+/// Per-worker cache summary used by `crackctl status --cache` and the
+/// TUI workers view.
+pub async fn cache_status(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<Vec<WorkerCacheStatus>>> {
+    let rows = db::cache_summary_per_worker(&state.db).await?;
+    let entries: Vec<WorkerCacheStatus> = rows
+        .into_iter()
+        .map(|(worker_id, file_count, total_bytes)| WorkerCacheStatus {
+            worker_id,
+            file_count,
+            total_bytes,
+        })
+        .collect();
+    Ok(Json(entries))
+}
+
 pub async fn download_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

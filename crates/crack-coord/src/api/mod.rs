@@ -94,8 +94,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/v1/files/hardlink", post(files::hardlink_file))
+        .route("/api/v1/files/gc", post(files::gc_now))
         .route("/api/v1/files/{id}", get(files::download_file))
+        .route("/api/v1/files/{id}/pin", post(files::pin_file))
+        .route("/api/v1/files/{id}/unpin", post(files::unpin_file))
         .route("/api/v1/server-info", get(files::server_info))
+        .route("/api/v1/cache/status", get(files::cache_status))
         // Workers
         .route("/api/v1/workers", get(workers::list_workers))
         .route("/api/v1/workers/authorize", post(workers::authorize_worker))

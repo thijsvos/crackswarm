@@ -101,6 +101,10 @@ pub struct TuiState {
     pub status: Option<SystemStatus>,
     pub campaigns: Vec<Campaign>,
     pub campaign_phases: Vec<CampaignPhase>,
+    /// Per-worker content cache summary keyed by worker_id —
+    /// (file_count, total_bytes). Powers the cache column on the
+    /// workers view.
+    pub cache_summary: std::collections::HashMap<String, (i64, i64)>,
 }
 
 impl TuiState {
@@ -128,6 +132,7 @@ impl TuiState {
             status: None,
             campaigns: Vec::new(),
             campaign_phases: Vec::new(),
+            cache_summary: std::collections::HashMap::new(),
         }
     }
 
@@ -282,6 +287,7 @@ impl TuiState {
         self.audit_entries = data.audit_entries;
         self.status = data.status;
         self.campaigns = data.campaigns;
+        self.cache_summary = data.cache_summary;
 
         if let Some(chunks) = data.chunks {
             self.chunks = chunks;
@@ -302,4 +308,6 @@ pub struct TuiData {
     pub status: Option<SystemStatus>,
     pub campaigns: Vec<Campaign>,
     pub campaign_phases: Option<Vec<CampaignPhase>>,
+    /// Per-worker (file_count, total_bytes), keyed by worker_id.
+    pub cache_summary: std::collections::HashMap<String, (i64, i64)>,
 }

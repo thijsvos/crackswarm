@@ -84,6 +84,17 @@ pub fn render_worker_detail(f: &mut Frame, area: Rect, state: &TuiState) {
         format!("{}h ago", elapsed.num_hours())
     };
 
+    let cache_summary = state
+        .cache_summary
+        .get(&worker.id)
+        .copied()
+        .unwrap_or((0, 0));
+    let cache_str = format!(
+        "{} files, {}",
+        cache_summary.0,
+        format_bytes(cache_summary.1)
+    );
+
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  ID:           ", Style::default().fg(Theme::SUBTEXT0)),
@@ -114,6 +125,10 @@ pub fn render_worker_detail(f: &mut Frame, area: Rect, state: &TuiState) {
                 Style::default().fg(Theme::TEXT),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("  Cache:        ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled(cache_str, Style::default().fg(Theme::TEXT)),
+        ]),
         Line::default(),
         Line::from(Span::styled(
             "  Devices:",
@@ -139,4 +154,26 @@ pub fn render_worker_detail(f: &mut Frame, area: Rect, state: &TuiState) {
 
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Render `bytes` in IEC units (KiB / MiB / GiB / TiB) with one decimal
+/// place. Negative values clamp to "0 B" — they shouldn't happen, but the
+/// underlying SUM(...) i64 leaves the door open and we'd rather not panic
+/// inside the render path.
+fn format_bytes(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "0 B".to_string();
+    }
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", bytes)
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }

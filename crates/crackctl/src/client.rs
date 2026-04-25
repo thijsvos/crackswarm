@@ -81,6 +81,13 @@ struct ServerInfo {
     pub device_id: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkerCacheStatus {
+    pub worker_id: String,
+    pub file_count: i64,
+    pub total_bytes: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct HardlinkPayload {
     pub source_path: String,
@@ -509,6 +516,52 @@ impl Client {
         let resp = Self::check(resp).await?;
         let files: Vec<FileRecord> = resp.json().await.context("failed to parse files")?;
         Ok(files)
+    }
+
+    pub async fn pin_file(&self, file_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/api/v1/files/{file_id}/pin")))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    pub async fn unpin_file(&self, file_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/api/v1/files/{file_id}/unpin")))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    pub async fn gc_now(&self) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/api/v1/files/gc"))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    pub async fn cache_status(&self) -> Result<Vec<WorkerCacheStatus>> {
+        let resp = self
+            .http
+            .get(self.url("/api/v1/cache/status"))
+            .send()
+            .await
+            .context("failed to reach coordinator")?;
+        let resp = Self::check(resp).await?;
+        let entries: Vec<WorkerCacheStatus> =
+            resp.json().await.context("failed to parse cache status")?;
+        Ok(entries)
     }
 
     // ── Workers ──

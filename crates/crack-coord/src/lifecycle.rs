@@ -44,6 +44,13 @@ pub async fn run_gc_loop(state: Arc<AppState>) {
     }
 }
 
+/// Run one GC pass on demand. Same logic as the periodic loop —
+/// callable from `POST /api/v1/files/gc` so operators can flush
+/// reclaimed disk immediately instead of waiting for the next tick.
+pub async fn run_gc_once(state: &AppState) -> Result<()> {
+    gc_pass(state).await
+}
+
 async fn gc_pass(state: &AppState) -> Result<()> {
     let queued = db::list_gc_queue(&state.db).await?;
     for (sha, attempts) in queued {

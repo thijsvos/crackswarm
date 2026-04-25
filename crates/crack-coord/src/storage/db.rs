@@ -1398,6 +1398,48 @@ pub async fn set_gc_state_deleting(pool: &SqlitePool, sha256: &str) -> Result<()
     Ok(())
 }
 
+/// Toggle the `pinned` flag on a single file. Pinned files are skipped
+/// by the GC loop even when their refcount is zero.
+pub async fn set_file_pinned(pool: &SqlitePool, file_id: &str, pinned: bool) -> Result<bool> {
+    let result = sqlx::query("UPDATE files SET pinned = ?1 WHERE id = ?2")
+        .bind(if pinned { 1i64 } else { 0 })
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .context("updating files.pinned")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Per-worker cache summary: how many entries the worker holds and the
+/// total bytes those entries represent. Powers `crackctl status --cache`
+/// and the TUI's workers-view cache column.
+pub async fn cache_summary_per_worker(pool: &SqlitePool) -> Result<Vec<(String, i64, i64)>> {
+    // Returns (worker_id, file_count, total_bytes) — including 0/0 rows
+    // for connected workers with empty caches so the status output lists
+    // every worker, not only the busy ones.
+    let rows = sqlx::query(
+        "SELECT w.id AS wid, \
+                COALESCE(SUM(CASE WHEN wce.file_sha256 IS NOT NULL THEN 1 ELSE 0 END), 0) AS file_count, \
+                COALESCE(SUM(wce.size_bytes), 0) AS total_bytes \
+         FROM workers w \
+         LEFT JOIN worker_cache_entries wce ON wce.worker_id = w.id \
+         GROUP BY w.id \
+         ORDER BY w.id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("computing cache_summary_per_worker")?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.get::<String, _>("wid"),
+                r.get::<i64, _>("file_count"),
+                r.get::<i64, _>("total_bytes"),
+            ))
+        })
+        .collect()
+}
+
 /// All sha256s currently considered "live" on the coord — i.e. files with
 /// `gc_state = 'active'`. Used by reconciliation to tell a (re)connecting
 /// worker which content it's still allowed to keep cached.
@@ -2611,6 +2653,67 @@ mod tests {
             workers_with_file(&pool, "shared").await.unwrap(),
             vec!["w-b".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn set_file_pinned_round_trip() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "f-pin", "sha-pin").await;
+
+        // Pin → reflected in is_sha_pinned and column.
+        let updated = set_file_pinned(&pool, "f-pin", true).await.unwrap();
+        assert!(updated);
+        assert!(is_sha_pinned(&pool, "sha-pin").await.unwrap());
+
+        // Unpin.
+        let updated = set_file_pinned(&pool, "f-pin", false).await.unwrap();
+        assert!(updated);
+        assert!(!is_sha_pinned(&pool, "sha-pin").await.unwrap());
+
+        // Missing file id returns false.
+        assert!(!set_file_pinned(&pool, "nonexistent", true).await.unwrap());
+    }
+
+    async fn seed_worker(pool: &SqlitePool, id: &str, name: &str) {
+        let now = Utc::now();
+        let worker = Worker {
+            id: id.to_string(),
+            name: name.to_string(),
+            public_key: format!("pk-{id}"),
+            devices: vec![],
+            hashcat_version: None,
+            os: None,
+            status: WorkerStatus::Idle,
+            created_at: now,
+            last_seen_at: now,
+        };
+        create_or_update_worker(pool, &worker).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_summary_includes_workers_with_empty_caches() {
+        let pool = mem_pool().await;
+        seed_worker(&pool, "w-empty", "empty").await;
+        seed_worker(&pool, "w-busy", "busy").await;
+        sync_worker_cache_manifest(
+            &pool,
+            "w-busy",
+            &[manifest_entry("aa", 100), manifest_entry("bb", 250)],
+        )
+        .await
+        .unwrap();
+
+        let mut summary = cache_summary_per_worker(&pool).await.unwrap();
+        summary.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(summary.len(), 2);
+        // w-busy: 2 files, 350 bytes total
+        let busy = summary.iter().find(|s| s.0 == "w-busy").unwrap();
+        assert_eq!(busy.1, 2);
+        assert_eq!(busy.2, 350);
+        // w-empty: 0/0, but still listed
+        let empty = summary.iter().find(|s| s.0 == "w-empty").unwrap();
+        assert_eq!(empty.1, 0);
+        assert_eq!(empty.2, 0);
     }
 
     #[tokio::test]
