@@ -9,9 +9,10 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
 use serde::Serialize;
 
+use crate::admin_token::{require_admin_token, AdminToken};
 use crate::state::AppState;
 
 // ── API Error ──
@@ -75,7 +76,7 @@ pub type ApiResult<T> = Result<T, ApiError>;
 
 // ── Router ──
 
-pub fn create_router(state: Arc<AppState>) -> Router {
+pub fn create_router(state: Arc<AppState>, token: Arc<AdminToken>) -> Router {
     Router::new()
         // Tasks
         .route(
@@ -140,5 +141,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/potfile/stats", get(tasks::potfile_stats))
         .route("/api/v1/potfile/plaintexts", get(tasks::potfile_plaintexts))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
+        // Bearer-token gate. Applied last so it runs first (axum middleware
+        // evaluates outside-in); a missing or wrong token short-circuits
+        // before any handler state is touched.
+        .layer(middleware::from_fn_with_state(
+            token,
+            require_admin_token,
+        ))
         .with_state(state)
 }

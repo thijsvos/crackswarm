@@ -3,7 +3,7 @@ mod display;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crack_common::models::AttackConfig;
 
@@ -23,6 +23,17 @@ struct Cli {
         global = true
     )]
     api_url: String,
+
+    /// REST API admin token (hex). Reads from `--token-file` or
+    /// `<coord-data-dir>/admin.token` if omitted.
+    #[arg(long, env = "CRACKCTL_TOKEN", global = true)]
+    token: Option<String>,
+
+    /// File containing the REST API admin token (one line of hex).
+    /// Default: `<coord-data-dir>/admin.token`. Override when the
+    /// coord runs under a different data directory.
+    #[arg(long, env = "CRACKCTL_TOKEN_FILE", global = true)]
+    token_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -305,7 +316,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let client = Client::new(&cli.api_url);
+    let token = resolve_admin_token(&cli)?;
+    let client = Client::new(&cli.api_url, token);
 
     match cli.command {
         Commands::Task { action } => handle_task(&client, action).await?,
@@ -317,6 +329,31 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Pick a token from CLI flag → `--token-file` → default
+/// `<coord-data-dir>/admin.token`. The default mirrors what
+/// `crack-coord` writes at startup, so an operator running both
+/// binaries with the default data directories doesn't need to pass
+/// any flags.
+fn resolve_admin_token(cli: &Cli) -> Result<String> {
+    if let Some(t) = &cli.token {
+        return Ok(t.trim().to_string());
+    }
+
+    let path = cli
+        .token_file
+        .clone()
+        .unwrap_or_else(|| crack_common::auth::coordinator_data_dir().join("admin.token"));
+
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "failed to read REST admin token at {} \
+             (pass --token, set CRACKCTL_TOKEN, or specify --token-file / CRACKCTL_TOKEN_FILE)",
+            path.display()
+        )
+    })?;
+    Ok(raw.trim().to_string())
 }
 
 // ── Handlers ──

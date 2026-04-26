@@ -1,3 +1,4 @@
+mod admin_token;
 mod api;
 mod audit;
 mod campaign;
@@ -175,11 +176,24 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Generate or load the REST admin token before starting the API
+    // listener so any client that races startup gets a 401 rather than
+    // an unauthenticated response.
+    let admin_token = Arc::new(
+        admin_token::AdminToken::load_or_create(&data_dir)
+            .expect("failed to load or generate REST admin token"),
+    );
+    info!(
+        "REST admin token at {} (chmod 600 on Unix)",
+        data_dir.join("admin.token").display()
+    );
+
     // Start REST API server
     let api_state = Arc::clone(&state);
+    let api_token = Arc::clone(&admin_token);
     let api_bind_addr = api_bind.clone();
     tokio::spawn(async move {
-        let router = api::create_router(api_state);
+        let router = api::create_router(api_state, api_token);
         let listener = tokio::net::TcpListener::bind(&api_bind_addr)
             .await
             .expect("failed to bind API listener");
