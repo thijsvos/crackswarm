@@ -493,22 +493,15 @@ async fn connect_and_run(
             }
 
             Action::TcpReadable => {
-                // Read with a timeout to avoid blocking forever on spurious readability.
-                let cipher =
-                    match tokio::time::timeout(Duration::from_secs(5), read_framed(&mut stream))
-                        .await
-                    {
-                        Ok(Ok(data)) => data,
-                        Ok(Err(e)) => {
-                            // Real read error (connection closed, etc.)
-                            return Err(e);
-                        }
-                        Err(_) => {
-                            // Timeout — no data arrived, continue loop
-                            // (heartbeat and runner events will be processed)
-                            continue;
-                        }
-                    };
+                // No timeout: `read_framed`'s internal `read_exact` is not
+                // cancel-safe — a mid-frame timeout would drop arbitrary
+                // already-decrypted bytes from the kernel buffer view and
+                // desync framing on the next iteration. The outer
+                // `select!`'s `stream.readable()` arm is the only signal
+                // we trust to fire here, and it only fires once data is
+                // actually available, so blocking until at least one
+                // frame's worth of bytes lands is correct.
+                let cipher = read_framed(&mut stream).await?;
 
                 // Decrypt
                 let mut plain = vec![0u8; 65535];
