@@ -249,8 +249,96 @@ pub async fn init_db(data_dir: &Path) -> Result<SqlitePool> {
     .await
     .context("creating enrollment_tokens table")?;
 
+    // Migration: backfill files.sha256 for any pre-Slice-8 rows that were
+    // written by the legacy (`TransferFileChunk`) push path before sha256
+    // was a required column. Idempotent — only acts on `sha256 = ''` rows
+    // and silently skips rows whose on-disk file is gone (legitimately or
+    // because GC raced).
+    if let Err(e) = backfill_empty_shas(&pool, &data_dir.join("files")).await {
+        tracing::warn!(error = %e, "files.sha256 backfill ran with errors (non-fatal)");
+    }
+
     tracing::info!("Database initialized at {}", db_path.display());
     Ok(pool)
+}
+
+/// Re-hash on-disk content for any `files` row missing its sha256 and
+/// update the column.
+///
+/// Pre-Slice-8 deployments that used the legacy `TransferFileChunk`
+/// eager-push path could end up with `sha256 = ''` rows. The pull-based
+/// flow needs a real sha for cache addressing, so a one-shot scan at
+/// startup walks empty-sha rows, opens the on-disk file, and writes the
+/// computed digest back. Skips rows whose disk file is missing — those
+/// are orphan rows the GC sweep will clean up regardless.
+///
+/// Streams the file (no whole-file allocation) so a multi-GiB hash dump
+/// doesn't OOM init.
+async fn backfill_empty_shas(pool: &SqlitePool, files_dir: &Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt as _;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, filename FROM files WHERE sha256 = '' AND gc_state = 'active'",
+    )
+    .fetch_all(pool)
+    .await
+    .context("scanning files for empty sha")?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(count = rows.len(), "backfilling sha256 for legacy file rows");
+
+    let mut backfilled = 0usize;
+    let mut skipped = 0usize;
+    for (file_id, filename) in rows {
+        let path = match crate::storage::files::locate_existing(files_dir, &file_id) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(%file_id, %filename, "backfill: disk file missing, skipping row");
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(%file_id, error = %e, "backfill: open failed, skipping");
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let sha_hex = loop {
+            match file.read(&mut buf).await {
+                Ok(0) => break format!("{:x}", hasher.finalize()),
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) => {
+                    tracing::warn!(%file_id, error = %e, "backfill: read failed, skipping");
+                    skipped += 1;
+                    break String::new();
+                }
+            }
+        };
+        if sha_hex.is_empty() {
+            continue;
+        }
+
+        sqlx::query("UPDATE files SET sha256 = ?1 WHERE id = ?2 AND sha256 = ''")
+            .bind(&sha_hex)
+            .bind(&file_id)
+            .execute(pool)
+            .await
+            .with_context(|| format!("backfill UPDATE for {file_id}"))?;
+        backfilled += 1;
+    }
+
+    tracing::info!(backfilled, skipped, "files.sha256 backfill complete");
+    Ok(())
 }
 
 // ── Helper: parse DateTime from ISO 8601 string ──
@@ -3192,6 +3280,99 @@ mod tests {
         // Worker not flipped.
         let task_after = get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(task_after.next_skip, 123, "cursor must remain at competing value");
+    }
+
+    /// Scratch directory cleaned up on drop; backfill tests need real files
+    /// on disk to read.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("crack-coord-backfill-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Sha256 of a known string for assertions below.
+    fn sha_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[tokio::test]
+    async fn backfill_fills_empty_shas_from_disk() {
+        let pool = mem_pool().await;
+        let dir = TempDir::new();
+        let files_dir = dir.path.clone();
+
+        // Seed a legacy row with an empty sha and a matching file on disk.
+        let payload = b"legacy file content";
+        std::fs::write(files_dir.join("legacy-1"), payload).unwrap();
+        let mut rec = sample_file_record("legacy-1", "", Utc::now());
+        rec.disk_path = files_dir.join("legacy-1").to_string_lossy().to_string();
+        insert_file_record(&pool, &rec).await.unwrap();
+
+        backfill_empty_shas(&pool, &files_dir).await.unwrap();
+
+        let row: String = sqlx::query_scalar("SELECT sha256 FROM files WHERE id = 'legacy-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, sha_hex(payload));
+    }
+
+    #[tokio::test]
+    async fn backfill_skips_rows_with_missing_disk_files() {
+        let pool = mem_pool().await;
+        let dir = TempDir::new();
+
+        // Row exists with empty sha; file is intentionally not on disk.
+        let mut rec = sample_file_record("orphan-1", "", Utc::now());
+        rec.disk_path = dir.path.join("orphan-1").to_string_lossy().to_string();
+        insert_file_record(&pool, &rec).await.unwrap();
+
+        backfill_empty_shas(&pool, &dir.path).await.unwrap();
+
+        // Row's sha stays empty — backfill skipped, no panic, no UPDATE.
+        let row: String = sqlx::query_scalar("SELECT sha256 FROM files WHERE id = 'orphan-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, "");
+    }
+
+    #[tokio::test]
+    async fn backfill_is_idempotent_on_already_filled_rows() {
+        let pool = mem_pool().await;
+        let dir = TempDir::new();
+
+        // A row with a valid sha must not be re-hashed (the WHERE clause
+        // filters it out). Sanity-check that the second backfill run is a
+        // no-op even after the first one filled its empty siblings.
+        let payload = b"xyz";
+        std::fs::write(dir.path.join("filled"), payload).unwrap();
+        let mut rec = sample_file_record("filled", &sha_hex(payload), Utc::now());
+        rec.disk_path = dir.path.join("filled").to_string_lossy().to_string();
+        insert_file_record(&pool, &rec).await.unwrap();
+
+        // Two passes — neither should error or change the row.
+        backfill_empty_shas(&pool, &dir.path).await.unwrap();
+        backfill_empty_shas(&pool, &dir.path).await.unwrap();
+
+        let row: String = sqlx::query_scalar("SELECT sha256 FROM files WHERE id = 'filled'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, sha_hex(payload));
     }
 
     #[tokio::test]

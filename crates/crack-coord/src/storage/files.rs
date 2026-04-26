@@ -242,7 +242,7 @@ pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(Strin
 /// can't write filenames outside `<uuid>.[A-Za-z0-9]{1,16}`), but it is
 /// still O(files_count) per call and a clean candidate for retirement
 /// once the upload path stores the full disk path in DB.
-fn locate_existing(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
+pub(crate) fn locate_existing(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
     let exact = files_dir.join(file_id);
     if exact.is_file() {
         return Ok(exact);
