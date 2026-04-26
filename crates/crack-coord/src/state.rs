@@ -41,6 +41,13 @@ pub struct AppState {
     /// `crate::audit::run_audit_flusher`, which batches inserts every
     /// ~500ms or 64 events. Use [`Self::emit_audit`] to send.
     pub audit_tx: mpsc::Sender<AuditEntry>,
+
+    /// `(worker_id, hash_mode) → speed (h/s)` cache, populated by
+    /// `record_benchmark` on every BenchmarkResult and on first read-through
+    /// from `worker_benchmarks`. Avoids hitting SQLite for the speed lookup
+    /// on every chunk dispatch — the assigner reads this on the hot path
+    /// per worker per chunk.
+    pub benchmark_cache: RwLock<HashMap<(String, u32), u64>>,
 }
 
 #[allow(dead_code)]
@@ -122,6 +129,7 @@ impl AppState {
             preparing_tasks: RwLock::new(HashSet::new()),
             events,
             audit_tx,
+            benchmark_cache: RwLock::new(HashMap::new()),
         });
         (state, audit_rx)
     }
@@ -163,6 +171,51 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Read-through cache for the worker speed used in chunk-size sizing.
+    ///
+    /// Returns `Ok(None)` when the worker has never reported a benchmark
+    /// for this hash mode. The cache is populated on first hit so subsequent
+    /// dispatches skip the SELECT.
+    pub async fn get_worker_speed(
+        &self,
+        worker_id: &str,
+        hash_mode: u32,
+    ) -> anyhow::Result<Option<u64>> {
+        if let Some(&speed) = self
+            .benchmark_cache
+            .read()
+            .await
+            .get(&(worker_id.to_string(), hash_mode))
+        {
+            return Ok(Some(speed));
+        }
+        match crate::storage::db::get_benchmark(&self.db, worker_id, hash_mode).await? {
+            Some(b) => {
+                self.benchmark_cache
+                    .write()
+                    .await
+                    .insert((worker_id.to_string(), hash_mode), b.speed);
+                Ok(Some(b.speed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a freshly-reported benchmark and update the cache.
+    pub async fn record_benchmark(
+        &self,
+        worker_id: &str,
+        hash_mode: u32,
+        speed: u64,
+    ) -> anyhow::Result<()> {
+        crate::storage::db::upsert_benchmark(&self.db, worker_id, hash_mode, speed).await?;
+        self.benchmark_cache
+            .write()
+            .await
+            .insert((worker_id.to_string(), hash_mode), speed);
+        Ok(())
     }
 
     /// Get the files storage directory.

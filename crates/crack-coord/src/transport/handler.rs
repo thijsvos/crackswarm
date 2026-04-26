@@ -524,7 +524,7 @@ async fn handle_worker_message(
 
         WorkerMessage::BenchmarkResult { hash_mode, speed } => {
             if let Some(wid) = worker_id.as_deref() {
-                db::upsert_benchmark(&state.db, wid, *hash_mode, *speed).await?;
+                state.record_benchmark(wid, *hash_mode, *speed).await?;
 
                 // If the worker was idle, try to give it work now.
                 try_assign_work(state, wid, outbound_tx, transferred_files).await?;

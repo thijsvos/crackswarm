@@ -69,9 +69,8 @@ pub async fn assign_next_chunk(
         }
 
         // Look up the worker's benchmark for this hash mode (if any).
-        let worker_speed = db::get_benchmark(&state.db, worker_id, task.hash_mode)
-            .await?
-            .map(|b| b.speed);
+        // Cached in AppState — first miss reads from DB and populates.
+        let worker_speed = state.get_worker_speed(worker_id, task.hash_mode).await?;
 
         // Count connected workers for chunk-sizing heuristic.
         let num_workers = state.worker_connections.read().await.len();
