@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use crack_common::auth::Keypair;
@@ -14,6 +15,22 @@ use uuid::Uuid;
 /// Sized to absorb a reconnect storm (every connect emits an audit event)
 /// without blocking the producer; events drop with a `warn!` past this.
 const AUDIT_CHANNEL_CAPACITY: usize = 4096;
+
+/// How long an active-sha snapshot is reused before re-querying.
+/// 30s gives the heartbeat path a stable view across the typical 15s
+/// heartbeat cadence: the first heartbeat in a window rebuilds, the next
+/// few read from cache. Bounded staleness is acceptable here — at worst
+/// drift correction either sends an unnecessary `EvictFile` (the agent's
+/// `evict` is idempotent) or misses one for 30s (next heartbeat catches
+/// it).
+const ACTIVE_SHAS_TTL: Duration = Duration::from_secs(30);
+
+/// Cached snapshot of every sha256 currently considered "live"
+/// (`gc_state = 'active'` in the `files` table). See [`AppState::get_active_shas`].
+struct ActiveShasCache {
+    snapshot: Arc<HashSet<String>>,
+    loaded_at: Instant,
+}
 
 /// Shared application state accessible from REST API, transport handler, scheduler, and TUI.
 pub struct AppState {
@@ -48,6 +65,11 @@ pub struct AppState {
     /// on every chunk dispatch — the assigner reads this on the hot path
     /// per worker per chunk.
     pub benchmark_cache: RwLock<HashMap<(String, u32), u64>>,
+
+    /// TTL-cached snapshot of the active-sha set. Invalidates passively after
+    /// [`ACTIVE_SHAS_TTL`]; see [`Self::get_active_shas`] for the exact
+    /// staleness contract. `None` until the first read repopulates.
+    active_shas: RwLock<Option<ActiveShasCache>>,
 }
 
 #[allow(dead_code)]
@@ -130,6 +152,7 @@ impl AppState {
             events,
             audit_tx,
             benchmark_cache: RwLock::new(HashMap::new()),
+            active_shas: RwLock::new(None),
         });
         (state, audit_rx)
     }
@@ -216,6 +239,41 @@ impl AppState {
             .await
             .insert((worker_id.to_string(), hash_mode), speed);
         Ok(())
+    }
+
+    /// Snapshot of every sha256 with `gc_state = 'active'` in `files`.
+    ///
+    /// Cached for [`ACTIVE_SHAS_TTL`]; the heartbeat handler hits this on
+    /// every drift-correction tick (per worker, every 15s) and the
+    /// register handler hits it on every connect. Without the cache that
+    /// was N × `SELECT DISTINCT sha256 FROM files` round-trips per 30s
+    /// window; with it, ~1.
+    ///
+    /// Returned `Arc` is a snapshot — callers can iterate without holding
+    /// any lock past this call.
+    pub async fn get_active_shas(&self) -> anyhow::Result<Arc<HashSet<String>>> {
+        // Fast path: read lock + freshness check.
+        if let Some(cache) = self.active_shas.read().await.as_ref() {
+            if cache.loaded_at.elapsed() < ACTIVE_SHAS_TTL {
+                return Ok(cache.snapshot.clone());
+            }
+        }
+
+        // Stale or empty: rebuild under write lock, re-checking in case
+        // another caller raced us to the rebuild.
+        let mut wguard = self.active_shas.write().await;
+        if let Some(cache) = wguard.as_ref() {
+            if cache.loaded_at.elapsed() < ACTIVE_SHAS_TTL {
+                return Ok(cache.snapshot.clone());
+            }
+        }
+        let list = crate::storage::db::list_active_file_shas(&self.db).await?;
+        let snap: Arc<HashSet<String>> = Arc::new(list.into_iter().collect());
+        *wguard = Some(ActiveShasCache {
+            snapshot: snap.clone(),
+            loaded_at: Instant::now(),
+        });
+        Ok(snap)
     }
 
     /// Get the files storage directory.

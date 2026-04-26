@@ -357,9 +357,8 @@ async fn handle_worker_message(
                 // Same-cycle double-fires (this PR's gc_pass fallback +
                 // heartbeat re-evict) are harmless: agent's `evict` is
                 // idempotent and no-ops a second call.
-                match db::list_active_file_shas(&state.db).await {
+                match state.get_active_shas().await {
                     Ok(active) => {
-                        let active: std::collections::HashSet<_> = active.into_iter().collect();
                         for entry in cache_manifest {
                             if !active.contains(&entry.sha256) {
                                 let _ = outbound_tx
@@ -807,8 +806,9 @@ async fn handle_register(
     // list gets evicted (deferred if currently in use). Catches missed
     // EvictFile messages from prior sessions and any drift while the
     // agent was disconnected.
-    match db::list_active_file_shas(&state.db).await {
-        Ok(expected) => {
+    match state.get_active_shas().await {
+        Ok(active) => {
+            let expected: Vec<String> = active.iter().cloned().collect();
             let count = expected.len();
             if let Err(e) = outbound_tx
                 .send(CoordMessage::CacheReconcile { expected })
