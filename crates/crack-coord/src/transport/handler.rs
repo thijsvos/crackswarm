@@ -183,6 +183,16 @@ async fn run_connection(
     // We track the worker_id once the Register message arrives.
     let mut worker_id: Option<String> = None;
 
+    // Per-connection sha allow-list (C11). A worker may only fetch files
+    // we've explicitly named to it via `AssignChunk`. Without this an
+    // authorized worker for campaign A could enumerate campaign B's
+    // files by guessing or copying their sha256s. Populated as
+    // `AssignChunk` messages flow out; checked on every
+    // `RequestFileRange`. The list grows monotonically for the
+    // connection's lifetime; reconnect resets it.
+    let mut assigned_shas: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     // Reusable buffers.
     let mut read_buf = vec![0u8; 65535];
     let mut write_buf = vec![0u8; 65535];
@@ -224,6 +234,7 @@ async fn run_connection(
                     &pubkey_b64,
                     peer_addr,
                     &mut worker_id,
+                    &assigned_shas,
                 ).await {
                     error!(%peer_addr, error = %e, "error handling worker message");
                 }
@@ -231,6 +242,30 @@ async fn run_connection(
 
             // ── Outbound: send encrypted message to TCP ─────────────
             Some(coord_msg) = outbound_rx.recv() => {
+                // Sha allow-list maintenance (C11): record every file we
+                // name in an outbound `AssignChunk`. The agent is allowed
+                // to `RequestFileRange` only for shas it appears in this
+                // set.
+                if let CoordMessage::AssignChunk {
+                    hash_file_sha256,
+                    attack,
+                    ..
+                } = &coord_msg
+                {
+                    assigned_shas.insert(hash_file_sha256.clone());
+                    if let AssignChunkAttack::DictionaryByHash {
+                        wordlist_sha256,
+                        rules_sha256,
+                        ..
+                    } = attack
+                    {
+                        assigned_shas.insert(wordlist_sha256.clone());
+                        if let Some(rs) = rules_sha256 {
+                            assigned_shas.insert(rs.clone());
+                        }
+                    }
+                }
+
                 let json = match serde_json::to_vec(&coord_msg) {
                     Ok(j) => j,
                     Err(e) => {
@@ -307,6 +342,7 @@ async fn handle_worker_message(
     pubkey_b64: &str,
     peer_addr: SocketAddr,
     worker_id: &mut Option<String>,
+    assigned_shas: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     match msg {
         WorkerMessage::Register {
@@ -557,6 +593,26 @@ async fn handle_worker_message(
             offset,
             length,
         } => {
+            // Per-session sha allow-list (C11). The worker can only ask
+            // for files we've explicitly named to it via `AssignChunk`.
+            // Reject otherwise — surfaces both lateral-movement attempts
+            // (worker A poking at worker B's wordlist) and confused-state
+            // pulls after a state mismatch.
+            if !assigned_shas.contains(hash) {
+                let wid = worker_id.as_deref().unwrap_or("unauthenticated");
+                warn!(
+                    worker_id = %wid,
+                    %hash,
+                    "rejecting RequestFileRange: sha not in this session's allow-list"
+                );
+                let _ = outbound_tx
+                    .send(CoordMessage::FileError {
+                        hash: hash.clone(),
+                        reason: "not authorized for this file in this session".to_string(),
+                    })
+                    .await;
+                return Ok(());
+            }
             handle_request_file_range(state, outbound_tx, hash, *offset, *length).await?;
             Ok(())
         }
