@@ -480,8 +480,116 @@ fn row_to_file_record(row: &sqlx::sqlite::SqliteRow) -> Result<FileRecord> {
     })
 }
 
+// ── Generic lifecycle-status update ─────────────────────────────────────────
+//
+// Tasks / chunks / campaigns / phases all share the same "set status, plus
+// stamp started_at on first transition into Running, plus stamp
+// completed_at on first transition into a terminal state, plus run any
+// side effects" shape. The trait + helper here collapse the four
+// previously-parallel `update_X_status` functions to a single SQL
+// dispatcher; per-entity wrappers keep the side effects (file-ref
+// release, GC enqueue) since those differ per entity.
+
+/// State-machine classifier for `update_*_status`. The DB-side shape is:
+/// - `is_running()` → also stamp `started_at` (preserved if already set)
+/// - `is_terminal()` → also stamp `completed_at`
+/// - neither → status-only UPDATE
+trait LifecycleStatus: ToString {
+    fn is_running(&self) -> bool;
+    fn is_terminal(&self) -> bool;
+}
+
+impl LifecycleStatus for TaskStatus {
+    fn is_running(&self) -> bool {
+        matches!(self, TaskStatus::Running)
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
+}
+
+impl LifecycleStatus for ChunkStatus {
+    // `chunks` has no `started_at` column; a chunk's start is recorded
+    // as `assigned_at` at dispatch time.
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed
+        )
+    }
+}
+
+impl LifecycleStatus for CampaignStatus {
+    fn is_running(&self) -> bool {
+        matches!(self, CampaignStatus::Running)
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            CampaignStatus::Completed | CampaignStatus::Failed | CampaignStatus::Cancelled
+        )
+    }
+}
+
+impl LifecycleStatus for PhaseStatus {
+    fn is_running(&self) -> bool {
+        matches!(self, PhaseStatus::Running)
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            PhaseStatus::Completed
+                | PhaseStatus::Exhausted
+                | PhaseStatus::Failed
+                | PhaseStatus::Skipped
+        )
+    }
+}
+
+/// Run the SQL side of an `update_*_status` call. `table` and `id_col`
+/// are static (no SQL injection risk); the status string is bound. The
+/// caller wraps this with whatever per-entity side effects (file-ref
+/// release, GC enqueue) the transition demands — those vary too much
+/// to live inside a generic helper.
+async fn set_lifecycle_status<S: LifecycleStatus>(
+    pool: &SqlitePool,
+    table: &'static str,
+    id_col: &'static str,
+    id: &str,
+    status: &S,
+) -> Result<()> {
+    let now = now_iso();
+    let status_str = status.to_string();
+    let sql = if status.is_running() {
+        format!(
+            "UPDATE {table} SET status = ?1, started_at = COALESCE(started_at, ?2) WHERE {id_col} = ?3"
+        )
+    } else if status.is_terminal() {
+        format!("UPDATE {table} SET status = ?1, completed_at = ?2 WHERE {id_col} = ?3")
+    } else {
+        format!("UPDATE {table} SET status = ?1 WHERE {id_col} = ?2")
+    };
+
+    let q = sqlx::query(&sql).bind(&status_str);
+    let q = if status.is_running() || status.is_terminal() {
+        q.bind(&now).bind(id)
+    } else {
+        q.bind(id)
+    };
+    q.execute(pool)
+        .await
+        .with_context(|| format!("updating {table} status to {status_str}"))?;
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-// Task CRUD
+// Task operations
 // ════════════════════════════════════════════════════════════════════════════
 
 pub async fn create_task(pool: &SqlitePool, req: &CreateTaskRequest) -> Result<Task> {
@@ -594,45 +702,13 @@ pub async fn list_tasks(pool: &SqlitePool) -> Result<Vec<Task>> {
 }
 
 pub async fn update_task_status(pool: &SqlitePool, id: Uuid, status: TaskStatus) -> Result<()> {
-    let now = now_iso();
-    let status_str = status.to_string();
     let id_str = id.to_string();
-
-    match status {
-        TaskStatus::Running => {
-            // Set started_at only if not already set
-            sqlx::query(
-                "UPDATE tasks SET status = ?1, started_at = COALESCE(started_at, ?2) WHERE id = ?3",
-            )
-            .bind(&status_str)
-            .bind(&now)
-            .bind(&id_str)
-            .execute(pool)
-            .await
-            .context("updating task status to running")?;
-        }
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
-            sqlx::query("UPDATE tasks SET status = ?1, completed_at = ?2 WHERE id = ?3")
-                .bind(&status_str)
-                .bind(&now)
-                .bind(&id_str)
-                .execute(pool)
-                .await
-                .context("updating task status to terminal")?;
-            // Release this task's file refs — any now-orphan files get
-            // queued for the GC loop to reclaim on its next pass.
-            release_task_refs_inline(pool, id).await?;
-        }
-        _ => {
-            sqlx::query("UPDATE tasks SET status = ?1 WHERE id = ?2")
-                .bind(&status_str)
-                .bind(&id_str)
-                .execute(pool)
-                .await
-                .context("updating task status")?;
-        }
+    set_lifecycle_status(pool, "tasks", "id", &id_str, &status).await?;
+    if status.is_terminal() {
+        // Release this task's file refs — any now-orphan files get
+        // queued for the GC loop to reclaim on its next pass.
+        release_task_refs_inline(pool, id).await?;
     }
-
     Ok(())
 }
 
@@ -804,30 +880,7 @@ pub async fn get_chunks_for_task(pool: &SqlitePool, task_id: Uuid) -> Result<Vec
 }
 
 pub async fn update_chunk_status(pool: &SqlitePool, id: Uuid, status: ChunkStatus) -> Result<()> {
-    let now = now_iso();
-    let status_str = status.to_string();
-
-    match status {
-        ChunkStatus::Completed | ChunkStatus::Exhausted | ChunkStatus::Failed => {
-            sqlx::query("UPDATE chunks SET status = ?1, completed_at = ?2 WHERE id = ?3")
-                .bind(&status_str)
-                .bind(&now)
-                .bind(id.to_string())
-                .execute(pool)
-                .await
-                .context("updating chunk status (terminal)")?;
-        }
-        _ => {
-            sqlx::query("UPDATE chunks SET status = ?1 WHERE id = ?2")
-                .bind(&status_str)
-                .bind(id.to_string())
-                .execute(pool)
-                .await
-                .context("updating chunk status")?;
-        }
-    }
-
-    Ok(())
+    set_lifecycle_status(pool, "chunks", "id", &id.to_string(), &status).await
 }
 
 pub async fn update_chunk_progress(
@@ -2111,46 +2164,15 @@ pub async fn update_campaign_status(
     id: Uuid,
     status: CampaignStatus,
 ) -> Result<()> {
-    let now = now_iso();
-    let status_str = status.to_string();
     let id_str = id.to_string();
-
-    match status {
-        CampaignStatus::Running => {
-            sqlx::query(
-                "UPDATE campaigns SET status = ?1, started_at = COALESCE(started_at, ?2) WHERE id = ?3",
-            )
-            .bind(&status_str)
-            .bind(&now)
-            .bind(&id_str)
-            .execute(pool)
-            .await
-            .context("updating campaign status to running")?;
-        }
-        CampaignStatus::Completed | CampaignStatus::Failed | CampaignStatus::Cancelled => {
-            sqlx::query("UPDATE campaigns SET status = ?1, completed_at = ?2 WHERE id = ?3")
-                .bind(&status_str)
-                .bind(&now)
-                .bind(&id_str)
-                .execute(pool)
-                .await
-                .context("updating campaign status to terminal")?;
-            // Release campaign-level refs; mark any orphans for GC.
-            let shas = delete_refs_by_ref(pool, "campaign", &id_str).await?;
-            for sha in shas {
-                maybe_mark_orphan_for_gc(pool, &sha).await?;
-            }
-        }
-        _ => {
-            sqlx::query("UPDATE campaigns SET status = ?1 WHERE id = ?2")
-                .bind(&status_str)
-                .bind(&id_str)
-                .execute(pool)
-                .await
-                .context("updating campaign status")?;
+    set_lifecycle_status(pool, "campaigns", "id", &id_str, &status).await?;
+    if status.is_terminal() {
+        // Release campaign-level refs; mark any orphans for GC.
+        let shas = delete_refs_by_ref(pool, "campaign", &id_str).await?;
+        for sha in shas {
+            maybe_mark_orphan_for_gc(pool, &sha).await?;
         }
     }
-
     Ok(())
 }
 
@@ -2297,44 +2319,7 @@ pub async fn get_active_phase(
 }
 
 pub async fn update_phase_status(pool: &SqlitePool, id: Uuid, status: PhaseStatus) -> Result<()> {
-    let now = now_iso();
-    let status_str = status.to_string();
-
-    match status {
-        PhaseStatus::Running => {
-            sqlx::query(
-                "UPDATE campaign_phases SET status = ?1, started_at = COALESCE(started_at, ?2) WHERE id = ?3",
-            )
-            .bind(&status_str)
-            .bind(&now)
-            .bind(id.to_string())
-            .execute(pool)
-            .await
-            .context("updating phase status to running")?;
-        }
-        PhaseStatus::Completed
-        | PhaseStatus::Exhausted
-        | PhaseStatus::Failed
-        | PhaseStatus::Skipped => {
-            sqlx::query("UPDATE campaign_phases SET status = ?1, completed_at = ?2 WHERE id = ?3")
-                .bind(&status_str)
-                .bind(&now)
-                .bind(id.to_string())
-                .execute(pool)
-                .await
-                .context("updating phase status to terminal")?;
-        }
-        _ => {
-            sqlx::query("UPDATE campaign_phases SET status = ?1 WHERE id = ?2")
-                .bind(&status_str)
-                .bind(id.to_string())
-                .execute(pool)
-                .await
-                .context("updating phase status")?;
-        }
-    }
-
-    Ok(())
+    set_lifecycle_status(pool, "campaign_phases", "id", &id.to_string(), &status).await
 }
 
 pub async fn set_phase_task_id(pool: &SqlitePool, phase_id: Uuid, task_id: Uuid) -> Result<()> {
