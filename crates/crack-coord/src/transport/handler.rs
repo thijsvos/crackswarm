@@ -31,15 +31,62 @@ pub async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, peer
 
 // ── Handshake + session ─────────────────────────────────────────────────────
 
+/// Outcome of the pre-loop authentication phase. `Authorized` means the
+/// caller goes straight into the message loop; `Disconnect` means the
+/// per-connection task should clean up and exit (token timeout, decrypt
+/// failure, invalid enroll, unauthorized non-Enroll, etc.).
+enum AuthOutcome {
+    Authorized,
+    Disconnect,
+}
+
+/// Carries the post-handshake Noise transport + the peer's identity.
+/// Returned from `perform_handshake` so each phase has narrow inputs.
+struct HandshakeOutcome {
+    transport: snow::TransportState,
+    pubkey_b64: String,
+    pubkey_fp: String,
+}
+
 async fn run_connection(
     state: &Arc<AppState>,
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    // ── 1. Noise IK handshake (coordinator is responder) ────────────────
+    let HandshakeOutcome {
+        mut transport,
+        pubkey_b64,
+        pubkey_fp,
+    } = perform_handshake(&state.keypair, stream, peer_addr).await?;
 
+    let authorized = db::is_worker_authorized(&state.db, &pubkey_b64)
+        .await
+        .context("failed to check worker authorization")?;
+
+    if !authorized {
+        match await_enrollment_or_reject(state, stream, &mut transport, peer_addr, &pubkey_b64, &pubkey_fp).await? {
+            AuthOutcome::Authorized => {} // fall through to message loop
+            AuthOutcome::Disconnect => return Ok(()),
+        }
+    }
+
+    let worker_id = run_message_loop(state, stream, &mut transport, peer_addr, &pubkey_b64).await?;
+
+    cleanup(state, worker_id.as_deref(), peer_addr).await;
+    Ok(())
+}
+
+/// Run the Noise IK responder side of the handshake on `stream`.
+/// On success, `stream` is in transport mode and the returned
+/// [`HandshakeOutcome`] carries the encrypted transport plus the peer's
+/// authenticated public key (raw + truncated fingerprint for logs).
+async fn perform_handshake(
+    keypair: &crack_common::auth::Keypair,
+    stream: &mut TcpStream,
+    peer_addr: SocketAddr,
+) -> anyhow::Result<HandshakeOutcome> {
     let mut handshake =
-        build_responder(&state.keypair).context("failed to build noise responder")?;
+        build_responder(keypair).context("failed to build noise responder")?;
 
     // Read the initiator's first message (e, es, s, ss).
     let msg1 = read_noise_frame(stream)
@@ -47,11 +94,10 @@ async fn run_connection(
         .context("failed to read handshake message 1")?;
 
     let mut buf = vec![0u8; 65535];
-    let _payload_len = handshake
+    handshake
         .read_message(&msg1, &mut buf)
         .context("noise handshake: failed to process initiator message")?;
 
-    // Extract the client's static public key.
     let remote_static = handshake
         .get_remote_static()
         .context("noise handshake: no remote static key")?
@@ -59,15 +105,8 @@ async fn run_connection(
     let pubkey_b64 = encode_public_key(&remote_static);
     let pubkey_fp = pubkey_fingerprint(&pubkey_b64);
 
-    // Check authorization.
-    let authorized = db::is_worker_authorized(&state.db, &pubkey_b64)
-        .await
-        .context("failed to check worker authorization")?;
-
-    // Always complete the Noise handshake so unauthorized workers can
-    // attempt enrollment over the encrypted channel.
-
-    // Send the responder's reply message (e, ee, se).
+    // Always complete the responder's reply so unauthorized workers can
+    // still attempt enrollment over the encrypted channel.
     let len = handshake
         .write_message(&[], &mut buf)
         .context("noise handshake: failed to write responder message")?;
@@ -75,8 +114,7 @@ async fn run_connection(
         .await
         .context("failed to send handshake message 2")?;
 
-    // Transition to transport mode.
-    let mut transport = handshake
+    let transport = handshake
         .into_transport_mode()
         .context("failed to enter noise transport mode")?;
 
@@ -84,103 +122,123 @@ async fn run_connection(
     // under default umask; the audit_log table keeps the full key.
     info!(%peer_addr, pubkey_fp = %pubkey_fp, "noise handshake complete");
 
-    // If not authorized, wait for an Enroll message (with timeout).
-    if !authorized {
-        info!(%peer_addr, pubkey_fp = %pubkey_fp, "worker not pre-authorized, waiting for enrollment");
+    Ok(HandshakeOutcome {
+        transport,
+        pubkey_b64,
+        pubkey_fp,
+    })
+}
 
-        let enroll_result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), read_noise_frame(stream)).await;
+/// Block for up to 5s reading an `Enroll` message from an unauthorized
+/// peer. Valid nonce + matching name → authorize the worker and return
+/// `Authorized`. Anything else (timeout, decrypt fail, invalid message,
+/// unknown nonce, non-Enroll variant) audits the rejection and returns
+/// `Disconnect`.
+async fn await_enrollment_or_reject(
+    state: &Arc<AppState>,
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    peer_addr: SocketAddr,
+    pubkey_b64: &str,
+    pubkey_fp: &str,
+) -> anyhow::Result<AuthOutcome> {
+    info!(%peer_addr, pubkey_fp = %pubkey_fp, "worker not pre-authorized, waiting for enrollment");
 
-        let ciphertext = match enroll_result {
-            Ok(Ok(ct)) => ct,
-            Ok(Err(e)) => {
-                warn!(%peer_addr, error = %e, "enrollment read error");
-                return Ok(());
-            }
-            Err(_) => {
-                warn!(%peer_addr, pubkey_fp = %pubkey_fp, "enrollment timeout, disconnecting");
-                state.emit_audit(
-                    "auth_rejected",
-                    &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
-                    Some(&peer_addr.to_string()),
-                    None,
-                );
-                return Ok(());
-            }
-        };
+    let enroll_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_noise_frame(stream)).await;
 
-        // Decrypt the message
-        let mut enroll_buf = vec![0u8; 65535];
-        let plaintext_len = match transport.read_message(&ciphertext, &mut enroll_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(%peer_addr, error = %e, "enrollment decrypt failed");
-                return Ok(());
-            }
-        };
+    let ciphertext = match enroll_result {
+        Ok(Ok(ct)) => ct,
+        Ok(Err(e)) => {
+            warn!(%peer_addr, error = %e, "enrollment read error");
+            return Ok(AuthOutcome::Disconnect);
+        }
+        Err(_) => {
+            warn!(%peer_addr, pubkey_fp = %pubkey_fp, "enrollment timeout, disconnecting");
+            state.emit_audit(
+                "auth_rejected",
+                &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
+                Some(&peer_addr.to_string()),
+                None,
+            );
+            return Ok(AuthOutcome::Disconnect);
+        }
+    };
 
-        let msg: WorkerMessage = match serde_json::from_slice(&enroll_buf[..plaintext_len]) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(%peer_addr, error = %e, "invalid enrollment message");
-                return Ok(());
-            }
-        };
+    let mut enroll_buf = vec![0u8; 65535];
+    let plaintext_len = match transport.read_message(&ciphertext, &mut enroll_buf) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(%peer_addr, error = %e, "enrollment decrypt failed");
+            return Ok(AuthOutcome::Disconnect);
+        }
+    };
 
-        match msg {
-            WorkerMessage::Enroll { nonce, worker_name } => {
-                info!(%peer_addr, %worker_name, "received enrollment request");
+    let msg: WorkerMessage = match serde_json::from_slice(&enroll_buf[..plaintext_len]) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(%peer_addr, error = %e, "invalid enrollment message");
+            return Ok(AuthOutcome::Disconnect);
+        }
+    };
 
-                // Validate the nonce
-                let valid_name = db::validate_enrollment_nonce(&state.db, &nonce).await?;
-                match valid_name {
-                    Some(token_name) => {
-                        // Mark nonce as used, authorize the worker
-                        db::mark_nonce_used(&state.db, &nonce, &pubkey_b64).await?;
-                        db::authorize_worker(&state.db, &pubkey_b64, &token_name).await?;
+    match msg {
+        WorkerMessage::Enroll { nonce, worker_name } => {
+            info!(%peer_addr, %worker_name, "received enrollment request");
 
-                        state.emit_audit(
-                            "worker_enrolled",
-                            &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
-                            Some(&peer_addr.to_string()),
-                            None,
-                        );
+            let valid_name = db::validate_enrollment_nonce(&state.db, &nonce).await?;
+            match valid_name {
+                Some(token_name) => {
+                    db::mark_nonce_used(&state.db, &nonce, pubkey_b64).await?;
+                    db::authorize_worker(&state.db, pubkey_b64, &token_name).await?;
 
-                        info!(%peer_addr, name = %token_name, "worker enrolled successfully via token");
-                        // Fall through to the normal message loop
-                    }
-                    None => {
-                        warn!(%peer_addr, "invalid or expired enrollment nonce");
-                        state.emit_audit(
-                            "enroll_rejected",
-                            &format!(
-                                "Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"
-                            ),
-                            Some(&peer_addr.to_string()),
-                            None,
-                        );
-                        return Ok(());
-                    }
+                    state.emit_audit(
+                        "worker_enrolled",
+                        &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
+                        Some(&peer_addr.to_string()),
+                        None,
+                    );
+
+                    info!(%peer_addr, name = %token_name, "worker enrolled successfully via token");
+                    Ok(AuthOutcome::Authorized)
+                }
+                None => {
+                    warn!(%peer_addr, "invalid or expired enrollment nonce");
+                    state.emit_audit(
+                        "enroll_rejected",
+                        &format!("Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"),
+                        Some(&peer_addr.to_string()),
+                        None,
+                    );
+                    Ok(AuthOutcome::Disconnect)
                 }
             }
-            _ => {
-                warn!(%peer_addr, pubkey_fp = %pubkey_fp, "unauthorized worker sent non-Enroll message, disconnecting");
-                state.emit_audit(
-                    "auth_rejected",
-                    &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
-                    Some(&peer_addr.to_string()),
-                    None,
-                );
-                return Ok(());
-            }
+        }
+        _ => {
+            warn!(%peer_addr, pubkey_fp = %pubkey_fp, "unauthorized worker sent non-Enroll message, disconnecting");
+            state.emit_audit(
+                "auth_rejected",
+                &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
+                Some(&peer_addr.to_string()),
+                None,
+            );
+            Ok(AuthOutcome::Disconnect)
         }
     }
+}
 
-    // ── 2. Message loop ─────────────────────────────────────────────────
-
+/// Drive the encrypted message loop until the peer disconnects or a
+/// transport-level error pops. Returns the worker's id once it has
+/// `Register`'d, so the caller can pass it to `cleanup`.
+async fn run_message_loop(
+    state: &Arc<AppState>,
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    peer_addr: SocketAddr,
+    pubkey_b64: &str,
+) -> anyhow::Result<Option<String>> {
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<CoordMessage>(64);
 
-    // We track the worker_id once the Register message arrives.
     let mut worker_id: Option<String> = None;
 
     // Per-connection sha allow-list (C11). A worker may only fetch files
@@ -231,7 +289,7 @@ async fn run_connection(
                     state,
                     &msg,
                     &outbound_tx,
-                    &pubkey_b64,
+                    pubkey_b64,
                     peer_addr,
                     &mut worker_id,
                     &assigned_shas,
@@ -299,11 +357,7 @@ async fn run_connection(
         }
     }
 
-    // ── 3. Cleanup on disconnect ────────────────────────────────────────
-
-    cleanup(state, worker_id.as_deref(), peer_addr).await;
-
-    Ok(())
+    Ok(worker_id)
 }
 
 // ── Wire framing ────────────────────────────────────────────────────────────
