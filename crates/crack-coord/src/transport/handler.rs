@@ -872,17 +872,16 @@ pub(crate) async fn build_assign_chunk_msg(
         }
     };
 
-    // Read the hash file and base64-encode it for transfer over the Noise channel.
-    let file_data = files::read_file(&state.files_dir(), &task.hash_file_id)
-        .context("reading hash file for chunk assignment")?;
-    let hash_file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_data);
+    // Hash file is content-addressed exactly like wordlists/rules — the
+    // agent pulls it via `RequestFileRange`/`FileRange` on cache miss.
+    let (hash_file_sha256, hash_file_size) = file_ref(&state.db, &task.hash_file_id).await?;
 
     Ok(CoordMessage::AssignChunk {
         chunk_id: chunk.id,
         task_id: chunk.task_id,
         hash_mode: task.hash_mode,
-        hash_file_b64,
-        hash_file_id: task.hash_file_id.clone(),
+        hash_file_sha256,
+        hash_file_size,
         skip: chunk.skip,
         limit: chunk.limit,
         attack,

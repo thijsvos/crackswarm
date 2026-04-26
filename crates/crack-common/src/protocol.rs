@@ -46,19 +46,21 @@ pub enum CoordMessage {
     /// drift accumulated while the agent was disconnected. Eviction
     /// defers as usual when a sha is in use by a running chunk.
     CacheReconcile { expected: Vec<String> },
-    /// Dispatch a single chunk of work to the worker. The agent runs
-    /// hashcat against the supplied (eagerly inlined) hash file with the
-    /// attack-specific parameters in `attack`. `skip`/`limit` are passed
-    /// through to hashcat as restore points; `extra_args` is appended
-    /// verbatim. Only one chunk runs at a time per agent — additional
-    /// assignments queue locally.
+    /// Dispatch a single chunk of work to the worker. Every referenced
+    /// file (hash file, wordlist, rules) is identified by sha256 — the
+    /// agent looks them up in its content-addressed cache and pulls on
+    /// miss via `RequestFileRange`/`FileRange`. `skip`/`limit` are
+    /// passed through to hashcat as restore points; `extra_args` is
+    /// appended verbatim. Only one chunk runs at a time per agent —
+    /// additional assignments queue locally.
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
         hash_mode: u32,
-        /// Hash file content (base64-encoded) sent over the encrypted channel.
-        hash_file_b64: String,
-        hash_file_id: String,
+        /// sha256 of the hash file. The agent fetches it via the
+        /// content cache exactly like wordlists/rules — see `attack`.
+        hash_file_sha256: String,
+        hash_file_size: u64,
         skip: u64,
         limit: u64,
         attack: AssignChunkAttack,
@@ -317,8 +319,8 @@ mod tests {
             chunk_id,
             task_id,
             hash_mode: 1000,
-            hash_file_b64: "aGFzaGVz".to_string(),
-            hash_file_id: "hf-001".to_string(),
+            hash_file_sha256: "deadbeef".to_string(),
+            hash_file_size: 1024,
             skip: 0,
             limit: 50000,
             attack: AssignChunkAttack::BruteForce {
@@ -335,8 +337,8 @@ mod tests {
                 chunk_id: cid,
                 task_id: tid,
                 hash_mode,
-                hash_file_b64,
-                hash_file_id,
+                hash_file_sha256,
+                hash_file_size,
                 skip,
                 limit,
                 attack,
@@ -345,8 +347,8 @@ mod tests {
                 assert_eq!(cid, chunk_id);
                 assert_eq!(tid, task_id);
                 assert_eq!(hash_mode, 1000);
-                assert_eq!(hash_file_b64, "aGFzaGVz");
-                assert_eq!(hash_file_id, "hf-001");
+                assert_eq!(hash_file_sha256, "deadbeef");
+                assert_eq!(hash_file_size, 1024);
                 assert_eq!(skip, 0);
                 assert_eq!(limit, 50000);
                 match attack {
@@ -776,8 +778,8 @@ mod tests {
             chunk_id,
             task_id,
             hash_mode: 0,
-            hash_file_b64: "aGY=".to_string(),
-            hash_file_id: "hf-099".to_string(),
+            hash_file_sha256: "cafebabe".to_string(),
+            hash_file_size: 42,
             skip: 0,
             limit: 12345,
             attack: AssignChunkAttack::DictionaryByHash {

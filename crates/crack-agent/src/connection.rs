@@ -8,12 +8,10 @@
 //! results back via mpsc channels the main loop polls.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use base64::Engine;
 use crack_common::auth::{self, Keypair};
 use crack_common::protocol::{CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -529,8 +527,8 @@ async fn connect_and_run(
                         chunk_id,
                         task_id,
                         hash_mode,
-                        hash_file_b64,
-                        hash_file_id,
+                        hash_file_sha256,
+                        hash_file_size,
                         skip,
                         limit,
                         attack,
@@ -562,219 +560,197 @@ async fn connect_and_run(
                             },
                         );
 
-                        // Decode hash file from the message and cache locally
-                        let hash_file_path =
-                            save_hash_file(config, &hash_file_id, &hash_file_b64).await?;
-
                         let outfile_path = config.cache_dir().join(format!("out_{chunk_id}.txt"));
 
-                        // DictionaryByHash needs async file resolution via the
-                        // content cache — that can't run on the main loop (it
-                        // has to send RequestFileRange and consume FileRange
-                        // responses from this very loop). Spawn a task that
-                        // resolves paths and hands the ready chunk back via
-                        // ready_tx.
+                        // Pre-flight budget check covering hash file + any
+                        // attack-specific files. Each `has` call is async
+                        // against the content cache; sum every miss.
+                        let mut needed: u64 = 0;
+                        if !content_cache.has(&hash_file_sha256, hash_file_size).await {
+                            needed = needed.saturating_add(hash_file_size);
+                        }
                         if let AssignChunkAttack::DictionaryByHash {
                             wordlist_sha256,
                             wordlist_size,
                             rules_sha256,
                             rules_size,
-                        } = attack
+                        } = &attack
                         {
-                            // Pre-flight budget check: how much new disk
-                            // does this chunk need, and is the cache going
-                            // to accommodate it after LRU eviction?
-                            let mut needed: u64 = 0;
-                            if !content_cache.has(&wordlist_sha256, wordlist_size).await {
-                                needed = needed.saturating_add(wordlist_size);
+                            if !content_cache.has(wordlist_sha256, *wordlist_size).await {
+                                needed = needed.saturating_add(*wordlist_size);
                             }
-                            if let Some(ref rs) = rules_sha256 {
+                            if let Some(rs) = rules_sha256.as_deref() {
                                 let rz = rules_size.unwrap_or(0);
                                 if !content_cache.has(rs, rz).await {
                                     needed = needed.saturating_add(rz);
                                 }
                             }
+                        }
 
-                            if needed > content_cache.cache_max_bytes() {
+                        if needed > content_cache.cache_max_bytes() {
+                            warn!(
+                                %chunk_id,
+                                needed,
+                                budget = content_cache.cache_max_bytes(),
+                                "PullFailed: requested file exceeds cache budget"
+                            );
+                            let _ = outbound_tx
+                                .send(WorkerMessage::PullFailed {
+                                    chunk_id,
+                                    hash: hash_file_sha256.clone(),
+                                    reason: "files exceed cache budget".to_string(),
+                                })
+                                .await;
+                            continue;
+                        }
+                        if needed > 0 {
+                            let headroom = evict_lru_for_budget(
+                                &content_cache,
+                                needed,
+                                &running_chunks_using,
+                            )
+                            .await;
+                            if headroom < needed {
                                 warn!(
                                     %chunk_id,
                                     needed,
-                                    budget = content_cache.cache_max_bytes(),
-                                    "PullFailed: requested file exceeds cache budget"
+                                    headroom,
+                                    "PullFailed: insufficient disk after LRU eviction"
                                 );
                                 let _ = outbound_tx
                                     .send(WorkerMessage::PullFailed {
                                         chunk_id,
-                                        hash: wordlist_sha256.clone(),
-                                        reason: "file size exceeds cache budget".to_string(),
+                                        hash: hash_file_sha256.clone(),
+                                        reason: "insufficient disk after LRU eviction".to_string(),
                                     })
                                     .await;
                                 continue;
                             }
+                        }
 
-                            if needed > 0 {
-                                let headroom = evict_lru_for_budget(
-                                    &content_cache,
-                                    needed,
-                                    &running_chunks_using,
-                                )
-                                .await;
-                                if headroom < needed {
-                                    warn!(
-                                        %chunk_id,
-                                        needed,
-                                        headroom,
-                                        "PullFailed: insufficient disk after LRU eviction"
-                                    );
-                                    let _ = outbound_tx
-                                        .send(WorkerMessage::PullFailed {
+                        // Resolve every cache file off the main loop — the
+                        // pull dialog round-trips through this very loop, so
+                        // doing it here would deadlock. The spawned task
+                        // hands the ready chunk back via ready_tx.
+                        let cache = content_cache.clone();
+                        let outbound = outbound_tx.clone();
+                        let ready = ready_tx.clone();
+                        let hashcat_path = config.hashcat_path.clone();
+                        tokio::spawn(async move {
+                            let mut cache_holds: Vec<String> = Vec::new();
+
+                            let hash_file_path = match cache
+                                .ensure(&hash_file_sha256, hash_file_size, &outbound)
+                                .await
+                            {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    error!(%chunk_id, error = %e, "failed to fetch hash file");
+                                    let _ = outbound
+                                        .send(WorkerMessage::ChunkFailed {
                                             chunk_id,
-                                            hash: wordlist_sha256.clone(),
-                                            reason: "insufficient disk after LRU eviction"
-                                                .to_string(),
+                                            error: format!("fetch hash file: {e}"),
+                                            exit_code: None,
                                         })
                                         .await;
-                                    continue;
+                                    return;
                                 }
-                            }
+                            };
+                            cache_holds.push(hash_file_sha256);
 
-                            let cache = content_cache.clone();
-                            let outbound = outbound_tx.clone();
-                            let ready = ready_tx.clone();
-                            let hashcat_path = config.hashcat_path.clone();
-                            tokio::spawn(async move {
-                                let mut cache_holds: Vec<String> = Vec::new();
-                                let wordlist_path = match cache
-                                    .ensure(&wordlist_sha256, wordlist_size, &outbound)
-                                    .await
-                                {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        error!(
-                                            %chunk_id,
-                                            error = %e,
-                                            "failed to fetch wordlist for DictionaryByHash"
-                                        );
-                                        let _ = outbound
-                                            .send(WorkerMessage::ChunkFailed {
-                                                chunk_id,
-                                                error: format!("fetch wordlist: {e}"),
-                                                exit_code: None,
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                };
-                                cache_holds.push(wordlist_sha256.clone());
-
-                                let rules_path = match rules_sha256.clone() {
-                                    Some(rs) => {
-                                        let rz = rules_size.unwrap_or(0);
-                                        match cache.ensure(&rs, rz, &outbound).await {
-                                            Ok(p) => {
-                                                cache_holds.push(rs);
-                                                Some(p)
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    %chunk_id,
-                                                    error = %e,
-                                                    "failed to fetch rules for DictionaryByHash"
-                                                );
-                                                let _ = outbound
-                                                    .send(WorkerMessage::ChunkFailed {
-                                                        chunk_id,
-                                                        error: format!("fetch rules: {e}"),
-                                                        exit_code: None,
-                                                    })
-                                                    .await;
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    None => None,
-                                };
-
-                                let run_config = HashcatRunConfig {
+                            let run_config = match attack {
+                                AssignChunkAttack::BruteForce {
+                                    mask,
+                                    custom_charsets,
+                                } => HashcatRunConfig {
                                     hashcat_path,
                                     hash_file_path,
                                     hash_mode,
-                                    attack_mode: 0,
-                                    mask: None,
+                                    attack_mode: 3,
+                                    mask: Some(mask),
                                     skip,
                                     limit,
-                                    custom_charsets: None,
-                                    wordlist_path: Some(wordlist_path),
-                                    rules_path,
+                                    custom_charsets,
+                                    wordlist_path: None,
+                                    rules_path: None,
                                     extra_args,
                                     outfile_path,
-                                };
+                                },
+                                AssignChunkAttack::DictionaryByHash {
+                                    wordlist_sha256,
+                                    wordlist_size,
+                                    rules_sha256,
+                                    rules_size,
+                                } => {
+                                    let wordlist_path = match cache
+                                        .ensure(&wordlist_sha256, wordlist_size, &outbound)
+                                        .await
+                                    {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            error!(%chunk_id, error = %e, "failed to fetch wordlist");
+                                            let _ = outbound
+                                                .send(WorkerMessage::ChunkFailed {
+                                                    chunk_id,
+                                                    error: format!("fetch wordlist: {e}"),
+                                                    exit_code: None,
+                                                })
+                                                .await;
+                                            return;
+                                        }
+                                    };
+                                    cache_holds.push(wordlist_sha256);
 
-                                let _ = ready
-                                    .send(PendingChunk {
-                                        chunk_id,
-                                        task_id,
-                                        run_config,
-                                        cache_holds,
-                                    })
-                                    .await;
-                            });
-                            continue;
-                        }
+                                    let rules_path = match rules_sha256 {
+                                        Some(rs) => {
+                                            let rz = rules_size.unwrap_or(0);
+                                            match cache.ensure(&rs, rz, &outbound).await {
+                                                Ok(p) => {
+                                                    cache_holds.push(rs);
+                                                    Some(p)
+                                                }
+                                                Err(e) => {
+                                                    error!(%chunk_id, error = %e, "failed to fetch rules");
+                                                    let _ = outbound
+                                                        .send(WorkerMessage::ChunkFailed {
+                                                            chunk_id,
+                                                            error: format!("fetch rules: {e}"),
+                                                            exit_code: None,
+                                                        })
+                                                        .await;
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        None => None,
+                                    };
 
-                        let run_config = match attack {
-                            AssignChunkAttack::BruteForce {
-                                mask,
-                                custom_charsets,
-                            } => HashcatRunConfig {
-                                hashcat_path: config.hashcat_path.clone(),
-                                hash_file_path,
-                                hash_mode,
-                                attack_mode: 3,
-                                mask: Some(mask),
-                                skip,
-                                limit,
-                                custom_charsets,
-                                wordlist_path: None,
-                                rules_path: None,
-                                extra_args,
-                                outfile_path,
-                            },
-                            AssignChunkAttack::DictionaryByHash { .. } => {
-                                unreachable!("handled via early-return + spawn above")
-                            }
-                        };
+                                    HashcatRunConfig {
+                                        hashcat_path,
+                                        hash_file_path,
+                                        hash_mode,
+                                        attack_mode: 0,
+                                        mask: None,
+                                        skip,
+                                        limit,
+                                        custom_charsets: None,
+                                        wordlist_path: Some(wordlist_path),
+                                        rules_path,
+                                        extra_args,
+                                        outfile_path,
+                                    }
+                                }
+                            };
 
-                        // Only run one hashcat at a time to avoid GPU contention.
-                        // If one is already running, queue this chunk.
-                        if active_chunks.is_empty() {
-                            start_hashcat(
-                                &run_config,
-                                chunk_id,
-                                task_id,
-                                &mut stream,
-                                &mut transport,
-                                &mut active_chunks,
-                                &mut _chunk_task,
-                                &runner_tx,
-                            )
-                            .await?;
-                        } else {
-                            info!(
-                                chunk_id = %chunk_id,
-                                queue_len = pending_queue.len() + 1,
-                                "queuing chunk (another hashcat is running)"
-                            );
-                            pending_queue.push_back(PendingChunk {
-                                chunk_id,
-                                task_id,
-                                run_config,
-                                // BruteForce uses no content-cache files;
-                                // DictionaryByHash hits the early-return
-                                // path above with its own holds list.
-                                cache_holds: Vec::new(),
-                            });
-                        }
+                            let _ = ready
+                                .send(PendingChunk {
+                                    chunk_id,
+                                    task_id,
+                                    run_config,
+                                    cache_holds,
+                                })
+                                .await;
+                        });
                     }
 
                     CoordMessage::AbortChunk { chunk_id } => {
@@ -1107,43 +1083,6 @@ async fn recv_message(
     let msg: CoordMessage =
         serde_json::from_slice(&plain[..n]).context("failed to deserialize CoordMessage")?;
     Ok(msg)
-}
-
-// ── Hash file caching ──
-
-/// Save a base64-encoded hash file received over the Noise channel to the local cache.
-async fn save_hash_file(
-    config: &RunConfig,
-    file_id: &str,
-    b64_data: &str,
-) -> anyhow::Result<PathBuf> {
-    // Validate file_id is a proper UUID to prevent path traversal
-    Uuid::parse_str(file_id).context("invalid file_id: not a valid UUID")?;
-
-    let cache_dir = config.cache_dir();
-    tokio::fs::create_dir_all(&cache_dir).await?;
-
-    let cached_path = cache_dir.join(file_id);
-
-    // If already cached, reuse it
-    if cached_path.exists() {
-        info!(path = %cached_path.display(), "using cached hash file");
-        return Ok(cached_path);
-    }
-
-    // Decode from base64 and write to disk
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(b64_data)
-        .context("failed to decode hash file from base64")?;
-
-    tokio::fs::write(&cached_path, &data).await?;
-    info!(
-        path = %cached_path.display(),
-        size = data.len(),
-        "hash file saved from coordinator"
-    );
-
-    Ok(cached_path)
 }
 
 // ── Benchmarking ──
