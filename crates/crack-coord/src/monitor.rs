@@ -279,16 +279,16 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
 
     // Try to assign pending chunks to idle workers.
     //
-    // `assign_next_chunk` is now transaction-safe — the read-modify-write
-    // on `tasks.next_skip` is wrapped in `try_dispatch_new_chunk` with an
+    // `assign_next_chunk` is transaction-safe — the read-modify-write on
+    // `tasks.next_skip` is wrapped in `try_dispatch_new_chunk` with an
     // optimistic conditional UPDATE — so parallel fanout via
     // `for_each_concurrent` is unblocked from a correctness standpoint.
-    // Keeping the loop sequential here for now because the bigger latency
-    // win sits in `build_assign_chunk_msg` and `send_attack_files_via_tx`
-    // (those still re-read the hash file every dispatch — see X4 / P3 in
-    // the audit roadmap). Acquire the connections-map read guard once
-    // instead of per-iteration so a slow `worker_connections.write()`
-    // (new-worker registration) doesn't serialize behind 8 dispatches.
+    // Keeping the loop sequential because the remaining latency sits in
+    // `build_assign_chunk_msg` (still re-reads the hash file every
+    // dispatch — see X2 in the audit roadmap). Acquire the
+    // connections-map read guard once instead of per-iteration so a slow
+    // `worker_connections.write()` (new-worker registration) doesn't
+    // serialize behind 8 dispatches.
     let idle_workers = crate::scheduler::assigner::find_idle_workers(state).await?;
     let conns = state.worker_connections.read().await;
     for worker_id in idle_workers {
@@ -296,14 +296,6 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
             crate::scheduler::assigner::assign_next_chunk(state, &worker_id).await?
         {
             if let Some(conn) = conns.get(&worker_id) {
-                // Transfer wordlist/rules files before assigning the chunk
-                if let Err(e) =
-                    crate::transport::handler::send_attack_files_via_tx(state, &task, &conn.tx)
-                        .await
-                {
-                    error!(task_id = %task.id, error = %e, "failed to transfer attack files for dispatch");
-                    continue;
-                }
                 match crate::transport::handler::build_assign_chunk_msg(state, &task, &chunk).await
                 {
                     Ok(msg) => {

@@ -8,8 +8,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use std::collections::HashSet;
-
 use base64::Engine;
 use crack_common::auth::{build_responder, encode_public_key, pubkey_fingerprint};
 use crack_common::models::*;
@@ -185,9 +183,6 @@ async fn run_connection(
     // We track the worker_id once the Register message arrives.
     let mut worker_id: Option<String> = None;
 
-    // Track which files have been transferred to this worker so we don't re-send.
-    let mut transferred_files: HashSet<String> = HashSet::new();
-
     // Reusable buffers.
     let mut read_buf = vec![0u8; 65535];
     let mut write_buf = vec![0u8; 65535];
@@ -229,7 +224,6 @@ async fn run_connection(
                     &pubkey_b64,
                     peer_addr,
                     &mut worker_id,
-                    &mut transferred_files,
                 ).await {
                     error!(%peer_addr, error = %e, "error handling worker message");
                 }
@@ -313,7 +307,6 @@ async fn handle_worker_message(
     pubkey_b64: &str,
     peer_addr: SocketAddr,
     worker_id: &mut Option<String>,
-    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     match msg {
         WorkerMessage::Register {
@@ -332,7 +325,6 @@ async fn handle_worker_message(
                 os,
                 devices,
                 worker_id,
-                transferred_files,
             )
             .await
         }
@@ -478,7 +470,6 @@ async fn handle_worker_message(
             // Try to assign more work to this worker.
             if let Some(wid) = worker_id.as_deref() {
                 if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
-                    send_attack_files(state, &task, outbound_tx, transferred_files).await?;
                     let msg = build_assign_chunk_msg(state, &task, &new_chunk).await?;
                     let _ = outbound_tx.send(msg).await;
                 } else {
@@ -518,7 +509,7 @@ async fn handle_worker_message(
 
             // Try to assign next work to keep the worker busy.
             if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
+                try_assign_work(state, wid, outbound_tx).await?;
             }
             Ok(())
         }
@@ -528,7 +519,7 @@ async fn handle_worker_message(
                 state.record_benchmark(wid, *hash_mode, *speed).await?;
 
                 // If the worker was idle, try to give it work now.
-                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
+                try_assign_work(state, wid, outbound_tx).await?;
             }
             Ok(())
         }
@@ -597,7 +588,7 @@ async fn handle_worker_message(
             );
 
             if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
+                try_assign_work(state, wid, outbound_tx).await?;
             }
             Ok(())
         }
@@ -749,7 +740,6 @@ async fn handle_register(
     os: &str,
     devices: &[DeviceInfo],
     worker_id: &mut Option<String>,
-    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     // Look up or create the worker record by public key.
     let worker = db::get_or_create_worker(&state.db, pubkey_b64, worker_name).await?;
@@ -825,7 +815,7 @@ async fn handle_register(
     }
 
     // Try to immediately assign work to the newly registered worker.
-    try_assign_work(state, &wid, outbound_tx, transferred_files).await?;
+    try_assign_work(state, &wid, outbound_tx).await?;
 
     Ok(())
 }
@@ -834,12 +824,17 @@ async fn handle_register(
 
 /// Build a CoordMessage::AssignChunk with the hash file data embedded.
 ///
-/// For dictionary-based attacks, emits `DictionaryByHash` whenever we can
-/// look up the referenced file's sha256 + size (the common case). The
-/// agent then pulls the file from its content cache on demand. Falls
-/// back to the legacy `Dictionary` / `DictionaryWithRules` push path
-/// only if a file record is missing or has no sha — effectively never,
-/// for files uploaded via this coord.
+/// All dictionary-based attacks emit `DictionaryByHash` — the agent looks
+/// the referenced files up in its content-addressed cache and pulls on
+/// miss via `RequestFileRange`/`FileRange`. The pre-Slice-8 push paths
+/// (`TransferFileChunk` + `Dictionary` / `DictionaryWithRules` variants)
+/// were retired in PR5b after a one-shot sha256 backfill in `init_db`.
+///
+/// # Errors
+/// Returns an error if a referenced file row is missing or has no
+/// `sha256`. Both should be impossible after `backfill_empty_shas` has
+/// run; surfacing it as an error makes operator-noticeable rather than
+/// silently dispatching with broken metadata.
 pub(crate) async fn build_assign_chunk_msg(
     state: &AppState,
     task: &Task,
@@ -854,47 +849,25 @@ pub(crate) async fn build_assign_chunk_msg(
             custom_charsets: custom_charsets.clone(),
         },
         AttackConfig::Dictionary { wordlist_file_id } => {
-            match file_ref(&state.db, wordlist_file_id).await? {
-                Some((sha, size)) => AssignChunkAttack::DictionaryByHash {
-                    wordlist_sha256: sha,
-                    wordlist_size: size,
-                    rules_sha256: None,
-                    rules_size: None,
-                },
-                None => {
-                    warn!(file_id = %wordlist_file_id, "no sha256 for wordlist, falling back to legacy Dictionary push");
-                    AssignChunkAttack::Dictionary {
-                        wordlist_file_id: wordlist_file_id.clone(),
-                    }
-                }
+            let (sha, size) = file_ref(&state.db, wordlist_file_id).await?;
+            AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: sha,
+                wordlist_size: size,
+                rules_sha256: None,
+                rules_size: None,
             }
         }
         AttackConfig::DictionaryWithRules {
             wordlist_file_id,
             rules_file_id,
         } => {
-            let wl = file_ref(&state.db, wordlist_file_id).await?;
-            let rl = file_ref(&state.db, rules_file_id).await?;
-            match (wl, rl) {
-                (Some((w_sha, w_size)), Some((r_sha, r_size))) => {
-                    AssignChunkAttack::DictionaryByHash {
-                        wordlist_sha256: w_sha,
-                        wordlist_size: w_size,
-                        rules_sha256: Some(r_sha),
-                        rules_size: Some(r_size),
-                    }
-                }
-                _ => {
-                    warn!(
-                        wordlist = %wordlist_file_id,
-                        rules = %rules_file_id,
-                        "no sha256 for wordlist/rules, falling back to legacy DictionaryWithRules push"
-                    );
-                    AssignChunkAttack::DictionaryWithRules {
-                        wordlist_file_id: wordlist_file_id.clone(),
-                        rules_file_id: rules_file_id.clone(),
-                    }
-                }
+            let (w_sha, w_size) = file_ref(&state.db, wordlist_file_id).await?;
+            let (r_sha, r_size) = file_ref(&state.db, rules_file_id).await?;
+            AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: w_sha,
+                wordlist_size: w_size,
+                rules_sha256: Some(r_sha),
+                rules_size: Some(r_size),
             }
         }
     };
@@ -917,128 +890,34 @@ pub(crate) async fn build_assign_chunk_msg(
     })
 }
 
-/// Look up a file's (sha256, size_bytes) by UUID. Returns None if the record
-/// is missing, or if sha256 is empty (would pollute the content cache).
-async fn file_ref(pool: &sqlx::SqlitePool, file_id: &str) -> anyhow::Result<Option<(String, u64)>> {
-    Ok(db::get_file_record(pool, file_id).await?.and_then(|r| {
-        if r.sha256.is_empty() || r.size_bytes < 0 {
-            None
-        } else {
-            Some((r.sha256, r.size_bytes as u64))
-        }
-    }))
-}
-
-/// Stream a file to a worker in ~40KB chunks via TransferFileChunk messages.
-///
-/// Skips sending if the file has already been transferred to this worker
-/// (tracked via `transferred_files`).
-async fn send_file_to_worker(
-    state: &AppState,
-    file_id: &str,
-    outbound_tx: &mpsc::Sender<CoordMessage>,
-    transferred_files: &mut HashSet<String>,
-) -> anyhow::Result<()> {
-    if transferred_files.contains(file_id) {
-        return Ok(());
+/// Look up a file's `(sha256, size_bytes)` by UUID. Errors if the record
+/// is missing or has no sha — both indicate a broken DB row that the
+/// startup backfill should have caught.
+async fn file_ref(pool: &sqlx::SqlitePool, file_id: &str) -> anyhow::Result<(String, u64)> {
+    let record = db::get_file_record(pool, file_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("file {file_id} not found"))?;
+    if record.sha256.is_empty() {
+        anyhow::bail!("file {file_id} has no sha256 (backfill may have skipped it)");
     }
-
-    let file_data = files::read_file(&state.files_dir(), file_id)
-        .with_context(|| format!("reading file {file_id} for transfer"))?;
-
-    // Look up the original filename from the DB (best-effort, fall back to file_id).
-    let filename = match db::get_file_record(&state.db, file_id).await? {
-        Some(record) => record.filename,
-        None => file_id.to_string(),
-    };
-
-    const CHUNK_SIZE: usize = 40 * 1024; // ~40 KB
-    let total_chunks = file_data.len().div_ceil(CHUNK_SIZE).max(1) as u32;
-
-    for (i, chunk_data) in file_data.chunks(CHUNK_SIZE).enumerate() {
-        let data_b64 = base64::engine::general_purpose::STANDARD.encode(chunk_data);
-        let msg = CoordMessage::TransferFileChunk {
-            file_id: file_id.to_string(),
-            filename: filename.clone(),
-            chunk_index: i as u32,
-            total_chunks,
-            data_b64,
-        };
-        outbound_tx
-            .send(msg)
-            .await
-            .context("sending file transfer chunk to worker")?;
+    if record.size_bytes < 0 {
+        anyhow::bail!("file {file_id} has invalid size_bytes={}", record.size_bytes);
     }
-
-    transferred_files.insert(file_id.to_string());
-    info!(file_id = %file_id, filename = %filename, size = file_data.len(), chunks = total_chunks, "transferred file to worker");
-    Ok(())
+    Ok((record.sha256, record.size_bytes as u64))
 }
 
 /// Try to assign the next pending chunk to a worker and send it via the
-/// outbound channel. Transfers any required files first.
+/// outbound channel.
 async fn try_assign_work(
     state: &Arc<AppState>,
     wid: &str,
     outbound_tx: &mpsc::Sender<CoordMessage>,
-    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     if let Some((task, chunk)) = scheduler::assign_next_chunk(state, wid).await? {
-        send_attack_files(state, &task, outbound_tx, transferred_files).await?;
         let msg = build_assign_chunk_msg(state, &task, &chunk).await?;
         let _ = outbound_tx.send(msg).await;
     }
     Ok(())
-}
-
-/// Transfer referenced attack files to the worker before dispatching a chunk.
-///
-/// When every file has a sha256 recorded, we skip the push entirely — the
-/// agent will pull on demand via the content-addressed cache when it sees
-/// `DictionaryByHash`. The eager `TransferFileChunk` path remains only for
-/// the legacy fallback where a file has no sha (pre-dedup rows).
-async fn send_attack_files(
-    state: &AppState,
-    task: &Task,
-    outbound_tx: &mpsc::Sender<CoordMessage>,
-    transferred_files: &mut HashSet<String>,
-) -> anyhow::Result<()> {
-    match &task.attack_config {
-        AttackConfig::Dictionary { wordlist_file_id } => {
-            if file_ref(&state.db, wordlist_file_id).await?.is_some() {
-                return Ok(());
-            }
-            send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
-        }
-        AttackConfig::DictionaryWithRules {
-            wordlist_file_id,
-            rules_file_id,
-        } => {
-            let both_hashed = file_ref(&state.db, wordlist_file_id).await?.is_some()
-                && file_ref(&state.db, rules_file_id).await?.is_some();
-            if both_hashed {
-                return Ok(());
-            }
-            send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
-            send_file_to_worker(state, rules_file_id, outbound_tx, transferred_files).await?;
-        }
-        AttackConfig::BruteForce { .. } => {
-            // No extra files needed for brute-force.
-        }
-    }
-    Ok(())
-}
-
-/// Transfer attack files (wordlist, rules) to a worker via a raw `Sender`.
-/// Used by the monitor which doesn't track per-worker transferred files.
-/// The agent caches files, so duplicate sends are harmless.
-pub(crate) async fn send_attack_files_via_tx(
-    state: &AppState,
-    task: &Task,
-    tx: &mpsc::Sender<CoordMessage>,
-) -> anyhow::Result<()> {
-    let mut dummy = HashSet::new();
-    send_attack_files(state, task, tx, &mut dummy).await
 }
 
 /// Send AbortChunk to every connected worker that has running chunks on the

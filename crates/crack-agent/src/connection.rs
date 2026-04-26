@@ -525,72 +525,6 @@ async fn connect_and_run(
                         info!(worker_id = %wid, "received duplicate Welcome");
                     }
 
-                    CoordMessage::TransferFileChunk {
-                        file_id,
-                        filename,
-                        chunk_index,
-                        total_chunks,
-                        data_b64,
-                    } => {
-                        // Validate file_id is a proper UUID to prevent path traversal
-                        Uuid::parse_str(&file_id).context("invalid file_id: not a valid UUID")?;
-
-                        // Bounds checks
-                        if total_chunks > 10_000 {
-                            return Err(anyhow!("file transfer too large"));
-                        }
-                        if chunk_index >= total_chunks {
-                            continue;
-                        }
-
-                        // Decode chunk data
-                        let data = base64::engine::general_purpose::STANDARD
-                            .decode(&data_b64)
-                            .context("failed to decode file chunk")?;
-
-                        // Use a simple approach: accumulate chunks in cache dir as partial files
-                        let cache_dir = config.cache_dir();
-                        tokio::fs::create_dir_all(&cache_dir).await?;
-                        let part_path = cache_dir.join(format!("{file_id}.part{chunk_index}"));
-                        tokio::fs::write(&part_path, &data).await?;
-
-                        // Check if all chunks received
-                        let mut all_received = true;
-                        for i in 0..total_chunks {
-                            if !cache_dir.join(format!("{file_id}.part{i}")).exists() {
-                                all_received = false;
-                                break;
-                            }
-                        }
-
-                        if all_received {
-                            // Reassemble
-                            let final_path = cache_dir.join(&file_id);
-                            let mut full_data = Vec::new();
-                            for i in 0..total_chunks {
-                                let p = cache_dir.join(format!("{file_id}.part{i}"));
-                                let chunk_data = tokio::fs::read(&p).await?;
-                                full_data.extend_from_slice(&chunk_data);
-                                let _ = tokio::fs::remove_file(&p).await;
-                            }
-                            tokio::fs::write(&final_path, &full_data).await?;
-                            info!(
-                                file_id = %file_id,
-                                filename = %filename,
-                                size = full_data.len(),
-                                chunks = total_chunks,
-                                "file transfer complete"
-                            );
-                        } else {
-                            debug!(
-                                file_id = %file_id,
-                                chunk = chunk_index,
-                                total = total_chunks,
-                                "received file chunk"
-                            );
-                        }
-                    }
-
                     CoordMessage::AssignChunk {
                         chunk_id,
                         task_id,
@@ -606,10 +540,6 @@ async fn connect_and_run(
 
                         let mask_display = match &attack {
                             AssignChunkAttack::BruteForce { mask, .. } => mask.clone(),
-                            AssignChunkAttack::Dictionary { .. } => "dictionary".to_string(),
-                            AssignChunkAttack::DictionaryWithRules { .. } => {
-                                "dict+rules".to_string()
-                            }
                             AssignChunkAttack::DictionaryByHash { .. } => "dict+hash".to_string(),
                         };
 
@@ -637,8 +567,6 @@ async fn connect_and_run(
                             save_hash_file(config, &hash_file_id, &hash_file_b64).await?;
 
                         let outfile_path = config.cache_dir().join(format!("out_{chunk_id}.txt"));
-
-                        let cache_dir = config.cache_dir();
 
                         // DictionaryByHash needs async file resolution via the
                         // content cache — that can't run on the main loop (it
@@ -812,39 +740,6 @@ async fn connect_and_run(
                                 extra_args,
                                 outfile_path,
                             },
-                            AssignChunkAttack::Dictionary { wordlist_file_id } => {
-                                HashcatRunConfig {
-                                    hashcat_path: config.hashcat_path.clone(),
-                                    hash_file_path,
-                                    hash_mode,
-                                    attack_mode: 0,
-                                    mask: None,
-                                    skip,
-                                    limit,
-                                    custom_charsets: None,
-                                    wordlist_path: Some(cache_dir.join(&wordlist_file_id)),
-                                    rules_path: None,
-                                    extra_args,
-                                    outfile_path,
-                                }
-                            }
-                            AssignChunkAttack::DictionaryWithRules {
-                                wordlist_file_id,
-                                rules_file_id,
-                            } => HashcatRunConfig {
-                                hashcat_path: config.hashcat_path.clone(),
-                                hash_file_path,
-                                hash_mode,
-                                attack_mode: 0,
-                                mask: None,
-                                skip,
-                                limit,
-                                custom_charsets: None,
-                                wordlist_path: Some(cache_dir.join(&wordlist_file_id)),
-                                rules_path: Some(cache_dir.join(&rules_file_id)),
-                                extra_args,
-                                outfile_path,
-                            },
                             AssignChunkAttack::DictionaryByHash { .. } => {
                                 unreachable!("handled via early-return + spawn above")
                             }
@@ -874,9 +769,9 @@ async fn connect_and_run(
                                 chunk_id,
                                 task_id,
                                 run_config,
-                                // Legacy paths (BruteForce, pushed Dictionary)
-                                // don't use the content cache, so nothing to
-                                // hold.
+                                // BruteForce uses no content-cache files;
+                                // DictionaryByHash hits the early-return
+                                // path above with its own holds list.
                                 cache_holds: Vec::new(),
                             });
                         }
