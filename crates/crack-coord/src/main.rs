@@ -2,6 +2,7 @@ mod api;
 mod audit;
 mod campaign;
 mod config;
+mod last_seen;
 mod lifecycle;
 mod monitor;
 mod scheduler;
@@ -150,6 +151,12 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     let audit_pool = state.db.clone();
     tokio::spawn(async move {
         audit::run_audit_flusher(audit_pool, audit_rx).await;
+    });
+
+    // Background flusher for buffered heartbeat writes.
+    let last_seen_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        last_seen::run_last_seen_flusher(last_seen_state).await;
     });
 
     state.emit_audit(

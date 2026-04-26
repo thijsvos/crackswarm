@@ -944,19 +944,6 @@ pub async fn update_worker_status(pool: &SqlitePool, id: &str, status: WorkerSta
     Ok(())
 }
 
-pub async fn update_worker_last_seen(pool: &SqlitePool, id: &str) -> Result<()> {
-    let now = now_iso();
-
-    sqlx::query("UPDATE workers SET last_seen_at = ?1 WHERE id = ?2")
-        .bind(&now)
-        .bind(id)
-        .execute(pool)
-        .await
-        .context("updating worker last_seen")?;
-
-    Ok(())
-}
-
 pub async fn get_worker_by_pubkey(pool: &SqlitePool, public_key: &str) -> Result<Option<Worker>> {
     let row = sqlx::query("SELECT * FROM workers WHERE public_key = ?1")
         .bind(public_key)

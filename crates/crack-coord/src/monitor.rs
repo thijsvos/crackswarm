@@ -186,7 +186,11 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
 
-        let elapsed = now - worker.last_seen_at;
+        // Heartbeat writes are buffered and flushed every ~3s. Consult the
+        // in-memory buffer too so a worker that pinged 1s ago doesn't get
+        // marked timed-out because the row hasn't flushed yet.
+        let last_seen = state.effective_last_seen(&worker.id, worker.last_seen_at).await;
+        let elapsed = now - last_seen;
         if elapsed > timeout {
             warn!(
                 worker_id = %worker.id,

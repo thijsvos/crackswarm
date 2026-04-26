@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crack_common::auth::Keypair;
 use crack_common::models::AuditEntry;
 use crack_common::protocol::CoordMessage;
 use sqlx::SqlitePool;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Buffer depth for the audit-log channel feeding the background flusher.
@@ -70,6 +70,14 @@ pub struct AppState {
     /// [`ACTIVE_SHAS_TTL`]; see [`Self::get_active_shas`] for the exact
     /// staleness contract. `None` until the first read repopulates.
     active_shas: RwLock<Option<ActiveShasCache>>,
+
+    /// `worker_id → newest_heartbeat_seen` buffer flushed every ~3s by
+    /// [`crate::last_seen::run_last_seen_flusher`] in one transaction.
+    /// Heartbeats are by far the chattiest write the system performs;
+    /// collapsing N writes per 15s into ⌈N/15s × 3s⌉ ≈ N/5 writes makes
+    /// it cheap regardless of fleet size. Latest-write-wins, so per-key
+    /// updates are idempotent.
+    pub last_seen_buffer: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 #[allow(dead_code)]
@@ -153,6 +161,7 @@ impl AppState {
             audit_tx,
             benchmark_cache: RwLock::new(HashMap::new()),
             active_shas: RwLock::new(None),
+            last_seen_buffer: Mutex::new(HashMap::new()),
         });
         (state, audit_rx)
     }
@@ -239,6 +248,31 @@ impl AppState {
             .await
             .insert((worker_id.to_string(), hash_mode), speed);
         Ok(())
+    }
+
+    /// Record that `worker_id` just heartbeated. Buffered in-memory; the
+    /// background flusher persists the latest timestamp per worker every
+    /// ~3 seconds.
+    pub async fn note_heartbeat(&self, worker_id: &str) {
+        self.last_seen_buffer
+            .lock()
+            .await
+            .insert(worker_id.to_string(), Utc::now());
+    }
+
+    /// Like the `last_seen_at` column, but consults the in-memory buffer
+    /// first so the heartbeat-timeout check sees the freshest timestamp
+    /// even when it hasn't flushed to DB yet. Returns `db_ts` unchanged
+    /// if the buffer doesn't have a newer entry.
+    pub async fn effective_last_seen(
+        &self,
+        worker_id: &str,
+        db_ts: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        match self.last_seen_buffer.lock().await.get(worker_id) {
+            Some(&ts) if ts > db_ts => ts,
+            _ => db_ts,
+        }
     }
 
     /// Snapshot of every sha256 with `gc_state = 'active'` in `files`.

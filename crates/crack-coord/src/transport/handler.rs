@@ -339,7 +339,9 @@ async fn handle_worker_message(
 
         WorkerMessage::Heartbeat { cache_manifest } => {
             if let Some(wid) = worker_id.as_deref() {
-                db::update_worker_last_seen(&state.db, wid).await?;
+                // Buffered: a background flusher persists every ~3s so the
+                // hot path does an in-memory HashMap insert, not a write.
+                state.note_heartbeat(wid).await;
                 // Sync the coord's view of this worker's cache. Entries
                 // present here but missing from the DB are upserted;
                 // entries in the DB but missing from this manifest are
