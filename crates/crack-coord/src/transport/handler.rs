@@ -355,11 +355,12 @@ async fn handle_worker_message(
                     Ok(active) => {
                         for entry in cache_manifest {
                             if !active.contains(&entry.sha256) {
-                                let _ = outbound_tx
-                                    .send(CoordMessage::EvictFile {
-                                        hash: entry.sha256.clone(),
-                                    })
-                                    .await;
+                                // try_send: the next heartbeat repeats
+                                // drift correction, so a full per-conn
+                                // mpsc shouldn't block this hot path.
+                                let _ = outbound_tx.try_send(CoordMessage::EvictFile {
+                                    hash: entry.sha256.clone(),
+                                });
                             }
                         }
                     }
