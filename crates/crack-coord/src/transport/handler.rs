@@ -420,46 +420,7 @@ async fn handle_worker_message(
         }
 
         WorkerMessage::Heartbeat { cache_manifest } => {
-            if let Some(wid) = worker_id.as_deref() {
-                // Buffered: a background flusher persists every ~3s so the
-                // hot path does an in-memory HashMap insert, not a write.
-                state.note_heartbeat(wid).await;
-                // Sync the coord's view of this worker's cache. Entries
-                // present here but missing from the DB are upserted;
-                // entries in the DB but missing from this manifest are
-                // removed (the agent evicted them locally since last tick).
-                if let Err(e) = db::sync_worker_cache_manifest(&state.db, wid, cache_manifest).await
-                {
-                    warn!(worker = %wid, error = %e, "failed to sync cache manifest");
-                }
-
-                // Drift-correction tick (issue #45). If the manifest carries
-                // a sha that is no longer active on the coord, tell the agent
-                // to evict it. Catches: missed `EvictFile` (mpsc backpressure
-                // / transient drop), post-coord-restart staleness, and any
-                // other cause of view divergence between coord and agent.
-                // Same-cycle double-fires (this PR's gc_pass fallback +
-                // heartbeat re-evict) are harmless: agent's `evict` is
-                // idempotent and no-ops a second call.
-                match state.get_active_shas().await {
-                    Ok(active) => {
-                        for entry in cache_manifest {
-                            if !active.contains(&entry.sha256) {
-                                // try_send: the next heartbeat repeats
-                                // drift correction, so a full per-conn
-                                // mpsc shouldn't block this hot path.
-                                let _ = outbound_tx.try_send(CoordMessage::EvictFile {
-                                    hash: entry.sha256.clone(),
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(worker = %wid, error = %e, "drift-correction lookup failed")
-                    }
-                }
-            }
-            Ok(())
+            handle_heartbeat(state, outbound_tx, worker_id.as_deref(), cache_manifest).await
         }
 
         WorkerMessage::ChunkStarted { chunk_id } => {
@@ -474,8 +435,6 @@ async fn handle_worker_message(
             ..
         } => {
             db::update_chunk_progress(&state.db, *chunk_id, *progress_pct, *speed).await?;
-
-            // Look up the task_id for this chunk so we can emit the event.
             if let Some(chunk) = db::get_chunk(&state.db, *chunk_id).await? {
                 state.emit(AppEvent::ChunkProgress {
                     task_id: chunk.task_id,
@@ -492,87 +451,15 @@ async fn handle_worker_message(
             task_id,
             hash,
             plaintext,
-        } => {
-            let wid = worker_id.as_deref().unwrap_or("unknown");
-            info!(
-                task_id = %task_id,
-                hash = %hash,
-                worker_id = %wid,
-                "received HashCracked from worker"
-            );
-            let inserted =
-                db::insert_cracked_hash(&state.db, *task_id, hash, plaintext, wid).await?;
-
-            // Only increment the count and check completion if the hash was
-            // actually new (not a duplicate).
-            if !inserted {
-                debug!(task_id = %task_id, hash = %hash, "duplicate hash ignored");
-                return Ok(());
-            }
-
-            let new_count = db::increment_task_cracked_count(&state.db, *task_id, 1).await?;
-
-            state.emit(AppEvent::HashCracked {
-                task_id: *task_id,
-                hash: hash.clone(),
-            });
-
-            // Check if all hashes for this task have been cracked.
-            if let Some(task) = db::get_task(&state.db, *task_id).await? {
-                if new_count >= task.total_hashes {
-                    info!(task_id = %task_id, "all hashes cracked, completing task");
-                    db::update_task_status(&state.db, *task_id, TaskStatus::Completed).await?;
-
-                    state.emit(AppEvent::TaskCompleted { task_id: *task_id });
-
-                    // Abort all running chunks on this task across all workers.
-                    abort_task_chunks(state, *task_id).await?;
-
-                    // Advance campaign if this task is campaign-owned
-                    if task.campaign_id.is_some() {
-                        if let Err(e) = crate::campaign::on_task_completed(state, *task_id).await {
-                            error!(task_id = %task_id, error = %e, "campaign advance error");
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
+        } => handle_hash_cracked(state, worker_id.as_deref(), *task_id, hash, plaintext).await,
 
         WorkerMessage::ChunkCompleted {
             chunk_id,
             exit_code,
             total_cracked: _,
         } => {
-            let status = if *exit_code == 1 {
-                ChunkStatus::Exhausted
-            } else {
-                ChunkStatus::Completed
-            };
-
-            // Mark progress as 100% without clobbering the last-reported speed —
-            // for fast hashes, hashcat may finish before any status update is sent.
-            db::finalize_chunk_progress(&state.db, *chunk_id).await?;
-            db::update_chunk_status(&state.db, *chunk_id, status).await?;
-
-            let chunk = db::get_chunk(&state.db, *chunk_id).await?;
-            let task_id = chunk.as_ref().map(|c| c.task_id);
-
-            // Try to assign more work to this worker.
-            if let Some(wid) = worker_id.as_deref() {
-                if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
-                    let msg = build_assign_chunk_msg(state, &task, &new_chunk).await?;
-                    let _ = outbound_tx.send(msg).await;
-                } else {
-                    db::update_worker_status(&state.db, wid, WorkerStatus::Idle).await?;
-                }
-            }
-
-            // Check if all chunks for this task are done.
-            if let Some(tid) = task_id {
-                check_task_completion(state, tid).await?;
-            }
-            Ok(())
+            handle_chunk_completed(state, outbound_tx, worker_id.as_deref(), *chunk_id, *exit_code)
+                .await
         }
 
         WorkerMessage::ChunkFailed {
@@ -580,36 +467,20 @@ async fn handle_worker_message(
             error: err_msg,
             exit_code,
         } => {
-            db::update_chunk_status(&state.db, *chunk_id, ChunkStatus::Failed).await?;
-
-            let wid = worker_id.as_deref().unwrap_or("unknown");
-            error!(
-                %chunk_id,
-                worker_id = %wid,
-                exit_code = ?exit_code,
-                error = %err_msg,
-                "chunk failed"
-            );
-
-            state.emit_audit(
-                "chunk_failed",
-                &format!("Chunk {chunk_id} failed: {err_msg}"),
-                None,
-                Some(wid),
-            );
-
-            // Try to assign next work to keep the worker busy.
-            if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx).await?;
-            }
-            Ok(())
+            handle_chunk_failed(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                *chunk_id,
+                err_msg,
+                *exit_code,
+            )
+            .await
         }
 
         WorkerMessage::BenchmarkResult { hash_mode, speed } => {
             if let Some(wid) = worker_id.as_deref() {
                 state.record_benchmark(wid, *hash_mode, *speed).await?;
-
-                // If the worker was idle, try to give it work now.
                 try_assign_work(state, wid, outbound_tx).await?;
             }
             Ok(())
@@ -636,8 +507,8 @@ async fn handle_worker_message(
         }
 
         WorkerMessage::Enroll { .. } => {
-            // Enrollment is handled before the message loop. If we get here,
-            // the worker is already authorized, so we just ignore it.
+            // Enrollment runs before the message loop. A second `Enroll`
+            // from an already-authorized worker is benign — drop it.
             debug!(%peer_addr, "ignoring Enroll message in message loop (already authorized)");
             Ok(())
         }
@@ -647,28 +518,16 @@ async fn handle_worker_message(
             offset,
             length,
         } => {
-            // Per-session sha allow-list (C11). The worker can only ask
-            // for files we've explicitly named to it via `AssignChunk`.
-            // Reject otherwise — surfaces both lateral-movement attempts
-            // (worker A poking at worker B's wordlist) and confused-state
-            // pulls after a state mismatch.
-            if !assigned_shas.contains(hash) {
-                let wid = worker_id.as_deref().unwrap_or("unauthenticated");
-                warn!(
-                    worker_id = %wid,
-                    %hash,
-                    "rejecting RequestFileRange: sha not in this session's allow-list"
-                );
-                let _ = outbound_tx
-                    .send(CoordMessage::FileError {
-                        hash: hash.clone(),
-                        reason: "not authorized for this file in this session".to_string(),
-                    })
-                    .await;
-                return Ok(());
-            }
-            handle_request_file_range(state, outbound_tx, hash, *offset, *length).await?;
-            Ok(())
+            handle_request_file_range_msg(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                assigned_shas,
+                hash,
+                *offset,
+                *length,
+            )
+            .await
         }
 
         WorkerMessage::PullFailed {
@@ -676,55 +535,254 @@ async fn handle_worker_message(
             hash,
             reason,
         } => {
-            // The agent couldn't fetch a file required by this chunk
-            // (cache budget, disk full, etc.). Treat it like a chunk
-            // failure so the abandoned-chunk reassigner picks it up
-            // for a different worker.
-            db::update_chunk_status(&state.db, *chunk_id, ChunkStatus::Failed).await?;
-
-            let wid = worker_id.as_deref().unwrap_or("unknown");
-            warn!(
-                %chunk_id,
-                worker_id = %wid,
-                %hash,
-                %reason,
-                "pull failed: chunk will be reassigned"
-            );
-
-            state.emit_audit(
-                "pull_failed",
-                &format!("Worker {wid} couldn't fetch {hash} for chunk {chunk_id}: {reason}"),
-                None,
-                Some(wid),
-            );
-
-            if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx).await?;
-            }
-            Ok(())
+            handle_pull_failed(state, outbound_tx, worker_id.as_deref(), *chunk_id, hash, reason)
+                .await
         }
 
         WorkerMessage::CacheAck { kept, evicted } => {
-            // The agent has already evicted what we asked. Drop the
-            // evicted shas from our coord-side view immediately so the
-            // GC loop doesn't keep re-targeting this worker. The next
-            // heartbeat will deliver the full ground-truth manifest.
-            if let Some(wid) = worker_id.as_deref() {
-                for sha in evicted {
-                    if let Err(e) = db::remove_worker_cache_entry(&state.db, wid, sha).await {
-                        warn!(worker = %wid, %sha, error = %e, "remove_worker_cache_entry failed");
-                    }
-                }
-                debug!(
-                    worker = %wid,
-                    kept = kept.len(),
-                    evicted_count = evicted.len(),
-                    "received CacheAck"
-                );
-            }
-            Ok(())
+            handle_cache_ack(state, worker_id.as_deref(), kept, evicted).await
         }
     }
+}
+
+// ── Per-variant message handlers ─────────────────────────────────────────────
+
+async fn handle_heartbeat(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    cache_manifest: &[crack_common::protocol::CacheManifestEntry],
+) -> anyhow::Result<()> {
+    let Some(wid) = worker_id else {
+        return Ok(());
+    };
+
+    // Buffered: a background flusher persists every ~3s so the hot path
+    // does an in-memory HashMap insert, not a write.
+    state.note_heartbeat(wid).await;
+
+    if let Err(e) = db::sync_worker_cache_manifest(&state.db, wid, cache_manifest).await {
+        warn!(worker = %wid, error = %e, "failed to sync cache manifest");
+    }
+
+    // Drift-correction tick (issue #45): if the manifest carries a sha
+    // that's no longer active on the coord, tell the agent to evict it.
+    // Catches missed `EvictFile`s (mpsc backpressure / transient drop),
+    // post-coord-restart staleness, and any other cause of divergence.
+    // Agent's `evict` is idempotent so duplicate fires are harmless.
+    match state.get_active_shas().await {
+        Ok(active) => {
+            for entry in cache_manifest {
+                if !active.contains(&entry.sha256) {
+                    // try_send: the next heartbeat repeats drift correction,
+                    // so a full per-conn mpsc shouldn't block this hot path.
+                    let _ = outbound_tx.try_send(CoordMessage::EvictFile {
+                        hash: entry.sha256.clone(),
+                    });
+                }
+            }
+        }
+        Err(e) => warn!(worker = %wid, error = %e, "drift-correction lookup failed"),
+    }
+    Ok(())
+}
+
+async fn handle_hash_cracked(
+    state: &Arc<AppState>,
+    worker_id: Option<&str>,
+    task_id: Uuid,
+    hash: &str,
+    plaintext: &str,
+) -> anyhow::Result<()> {
+    let wid = worker_id.unwrap_or("unknown");
+    info!(
+        %task_id,
+        %hash,
+        worker_id = %wid,
+        "received HashCracked from worker"
+    );
+    let inserted = db::insert_cracked_hash(&state.db, task_id, hash, plaintext, wid).await?;
+    if !inserted {
+        debug!(%task_id, %hash, "duplicate hash ignored");
+        return Ok(());
+    }
+
+    let new_count = db::increment_task_cracked_count(&state.db, task_id, 1).await?;
+    state.emit(AppEvent::HashCracked {
+        task_id,
+        hash: hash.to_string(),
+    });
+
+    // Check task completion. If this was the last hash, mark complete and
+    // tear down running chunks across workers.
+    if let Some(task) = db::get_task(&state.db, task_id).await? {
+        if new_count >= task.total_hashes {
+            info!(%task_id, "all hashes cracked, completing task");
+            db::update_task_status(&state.db, task_id, TaskStatus::Completed).await?;
+            state.emit(AppEvent::TaskCompleted { task_id });
+            abort_task_chunks(state, task_id).await?;
+            if task.campaign_id.is_some() {
+                if let Err(e) = crate::campaign::on_task_completed(state, task_id).await {
+                    error!(%task_id, error = %e, "campaign advance error");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_chunk_completed(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    chunk_id: Uuid,
+    exit_code: i32,
+) -> anyhow::Result<()> {
+    let status = if exit_code == 1 {
+        ChunkStatus::Exhausted
+    } else {
+        ChunkStatus::Completed
+    };
+
+    // Mark progress as 100% without clobbering the last-reported speed —
+    // fast hashes can finish before any status update is sent.
+    db::finalize_chunk_progress(&state.db, chunk_id).await?;
+    db::update_chunk_status(&state.db, chunk_id, status).await?;
+
+    let chunk = db::get_chunk(&state.db, chunk_id).await?;
+    let task_id = chunk.as_ref().map(|c| c.task_id);
+
+    // Try to assign more work to this worker, otherwise mark it idle.
+    if let Some(wid) = worker_id {
+        if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
+            let msg = build_assign_chunk_msg(state, &task, &new_chunk).await?;
+            let _ = outbound_tx.send(msg).await;
+        } else {
+            db::update_worker_status(&state.db, wid, WorkerStatus::Idle).await?;
+        }
+    }
+
+    if let Some(tid) = task_id {
+        check_task_completion(state, tid).await?;
+    }
+    Ok(())
+}
+
+async fn handle_chunk_failed(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    chunk_id: Uuid,
+    err_msg: &str,
+    exit_code: Option<i32>,
+) -> anyhow::Result<()> {
+    db::update_chunk_status(&state.db, chunk_id, ChunkStatus::Failed).await?;
+    let wid = worker_id.unwrap_or("unknown");
+    error!(
+        %chunk_id,
+        worker_id = %wid,
+        ?exit_code,
+        error = %err_msg,
+        "chunk failed"
+    );
+    state.emit_audit(
+        "chunk_failed",
+        &format!("Chunk {chunk_id} failed: {err_msg}"),
+        None,
+        Some(wid),
+    );
+    if let Some(wid) = worker_id {
+        try_assign_work(state, wid, outbound_tx).await?;
+    }
+    Ok(())
+}
+
+async fn handle_request_file_range_msg(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    assigned_shas: &std::collections::HashSet<String>,
+    hash: &str,
+    offset: u64,
+    length: u32,
+) -> anyhow::Result<()> {
+    // Per-session sha allow-list (C11). The worker can only ask for files
+    // we've explicitly named to it via `AssignChunk`.
+    if !assigned_shas.contains(hash) {
+        let wid = worker_id.unwrap_or("unauthenticated");
+        warn!(
+            worker_id = %wid,
+            %hash,
+            "rejecting RequestFileRange: sha not in this session's allow-list"
+        );
+        let _ = outbound_tx
+            .send(CoordMessage::FileError {
+                hash: hash.to_string(),
+                reason: "not authorized for this file in this session".to_string(),
+            })
+            .await;
+        return Ok(());
+    }
+    handle_request_file_range(state, outbound_tx, hash, offset, length).await
+}
+
+async fn handle_pull_failed(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    chunk_id: Uuid,
+    hash: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    // The agent couldn't fetch a file required by this chunk (cache
+    // budget, disk full, etc.). Treat it like a chunk failure so the
+    // abandoned-chunk reassigner picks it up for a different worker.
+    db::update_chunk_status(&state.db, chunk_id, ChunkStatus::Failed).await?;
+    let wid = worker_id.unwrap_or("unknown");
+    warn!(
+        %chunk_id,
+        worker_id = %wid,
+        %hash,
+        %reason,
+        "pull failed: chunk will be reassigned"
+    );
+    state.emit_audit(
+        "pull_failed",
+        &format!("Worker {wid} couldn't fetch {hash} for chunk {chunk_id}: {reason}"),
+        None,
+        Some(wid),
+    );
+    if let Some(wid) = worker_id {
+        try_assign_work(state, wid, outbound_tx).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cache_ack(
+    state: &Arc<AppState>,
+    worker_id: Option<&str>,
+    kept: &[String],
+    evicted: &[String],
+) -> anyhow::Result<()> {
+    // Agent has already evicted what we asked. Drop the evicted shas from
+    // our coord-side view immediately so the GC loop doesn't keep
+    // re-targeting this worker. The next heartbeat delivers the full
+    // ground-truth manifest.
+    let Some(wid) = worker_id else {
+        return Ok(());
+    };
+    for sha in evicted {
+        if let Err(e) = db::remove_worker_cache_entry(&state.db, wid, sha).await {
+            warn!(worker = %wid, %sha, error = %e, "remove_worker_cache_entry failed");
+        }
+    }
+    debug!(
+        worker = %wid,
+        kept = kept.len(),
+        evicted_count = evicted.len(),
+        "received CacheAck"
+    );
+    Ok(())
 }
 
 /// Cap any single `RequestFileRange` response at this many raw bytes. Larger
