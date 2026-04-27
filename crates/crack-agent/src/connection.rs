@@ -37,24 +37,117 @@ struct PendingChunk {
     cache_holds: Vec<String>,
 }
 
-/// Record that `pending.chunk_id` is currently using every sha in
-/// `pending.cache_holds`. Called on `ChunkReady` before the chunk runs or
-/// is queued; matching release happens on chunk terminal state.
-fn register_cache_holds(
-    pending: &PendingChunk,
-    running_chunks_using: &mut HashMap<String, HashSet<Uuid>>,
-    chunk_cache_holds: &mut HashMap<Uuid, Vec<String>>,
-) {
-    if pending.cache_holds.is_empty() {
-        return;
+/// All the per-connection bookkeeping state the agent's main loop owns.
+///
+/// Pulled out of `connect_and_run` so the loop body reads as I/O +
+/// dispatch rather than inline map manipulation. Every field has its
+/// own typed accessor — direct `.field` access is technically allowed
+/// by visibility rules but the methods name what each operation
+/// actually does.
+struct ConnectionState {
+    /// Running hashcat processes by chunk_id, holding the kill switch
+    /// so an inbound `AbortChunk` (or shutdown) can terminate them.
+    active_chunks: HashMap<Uuid, oneshot::Sender<()>>,
+    /// `chunk_id → task_id`. Currently insert-only — kept for future
+    /// reconnection / state-reconstruction needs.
+    chunk_task: HashMap<Uuid, Uuid>,
+    /// Chunks the agent has accepted but can't run yet (one hashcat
+    /// at a time per agent). Drained on every chunk terminal event.
+    pending_queue: VecDeque<PendingChunk>,
+    /// `sha256 → set of chunk_ids` currently using that file. An
+    /// incoming `EvictFile` for a sha in this map gets deferred until
+    /// the set drains.
+    running_chunks_using: HashMap<String, HashSet<Uuid>>,
+    /// Reverse of `running_chunks_using`: `chunk_id → shas` it holds.
+    /// On chunk terminal we release each sha and check
+    /// `pending_evictions`.
+    chunk_cache_holds: HashMap<Uuid, Vec<String>>,
+    /// Hashes the coord asked us to evict but couldn't drop yet because
+    /// a chunk was still using them. Drained as chunk terminals
+    /// release their holds.
+    pending_evictions: HashSet<String>,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            active_chunks: HashMap::new(),
+            chunk_task: HashMap::new(),
+            pending_queue: VecDeque::new(),
+            running_chunks_using: HashMap::new(),
+            chunk_cache_holds: HashMap::new(),
+            pending_evictions: HashSet::new(),
+        }
     }
-    for sha in &pending.cache_holds {
-        running_chunks_using
-            .entry(sha.clone())
-            .or_default()
-            .insert(pending.chunk_id);
+
+    /// Record that `pending.chunk_id` is using every sha in
+    /// `pending.cache_holds`. Called on `ChunkReady` before the chunk
+    /// runs or is queued; matching release happens on chunk terminal.
+    fn register_cache_holds(&mut self, pending: &PendingChunk) {
+        if pending.cache_holds.is_empty() {
+            return;
+        }
+        for sha in &pending.cache_holds {
+            self.running_chunks_using
+                .entry(sha.clone())
+                .or_default()
+                .insert(pending.chunk_id);
+        }
+        self.chunk_cache_holds
+            .insert(pending.chunk_id, pending.cache_holds.clone());
     }
-    chunk_cache_holds.insert(pending.chunk_id, pending.cache_holds.clone());
+
+    /// Drop every cache hold held by `chunk_id` and apply any
+    /// `pending_evictions` whose in-use set is now empty. Called on
+    /// chunk terminal events.
+    async fn release_holds_for_chunk(&mut self, chunk_id: Uuid, cache: &Arc<ContentCache>) {
+        let Some(shas) = self.chunk_cache_holds.remove(&chunk_id) else {
+            return;
+        };
+        for sha in shas {
+            let Some(users) = self.running_chunks_using.get_mut(&sha) else {
+                continue;
+            };
+            users.remove(&chunk_id);
+            if !users.is_empty() {
+                continue;
+            }
+            self.running_chunks_using.remove(&sha);
+            if self.pending_evictions.remove(&sha) {
+                let removed = cache.evict(&sha).await;
+                info!(
+                    sha = %sha,
+                    removed,
+                    "deferred EvictFile flushed after chunk completion"
+                );
+            }
+        }
+    }
+
+    /// Returns true if `sha` is currently held by at least one running
+    /// chunk — used as the eviction-defer gate.
+    fn is_sha_in_use(&self, sha: &str) -> bool {
+        self.running_chunks_using
+            .get(sha)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Apply or defer an `EvictFile` request. Returns `Some(removed)`
+    /// when the eviction was applied immediately; `None` when it was
+    /// deferred because a chunk is still using the file.
+    async fn defer_or_apply_eviction(
+        &mut self,
+        hash: String,
+        cache: &Arc<ContentCache>,
+    ) -> Option<bool> {
+        if self.is_sha_in_use(&hash) {
+            self.pending_evictions.insert(hash);
+            None
+        } else {
+            Some(cache.evict(&hash).await)
+        }
+    }
 }
 
 /// Best-effort LRU eviction to free `needed` bytes in the content cache,
@@ -67,7 +160,7 @@ fn register_cache_holds(
 async fn evict_lru_for_budget(
     cache: &Arc<ContentCache>,
     needed: u64,
-    running_chunks_using: &HashMap<String, HashSet<Uuid>>,
+    state: &ConnectionState,
 ) -> u64 {
     let budget = cache.cache_max_bytes();
     let mut current = cache.total_size().await;
@@ -83,11 +176,7 @@ async fn evict_lru_for_budget(
         }
         // Skip files actively in use; the deferred-eviction path will
         // pick them up later but they can't be reclaimed right now.
-        if running_chunks_using
-            .get(&c.sha256)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-        {
+        if state.is_sha_in_use(&c.sha256) {
             continue;
         }
         if cache.evict(&c.sha256).await {
@@ -226,6 +315,25 @@ struct EnrollInfo {
 /// Perform handshake, register, and run the message loop for a single
 /// connection lifetime. If `enroll_info` is provided, sends an Enroll
 /// message before Register.
+///
+/// ## Single-task design
+///
+/// `snow::TransportState` is `!Send`, so the encrypted transport stays
+/// pinned to one task. All reads and writes flow through this fn.
+///
+/// ## C2: Noise nonce-desync mitigation
+///
+/// The 2026-04-25 audit's C2 finding flagged that mid-`select!` write
+/// failures can leave snow's AEAD nonce counter advanced relative to
+/// the peer. Audit's recommended fix — "move writes to a separate task
+/// owning a split write half" — doesn't apply: snow's `TransportState`
+/// is single-threaded by design and has no public split API.
+///
+/// The mitigation in place: every direct `send_message` call propagates
+/// errors via `?`, the mid-frame error path returns from `connect_and_run`,
+/// and the outer `run_connection` reconnect loop performs a fresh Noise
+/// handshake on the next iteration. A desynced nonce counter is therefore
+/// never observed by the next exchange — the entire transport is rebuilt.
 async fn connect_and_run(
     config: &RunConfig,
     keypair: &Keypair,
@@ -339,22 +447,10 @@ async fn connect_and_run(
     // clone (Arc inside).
     let content_cache = ContentCache::new(config.cache_dir(), config.cache_max_bytes);
 
-    // Track running chunks: chunk_id -> kill signal sender (at most one at a time)
-    let mut active_chunks: HashMap<Uuid, oneshot::Sender<()>> = HashMap::new();
-    // Track chunk -> task mapping (reserved for future use, e.g. reconnection)
-    let mut _chunk_task: HashMap<Uuid, Uuid> = HashMap::new();
-    // Queue for chunks waiting to run (serialized: only one hashcat at a time)
-    let mut pending_queue: VecDeque<PendingChunk> = VecDeque::new();
-
-    // Per-hash set of chunk IDs currently using the cached file. EvictFile
-    // defers while this is non-empty for the target hash.
-    let mut running_chunks_using: HashMap<String, HashSet<Uuid>> = HashMap::new();
-    // Reverse map: chunk_id -> sha256s it holds. On chunk completion we
-    // drop the chunk from each hash's set and drain pending_evictions.
-    let mut chunk_cache_holds: HashMap<Uuid, Vec<String>> = HashMap::new();
-    // Hashes the coord has asked us to evict but couldn't be removed yet
-    // because a chunk was still using them.
-    let mut pending_evictions: HashSet<String> = HashSet::new();
+    // All per-connection bookkeeping (active chunks, queued chunks,
+    // cache-hold tracking, deferred evictions). Lives in one struct
+    // so the loop body reads as I/O + dispatch.
+    let mut state = ConnectionState::new();
 
     loop {
         // We use `stream.readable()` in the select to detect when there is
@@ -401,7 +497,7 @@ async fn connect_and_run(
                 handle_runner_event(
                     &mut stream,
                     &mut transport,
-                    &mut active_chunks,
+                    &mut state.active_chunks,
                     chunk_id,
                     task_id,
                     event,
@@ -410,49 +506,27 @@ async fn connect_and_run(
                 .await?;
 
                 if is_terminal {
-                    // Release this chunk's hold on every sha it was using.
-                    // Any hash whose in-use set becomes empty and is on the
-                    // pending-evictions list is actually evicted now.
-                    if let Some(shas) = chunk_cache_holds.remove(&chunk_id) {
-                        for sha in shas {
-                            if let Some(users) = running_chunks_using.get_mut(&sha) {
-                                users.remove(&chunk_id);
-                                if users.is_empty() {
-                                    running_chunks_using.remove(&sha);
-                                    if pending_evictions.remove(&sha) {
-                                        let removed = content_cache.evict(&sha).await;
-                                        info!(
-                                            sha = %sha,
-                                            removed,
-                                            "deferred EvictFile flushed after chunk completion"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Release this chunk's cache holds. The state struct
+                    // applies any pending_evictions whose in-use set just
+                    // became empty.
+                    state.release_holds_for_chunk(chunk_id, &content_cache).await;
 
                     // Start the next queued chunk, if any.
-                    if let Some(next) = pending_queue.pop_front() {
+                    if let Some(next) = state.pending_queue.pop_front() {
                         info!(
                             chunk_id = %next.chunk_id,
-                            remaining = pending_queue.len(),
+                            remaining = state.pending_queue.len(),
                             "starting next queued chunk"
                         );
-                        // Register this chunk's cache holds before start.
-                        register_cache_holds(
-                            &next,
-                            &mut running_chunks_using,
-                            &mut chunk_cache_holds,
-                        );
+                        state.register_cache_holds(&next);
                         start_hashcat(
                             &next.run_config,
                             next.chunk_id,
                             next.task_id,
                             &mut stream,
                             &mut transport,
-                            &mut active_chunks,
-                            &mut _chunk_task,
+                            &mut state.active_chunks,
+                            &mut state.chunk_task,
                             &runner_tx,
                         )
                         .await?;
@@ -469,26 +543,26 @@ async fn connect_and_run(
                 // Register cache holds regardless of whether we start or
                 // queue — an EvictFile arriving while the chunk is queued
                 // must still defer.
-                register_cache_holds(&pending, &mut running_chunks_using, &mut chunk_cache_holds);
-                if active_chunks.is_empty() {
+                state.register_cache_holds(&pending);
+                if state.active_chunks.is_empty() {
                     start_hashcat(
                         &pending.run_config,
                         pending.chunk_id,
                         pending.task_id,
                         &mut stream,
                         &mut transport,
-                        &mut active_chunks,
-                        &mut _chunk_task,
+                        &mut state.active_chunks,
+                        &mut state.chunk_task,
                         &runner_tx,
                     )
                     .await?;
                 } else {
                     info!(
                         chunk_id = %pending.chunk_id,
-                        queue_len = pending_queue.len() + 1,
+                        queue_len = state.pending_queue.len() + 1,
                         "queuing resolved chunk (another hashcat is running)"
                     );
-                    pending_queue.push_back(pending);
+                    state.pending_queue.push_back(pending);
                 }
             }
 
@@ -597,12 +671,8 @@ async fn connect_and_run(
                             continue;
                         }
                         if needed > 0 {
-                            let headroom = evict_lru_for_budget(
-                                &content_cache,
-                                needed,
-                                &running_chunks_using,
-                            )
-                            .await;
+                            let headroom =
+                                evict_lru_for_budget(&content_cache, needed, &state).await;
                             if headroom < needed {
                                 warn!(
                                     %chunk_id,
@@ -748,12 +818,12 @@ async fn connect_and_run(
 
                     CoordMessage::AbortChunk { chunk_id } => {
                         info!(chunk_id = %chunk_id, "aborting chunk");
-                        if let Some(kill_tx) = active_chunks.remove(&chunk_id) {
+                        if let Some(kill_tx) = state.active_chunks.remove(&chunk_id) {
                             let _ = kill_tx.send(());
                         }
                         // Also remove from pending queue if queued but not yet started
-                        pending_queue.retain(|p| p.chunk_id != chunk_id);
-                        _chunk_task.remove(&chunk_id);
+                        state.pending_queue.retain(|p| p.chunk_id != chunk_id);
+                        state.chunk_task.remove(&chunk_id);
                     }
 
                     CoordMessage::RequestBenchmark { hash_mode } => {
@@ -770,7 +840,7 @@ async fn connect_and_run(
                     CoordMessage::Shutdown => {
                         info!("coordinator requested shutdown");
                         // Kill all running hashcat processes by sending kill signals
-                        for (cid, kill_tx) in active_chunks.drain() {
+                        for (cid, kill_tx) in state.active_chunks.drain() {
                             info!(chunk_id = %cid, "killing hashcat for shutdown");
                             let _ = kill_tx.send(());
                         }
@@ -798,19 +868,12 @@ async fn connect_and_run(
                     }
 
                     CoordMessage::EvictFile { hash } => {
-                        if running_chunks_using
-                            .get(&hash)
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                        {
-                            info!(
+                        match state.defer_or_apply_eviction(hash.clone(), &content_cache).await {
+                            Some(removed) => info!(%hash, removed, "EvictFile applied"),
+                            None => info!(
                                 %hash,
                                 "EvictFile deferred — file is in use by a running chunk"
-                            );
-                            pending_evictions.insert(hash);
-                        } else {
-                            let removed = content_cache.evict(&hash).await;
-                            info!(%hash, removed, "EvictFile applied");
+                            ),
                         }
                     }
 
@@ -822,15 +885,11 @@ async fn connect_and_run(
                         for entry in manifest {
                             if expected_set.contains(&entry.sha256) {
                                 kept.push(entry.sha256);
-                            } else if running_chunks_using
-                                .get(&entry.sha256)
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false)
-                            {
+                            } else if state.is_sha_in_use(&entry.sha256) {
                                 // In use right now — defer eviction. Treated
                                 // as kept for the Ack so the coord doesn't
                                 // think it disappeared.
-                                pending_evictions.insert(entry.sha256.clone());
+                                state.pending_evictions.insert(entry.sha256.clone());
                                 kept.push(entry.sha256);
                             } else if content_cache.evict(&entry.sha256).await {
                                 evicted.push(entry.sha256);
