@@ -1,12 +1,18 @@
 use chrono::Utc;
 use crack_common::models::{Chunk, ChunkStatus, Task, WorkerStatus};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::state::AppState;
 use crate::storage::db;
+use crate::storage::db::DispatchOutcome;
 
 use super::chunker::calculate_chunk_size;
+
+/// Maximum retry attempts on a `CursorMoved` outcome. With WAL serializing
+/// SQLite writes, contention is rare; a small bound keeps the dispatch path
+/// from looping forever if the system is genuinely overloaded.
+const DISPATCH_MAX_ATTEMPTS: usize = 4;
 
 /// Find the next available work and assign a chunk to the given worker.
 ///
@@ -32,85 +38,95 @@ pub async fn assign_next_chunk(
         return Ok(Some((task, chunk)));
     }
 
-    // Second: create a new chunk from the task cursor
-    let task = match db::find_next_dispatchable_task(&state.db).await? {
-        Some(t) => t,
-        None => {
-            debug!("no dispatchable tasks found");
+    // Second: create a new chunk from the task cursor.
+    //
+    // The flow is read-then-conditional-write to avoid double-dispatching
+    // overlapping keyspace ranges when multiple workers ask for work at
+    // once. `db::try_dispatch_new_chunk` returns `CursorMoved` if the
+    // cursor was advanced by another caller between our SELECT and its
+    // UPDATE; we re-read and try again, bounded by DISPATCH_MAX_ATTEMPTS.
+    for attempt in 0..DISPATCH_MAX_ATTEMPTS {
+        let task = match db::find_next_dispatchable_task(&state.db).await? {
+            Some(t) => t,
+            None => {
+                debug!("no dispatchable tasks found");
+                return Ok(None);
+            }
+        };
+
+        let total_keyspace = match task.total_keyspace {
+            Some(ks) => ks,
+            None => {
+                debug!(task_id = %task.id, "task has no computed keyspace yet");
+                return Ok(None);
+            }
+        };
+
+        // Cursor exhausted? Another caller may have just finished it.
+        if task.next_skip >= total_keyspace {
+            debug!(task_id = %task.id, "task keyspace fully dispatched");
             return Ok(None);
         }
-    };
 
-    let total_keyspace = match task.total_keyspace {
-        Some(ks) => ks,
-        None => {
-            debug!(task_id = %task.id, "task has no computed keyspace yet");
-            return Ok(None);
+        // Look up the worker's benchmark for this hash mode (if any).
+        // Cached in AppState — first miss reads from DB and populates.
+        let worker_speed = state.get_worker_speed(worker_id, task.hash_mode).await?;
+
+        // Count connected workers for chunk-sizing heuristic.
+        let num_workers = state.worker_connections.read().await.len();
+
+        let chunk_size = calculate_chunk_size(worker_speed, total_keyspace, num_workers);
+        let remaining = total_keyspace - task.next_skip;
+        let limit = chunk_size.min(remaining);
+
+        let chunk = Chunk {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            skip: task.next_skip,
+            limit,
+            status: ChunkStatus::Dispatched,
+            assigned_worker: Some(worker_id.to_string()),
+            assigned_at: Some(Utc::now()),
+            completed_at: None,
+            progress: 0.0,
+            speed: 0,
+            cracked_count: 0,
+        };
+
+        match db::try_dispatch_new_chunk(&state.db, task.id, task.next_skip, &chunk, worker_id)
+            .await?
+        {
+            DispatchOutcome::Dispatched => {
+                info!(
+                    task_id = %task.id,
+                    chunk_id = %chunk.id,
+                    worker_id,
+                    skip = chunk.skip,
+                    limit = chunk.limit,
+                    attempt,
+                    "assigned chunk to worker"
+                );
+                let mut task = task;
+                task.next_skip = task.next_skip.saturating_add(limit);
+                return Ok(Some((task, chunk)));
+            }
+            DispatchOutcome::CursorMoved => {
+                debug!(
+                    task_id = %task.id,
+                    attempt,
+                    "cursor moved between SELECT and UPDATE, retrying"
+                );
+                continue;
+            }
         }
-    };
-
-    // If the cursor has already reached the end, there is nothing left.
-    if task.next_skip >= total_keyspace {
-        debug!(task_id = %task.id, "task keyspace fully dispatched");
-        return Ok(None);
     }
 
-    // Look up the worker's benchmark for this hash mode (if any).
-    let worker_speed = db::get_benchmark(&state.db, worker_id, task.hash_mode)
-        .await?
-        .map(|b| b.speed);
-
-    // Count connected workers for chunk-sizing heuristic.
-    let num_workers = {
-        let conns = state.worker_connections.read().await;
-        conns.len()
-    };
-
-    let chunk_size = calculate_chunk_size(worker_speed, total_keyspace, num_workers);
-
-    // Clamp so we don't overshoot the keyspace.
-    let remaining = total_keyspace - task.next_skip;
-    let limit = chunk_size.min(remaining);
-
-    let now = Utc::now();
-    let chunk = Chunk {
-        id: Uuid::new_v4(),
-        task_id: task.id,
-        skip: task.next_skip,
-        limit,
-        status: ChunkStatus::Dispatched,
-        assigned_worker: Some(worker_id.to_string()),
-        assigned_at: Some(now),
-        completed_at: None,
-        progress: 0.0,
-        speed: 0,
-        cracked_count: 0,
-    };
-
-    // Persist the chunk.
-    db::insert_chunk(&state.db, &chunk).await?;
-
-    // Mark the worker as working.
-    db::update_worker_status(&state.db, worker_id, WorkerStatus::Working).await?;
-
-    // Advance the task cursor.
-    let new_skip = task.next_skip + limit;
-    db::advance_task_cursor(&state.db, task.id, new_skip).await?;
-
-    info!(
-        task_id = %task.id,
-        chunk_id = %chunk.id,
+    warn!(
         worker_id,
-        skip = chunk.skip,
-        limit = chunk.limit,
-        "assigned chunk to worker"
+        attempts = DISPATCH_MAX_ATTEMPTS,
+        "give up assigning chunk: cursor kept moving (high contention or stuck cursor)"
     );
-
-    // Return the task with the updated cursor for the caller's convenience.
-    let mut task = task;
-    task.next_skip = new_skip;
-
-    Ok(Some((task, chunk)))
+    Ok(None)
 }
 
 /// Reassign an abandoned or failed chunk by creating a new chunk for the remaining work.

@@ -124,18 +124,36 @@ struct ErrorResponse {
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    token: String,
 }
 
 impl Client {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, token: String) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            token,
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
+    }
+
+    /// Build a request with the bearer token attached. All outbound HTTP
+    /// goes through one of these helpers so the Authorization header is
+    /// impossible to forget at a call site.
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http.get(self.url(path)).bearer_auth(&self.token)
+    }
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http.post(self.url(path)).bearer_auth(&self.token)
+    }
+    fn patch(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http.patch(self.url(path)).bearer_auth(&self.token)
+    }
+    fn delete(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http.delete(self.url(path)).bearer_auth(&self.token)
     }
 
     /// Check for HTTP error status and attempt to parse a JSON error body.
@@ -161,8 +179,7 @@ impl Client {
 
     pub async fn create_task(&self, req: CreateTaskPayload) -> Result<Task> {
         let resp = self
-            .http
-            .post(self.url("/api/v1/tasks"))
+            .post("/api/v1/tasks")
             .json(&req)
             .send()
             .await
@@ -175,8 +192,7 @@ impl Client {
 
     pub async fn list_tasks(&self) -> Result<Vec<Task>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/tasks"))
+            .get("/api/v1/tasks")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -188,8 +204,7 @@ impl Client {
 
     pub async fn get_task(&self, id: &str) -> Result<TaskDetail> {
         let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/tasks/{id}")))
+            .get(&format!("/api/v1/tasks/{id}"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -205,8 +220,7 @@ impl Client {
         };
 
         let resp = self
-            .http
-            .patch(self.url(&format!("/api/v1/tasks/{id}")))
+            .patch(&format!("/api/v1/tasks/{id}"))
             .json(&payload)
             .send()
             .await
@@ -218,8 +232,7 @@ impl Client {
 
     pub async fn delete_task(&self, id: &str) -> Result<()> {
         let resp = self
-            .http
-            .delete(self.url(&format!("/api/v1/tasks/{id}")))
+            .delete(&format!("/api/v1/tasks/{id}"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -230,8 +243,7 @@ impl Client {
 
     pub async fn get_task_results(&self, id: &str) -> Result<Vec<CrackedHash>> {
         let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/tasks/{id}/results")))
+            .get(&format!("/api/v1/tasks/{id}/results"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -245,8 +257,7 @@ impl Client {
 
     pub async fn create_campaign(&self, req: CreateCampaignPayload) -> Result<Campaign> {
         let resp = self
-            .http
-            .post(self.url("/api/v1/campaigns"))
+            .post("/api/v1/campaigns")
             .json(&req)
             .send()
             .await
@@ -262,8 +273,7 @@ impl Client {
 
     pub async fn list_campaigns(&self) -> Result<Vec<Campaign>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/campaigns"))
+            .get("/api/v1/campaigns")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -275,8 +285,7 @@ impl Client {
 
     pub async fn get_campaign(&self, id: &str) -> Result<CampaignDetailResponse> {
         let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/campaigns/{id}")))
+            .get(&format!("/api/v1/campaigns/{id}"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -291,8 +300,7 @@ impl Client {
 
     pub async fn start_campaign(&self, id: &str) -> Result<Campaign> {
         let resp = self
-            .http
-            .post(self.url(&format!("/api/v1/campaigns/{id}/start")))
+            .post(&format!("/api/v1/campaigns/{id}/start"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -308,8 +316,7 @@ impl Client {
         };
 
         let resp = self
-            .http
-            .patch(self.url(&format!("/api/v1/campaigns/{id}")))
+            .patch(&format!("/api/v1/campaigns/{id}"))
             .json(&payload)
             .send()
             .await
@@ -321,8 +328,7 @@ impl Client {
 
     pub async fn delete_campaign(&self, id: &str) -> Result<()> {
         let resp = self
-            .http
-            .delete(self.url(&format!("/api/v1/campaigns/{id}")))
+            .delete(&format!("/api/v1/campaigns/{id}"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -333,8 +339,7 @@ impl Client {
 
     pub async fn get_campaign_results(&self, id: &str) -> Result<Vec<CrackedHash>> {
         let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/campaigns/{id}/results")))
+            .get(&format!("/api/v1/campaigns/{id}/results"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -346,8 +351,7 @@ impl Client {
 
     pub async fn list_templates(&self) -> Result<Vec<CampaignTemplate>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/campaigns/templates"))
+            .get("/api/v1/campaigns/templates")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -420,8 +424,7 @@ impl Client {
             .text("file_type", file_type.to_string());
 
         let resp = self
-            .http
-            .post(self.url("/api/v1/files"))
+            .post("/api/v1/files")
             .multipart(form)
             .send()
             .await
@@ -467,12 +470,7 @@ impl Client {
 
         // Ask coord for its files_dir device id. If this endpoint doesn't
         // exist (older coord), fall through to streaming.
-        let resp = self
-            .http
-            .get(self.url("/api/v1/server-info"))
-            .send()
-            .await
-            .ok()?;
+        let resp = self.get("/api/v1/server-info").send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -493,8 +491,7 @@ impl Client {
         };
 
         let resp = self
-            .http
-            .post(self.url("/api/v1/files/hardlink"))
+            .post("/api/v1/files/hardlink")
             .json(&payload)
             .send()
             .await
@@ -507,8 +504,7 @@ impl Client {
 
     pub async fn list_files(&self) -> Result<Vec<FileRecord>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/files"))
+            .get("/api/v1/files")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -520,8 +516,7 @@ impl Client {
 
     pub async fn pin_file(&self, file_id: &str) -> Result<()> {
         let resp = self
-            .http
-            .post(self.url(&format!("/api/v1/files/{file_id}/pin")))
+            .post(&format!("/api/v1/files/{file_id}/pin"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -531,8 +526,7 @@ impl Client {
 
     pub async fn unpin_file(&self, file_id: &str) -> Result<()> {
         let resp = self
-            .http
-            .post(self.url(&format!("/api/v1/files/{file_id}/unpin")))
+            .post(&format!("/api/v1/files/{file_id}/unpin"))
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -542,8 +536,7 @@ impl Client {
 
     pub async fn gc_now(&self) -> Result<()> {
         let resp = self
-            .http
-            .post(self.url("/api/v1/files/gc"))
+            .post("/api/v1/files/gc")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -553,8 +546,7 @@ impl Client {
 
     pub async fn cache_status(&self) -> Result<Vec<WorkerCacheStatus>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/cache/status"))
+            .get("/api/v1/cache/status")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -568,8 +560,7 @@ impl Client {
 
     pub async fn list_workers(&self) -> Result<Vec<Worker>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/workers"))
+            .get("/api/v1/workers")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -586,8 +577,7 @@ impl Client {
         };
 
         let resp = self
-            .http
-            .post(self.url("/api/v1/workers/authorize"))
+            .post("/api/v1/workers/authorize")
             .json(&payload)
             .send()
             .await
@@ -608,8 +598,7 @@ impl Client {
         };
 
         let resp = self
-            .http
-            .post(self.url("/api/v1/workers/enroll"))
+            .post("/api/v1/workers/enroll")
             .json(&payload)
             .send()
             .await
@@ -627,8 +616,7 @@ impl Client {
 
     pub async fn get_status(&self) -> Result<SystemStatus> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/status"))
+            .get("/api/v1/status")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -640,8 +628,7 @@ impl Client {
 
     pub async fn get_potfile_stats(&self) -> Result<PotfileStats> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/potfile/stats"))
+            .get("/api/v1/potfile/stats")
             .send()
             .await
             .context("failed to reach coordinator")?;
@@ -653,8 +640,7 @@ impl Client {
 
     pub async fn export_potfile(&self) -> Result<Vec<String>> {
         let resp = self
-            .http
-            .get(self.url("/api/v1/potfile/plaintexts"))
+            .get("/api/v1/potfile/plaintexts")
             .send()
             .await
             .context("failed to reach coordinator")?;

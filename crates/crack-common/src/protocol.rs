@@ -19,16 +19,6 @@ pub enum CoordMessage {
     /// and `WorkerMessage::Register`. Conveys the worker's authoritative
     /// ID (the coord's view, used by the agent for log correlation).
     Welcome { worker_id: String },
-    /// Stream a file to the worker in chunks. The agent reconstructs
-    /// the file from ordered chunks and caches it by file_id.
-    TransferFileChunk {
-        file_id: String,
-        filename: String,
-        chunk_index: u32,
-        total_chunks: u32,
-        /// ~40KB of raw data, base64-encoded (fits in a single Noise frame).
-        data_b64: String,
-    },
     /// Response to `WorkerMessage::RequestFileRange`. Carries a byte range
     /// of the file identified by `hash` (sha256 hex). `eof = true` when
     /// `offset + data.len() >= total file size`, signalling the worker to
@@ -56,19 +46,21 @@ pub enum CoordMessage {
     /// drift accumulated while the agent was disconnected. Eviction
     /// defers as usual when a sha is in use by a running chunk.
     CacheReconcile { expected: Vec<String> },
-    /// Dispatch a single chunk of work to the worker. The agent runs
-    /// hashcat against the supplied (eagerly inlined) hash file with the
-    /// attack-specific parameters in `attack`. `skip`/`limit` are passed
-    /// through to hashcat as restore points; `extra_args` is appended
-    /// verbatim. Only one chunk runs at a time per agent — additional
-    /// assignments queue locally.
+    /// Dispatch a single chunk of work to the worker. Every referenced
+    /// file (hash file, wordlist, rules) is identified by sha256 — the
+    /// agent looks them up in its content-addressed cache and pulls on
+    /// miss via `RequestFileRange`/`FileRange`. `skip`/`limit` are
+    /// passed through to hashcat as restore points; `extra_args` is
+    /// appended verbatim. Only one chunk runs at a time per agent —
+    /// additional assignments queue locally.
     AssignChunk {
         chunk_id: Uuid,
         task_id: Uuid,
         hash_mode: u32,
-        /// Hash file content (base64-encoded) sent over the encrypted channel.
-        hash_file_b64: String,
-        hash_file_id: String,
+        /// sha256 of the hash file. The agent fetches it via the
+        /// content cache exactly like wordlists/rules — see `attack`.
+        hash_file_sha256: String,
+        hash_file_size: u64,
         skip: u64,
         limit: u64,
         attack: AssignChunkAttack,
@@ -98,15 +90,6 @@ pub enum AssignChunkAttack {
     BruteForce {
         mask: String,
         custom_charsets: Option<Vec<String>>,
-    },
-    /// Legacy: agent receives the wordlist bytes eagerly via TransferFileChunk
-    /// before this message. Kept for backwards compatibility; new coord
-    /// code prefers `DictionaryByHash` for dictionary attacks.
-    Dictionary { wordlist_file_id: String },
-    /// Legacy: same as `Dictionary` but with a rules file also pushed eagerly.
-    DictionaryWithRules {
-        wordlist_file_id: String,
-        rules_file_id: String,
     },
     /// Pull-based dispatch: the agent looks up the referenced files in its
     /// content-addressed cache by sha256; on miss, it fetches them via
@@ -254,8 +237,9 @@ pub struct CacheManifestEntry {
 
 /// Hard ceiling on a single decoded message body. Decoder rejects any
 /// length-prefix exceeding this — protects against memory exhaustion from
-/// a malformed or hostile frame. 16 MiB matches the largest
-/// `TransferFileChunk` envelope the protocol can carry.
+/// a malformed or hostile frame. 16 MiB is generous for the
+/// `AssignChunk` hash-file payload and `FileRange` chunks, and tight
+/// enough that a single oversized frame doesn't OOM the worker.
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// Serialize `msg` as JSON and prepend the 4-byte big-endian length
@@ -328,36 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_transfer_file_chunk() {
-        let msg = CoordMessage::TransferFileChunk {
-            file_id: "file-abc".to_string(),
-            filename: "rockyou.txt".to_string(),
-            chunk_index: 3,
-            total_chunks: 10,
-            data_b64: "SGVsbG8gV29ybGQ=".to_string(),
-        };
-        let encoded = encode_message(&msg).unwrap();
-        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
-        assert_eq!(consumed, encoded.len());
-        match decoded {
-            CoordMessage::TransferFileChunk {
-                file_id,
-                filename,
-                chunk_index,
-                total_chunks,
-                data_b64,
-            } => {
-                assert_eq!(file_id, "file-abc");
-                assert_eq!(filename, "rockyou.txt");
-                assert_eq!(chunk_index, 3);
-                assert_eq!(total_chunks, 10);
-                assert_eq!(data_b64, "SGVsbG8gV29ybGQ=");
-            }
-            other => panic!("expected TransferFileChunk, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn roundtrip_assign_chunk_brute_force() {
         let chunk_id = Uuid::new_v4();
         let task_id = Uuid::new_v4();
@@ -365,8 +319,8 @@ mod tests {
             chunk_id,
             task_id,
             hash_mode: 1000,
-            hash_file_b64: "aGFzaGVz".to_string(),
-            hash_file_id: "hf-001".to_string(),
+            hash_file_sha256: "deadbeef".to_string(),
+            hash_file_size: 1024,
             skip: 0,
             limit: 50000,
             attack: AssignChunkAttack::BruteForce {
@@ -383,8 +337,8 @@ mod tests {
                 chunk_id: cid,
                 task_id: tid,
                 hash_mode,
-                hash_file_b64,
-                hash_file_id,
+                hash_file_sha256,
+                hash_file_size,
                 skip,
                 limit,
                 attack,
@@ -393,8 +347,8 @@ mod tests {
                 assert_eq!(cid, chunk_id);
                 assert_eq!(tid, task_id);
                 assert_eq!(hash_mode, 1000);
-                assert_eq!(hash_file_b64, "aGFzaGVz");
-                assert_eq!(hash_file_id, "hf-001");
+                assert_eq!(hash_file_sha256, "deadbeef");
+                assert_eq!(hash_file_size, 1024);
                 assert_eq!(skip, 0);
                 assert_eq!(limit, 50000);
                 match attack {
@@ -409,73 +363,6 @@ mod tests {
                 }
                 assert_eq!(extra_args, vec!["--force".to_string()]);
             }
-            other => panic!("expected AssignChunk, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn roundtrip_assign_chunk_dictionary() {
-        let chunk_id = Uuid::new_v4();
-        let task_id = Uuid::new_v4();
-        let msg = CoordMessage::AssignChunk {
-            chunk_id,
-            task_id,
-            hash_mode: 0,
-            hash_file_b64: "dGVzdA==".to_string(),
-            hash_file_id: "hf-002".to_string(),
-            skip: 100,
-            limit: 200,
-            attack: AssignChunkAttack::Dictionary {
-                wordlist_file_id: "wl-001".to_string(),
-            },
-            extra_args: vec![],
-        };
-        let encoded = encode_message(&msg).unwrap();
-        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
-        assert_eq!(consumed, encoded.len());
-        match decoded {
-            CoordMessage::AssignChunk { attack, .. } => match attack {
-                AssignChunkAttack::Dictionary { wordlist_file_id } => {
-                    assert_eq!(wordlist_file_id, "wl-001");
-                }
-                other => panic!("expected Dictionary, got {other:?}"),
-            },
-            other => panic!("expected AssignChunk, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn roundtrip_assign_chunk_dict_rules() {
-        let chunk_id = Uuid::new_v4();
-        let task_id = Uuid::new_v4();
-        let msg = CoordMessage::AssignChunk {
-            chunk_id,
-            task_id,
-            hash_mode: 1000,
-            hash_file_b64: "cnVsZXM=".to_string(),
-            hash_file_id: "hf-003".to_string(),
-            skip: 0,
-            limit: 999,
-            attack: AssignChunkAttack::DictionaryWithRules {
-                wordlist_file_id: "wl-002".to_string(),
-                rules_file_id: "rl-001".to_string(),
-            },
-            extra_args: vec![],
-        };
-        let encoded = encode_message(&msg).unwrap();
-        let (decoded, consumed): (CoordMessage, usize) = decode_message(&encoded).unwrap().unwrap();
-        assert_eq!(consumed, encoded.len());
-        match decoded {
-            CoordMessage::AssignChunk { attack, .. } => match attack {
-                AssignChunkAttack::DictionaryWithRules {
-                    wordlist_file_id,
-                    rules_file_id,
-                } => {
-                    assert_eq!(wordlist_file_id, "wl-002");
-                    assert_eq!(rules_file_id, "rl-001");
-                }
-                other => panic!("expected DictionaryWithRules, got {other:?}"),
-            },
             other => panic!("expected AssignChunk, got {other:?}"),
         }
     }
@@ -891,8 +778,8 @@ mod tests {
             chunk_id,
             task_id,
             hash_mode: 0,
-            hash_file_b64: "aGY=".to_string(),
-            hash_file_id: "hf-099".to_string(),
+            hash_file_sha256: "cafebabe".to_string(),
+            hash_file_size: 42,
             skip: 0,
             limit: 12345,
             attack: AssignChunkAttack::DictionaryByHash {

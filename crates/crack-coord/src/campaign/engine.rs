@@ -49,8 +49,7 @@ pub async fn start_campaign(state: &Arc<AppState>, campaign_id: Uuid) -> Result<
         start_phase(state, &campaign, phase, &campaign.original_hash_file_id).await?;
     }
 
-    db::insert_audit(
-        &state.db,
+    state.emit_audit(
         "campaign_started",
         &format!(
             "Campaign '{}' started with {} hashes, {} phases",
@@ -58,8 +57,7 @@ pub async fn start_campaign(state: &Arc<AppState>, campaign_id: Uuid) -> Result<
         ),
         None,
         None,
-    )
-    .await?;
+    );
 
     Ok(())
 }
@@ -426,8 +424,7 @@ async fn start_phase_inner(
                 info!(campaign_id = %campaign.id, phase = phase.phase_index,
                     "pattern analyzer produced no new masks, skipping phase");
                 db::update_phase_status(&state.db, phase.id, PhaseStatus::Skipped).await?;
-                db::insert_audit(
-                    &state.db,
+                state.emit_audit(
                     "campaign_phase_skipped",
                     &format!(
                         "Phase {} '{}' skipped: no new masks ({} passwords, {} skeletons)",
@@ -438,14 +435,12 @@ async fn start_phase_inner(
                     ),
                     None,
                     None,
-                )
-                .await?;
+                );
                 advance_phase(state, campaign.id).await?;
                 return Ok(());
             }
 
-            db::insert_audit(
-                &state.db,
+            state.emit_audit(
                 "campaign_auto_masks",
                 &format!(
                     "Phase {} '{}' generated {} masks from {} passwords ({} skeletons)",
@@ -457,8 +452,7 @@ async fn start_phase_inner(
                 ),
                 None,
                 None,
-            )
-            .await?;
+            );
 
             if let Some(gm) = result.masks.first() {
                 let task = create_phase_task(

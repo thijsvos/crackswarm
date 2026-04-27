@@ -8,10 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use std::collections::HashSet;
-
 use base64::Engine;
-use crack_common::auth::{build_responder, encode_public_key};
+use crack_common::auth::{build_responder, encode_public_key, pubkey_fingerprint};
 use crack_common::models::*;
 use crack_common::protocol::{AssignChunkAttack, CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
 
@@ -33,15 +31,70 @@ pub async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, peer
 
 // ── Handshake + session ─────────────────────────────────────────────────────
 
+/// Outcome of the pre-loop authentication phase. `Authorized` means the
+/// caller goes straight into the message loop; `Disconnect` means the
+/// per-connection task should clean up and exit (token timeout, decrypt
+/// failure, invalid enroll, unauthorized non-Enroll, etc.).
+enum AuthOutcome {
+    Authorized,
+    Disconnect,
+}
+
+/// Carries the post-handshake Noise transport + the peer's identity.
+/// Returned from `perform_handshake` so each phase has narrow inputs.
+struct HandshakeOutcome {
+    transport: snow::TransportState,
+    pubkey_b64: String,
+    pubkey_fp: String,
+}
+
 async fn run_connection(
     state: &Arc<AppState>,
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    // ── 1. Noise IK handshake (coordinator is responder) ────────────────
+    let HandshakeOutcome {
+        mut transport,
+        pubkey_b64,
+        pubkey_fp,
+    } = perform_handshake(&state.keypair, stream, peer_addr).await?;
 
-    let mut handshake =
-        build_responder(&state.keypair).context("failed to build noise responder")?;
+    let authorized = db::is_worker_authorized(&state.db, &pubkey_b64)
+        .await
+        .context("failed to check worker authorization")?;
+
+    if !authorized {
+        match await_enrollment_or_reject(
+            state,
+            stream,
+            &mut transport,
+            peer_addr,
+            &pubkey_b64,
+            &pubkey_fp,
+        )
+        .await?
+        {
+            AuthOutcome::Authorized => {} // fall through to message loop
+            AuthOutcome::Disconnect => return Ok(()),
+        }
+    }
+
+    let worker_id = run_message_loop(state, stream, &mut transport, peer_addr, &pubkey_b64).await?;
+
+    cleanup(state, worker_id.as_deref(), peer_addr).await;
+    Ok(())
+}
+
+/// Run the Noise IK responder side of the handshake on `stream`.
+/// On success, `stream` is in transport mode and the returned
+/// [`HandshakeOutcome`] carries the encrypted transport plus the peer's
+/// authenticated public key (raw + truncated fingerprint for logs).
+async fn perform_handshake(
+    keypair: &crack_common::auth::Keypair,
+    stream: &mut TcpStream,
+    peer_addr: SocketAddr,
+) -> anyhow::Result<HandshakeOutcome> {
+    let mut handshake = build_responder(keypair).context("failed to build noise responder")?;
 
     // Read the initiator's first message (e, es, s, ss).
     let msg1 = read_noise_frame(stream)
@@ -49,26 +102,19 @@ async fn run_connection(
         .context("failed to read handshake message 1")?;
 
     let mut buf = vec![0u8; 65535];
-    let _payload_len = handshake
+    handshake
         .read_message(&msg1, &mut buf)
         .context("noise handshake: failed to process initiator message")?;
 
-    // Extract the client's static public key.
     let remote_static = handshake
         .get_remote_static()
         .context("noise handshake: no remote static key")?
         .to_vec();
     let pubkey_b64 = encode_public_key(&remote_static);
+    let pubkey_fp = pubkey_fingerprint(&pubkey_b64);
 
-    // Check authorization.
-    let authorized = db::is_worker_authorized(&state.db, &pubkey_b64)
-        .await
-        .context("failed to check worker authorization")?;
-
-    // Always complete the Noise handshake so unauthorized workers can
-    // attempt enrollment over the encrypted channel.
-
-    // Send the responder's reply message (e, ee, se).
+    // Always complete the responder's reply so unauthorized workers can
+    // still attempt enrollment over the encrypted channel.
     let len = handshake
         .write_message(&[], &mut buf)
         .context("noise handshake: failed to write responder message")?;
@@ -76,126 +122,141 @@ async fn run_connection(
         .await
         .context("failed to send handshake message 2")?;
 
-    // Transition to transport mode.
-    let mut transport = handshake
+    let transport = handshake
         .into_transport_mode()
         .context("failed to enter noise transport mode")?;
 
-    info!(%peer_addr, pubkey = %pubkey_b64, "noise handshake complete");
+    // Log a fingerprint, not the full pubkey: tracing output lands on disk
+    // under default umask; the audit_log table keeps the full key.
+    info!(%peer_addr, pubkey_fp = %pubkey_fp, "noise handshake complete");
 
-    // If not authorized, wait for an Enroll message (with timeout).
-    if !authorized {
-        info!(%peer_addr, pubkey = %pubkey_b64, "worker not pre-authorized, waiting for enrollment");
+    Ok(HandshakeOutcome {
+        transport,
+        pubkey_b64,
+        pubkey_fp,
+    })
+}
 
-        let enroll_result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), read_noise_frame(stream)).await;
+/// Block for up to 5s reading an `Enroll` message from an unauthorized
+/// peer. Valid nonce + matching name → authorize the worker and return
+/// `Authorized`. Anything else (timeout, decrypt fail, invalid message,
+/// unknown nonce, non-Enroll variant) audits the rejection and returns
+/// `Disconnect`.
+async fn await_enrollment_or_reject(
+    state: &Arc<AppState>,
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    peer_addr: SocketAddr,
+    pubkey_b64: &str,
+    pubkey_fp: &str,
+) -> anyhow::Result<AuthOutcome> {
+    info!(%peer_addr, pubkey_fp = %pubkey_fp, "worker not pre-authorized, waiting for enrollment");
 
-        let ciphertext = match enroll_result {
-            Ok(Ok(ct)) => ct,
-            Ok(Err(e)) => {
-                warn!(%peer_addr, error = %e, "enrollment read error");
-                return Ok(());
-            }
-            Err(_) => {
-                warn!(%peer_addr, pubkey = %pubkey_b64, "enrollment timeout, disconnecting");
-                db::insert_audit(
-                    &state.db,
-                    "auth_rejected",
-                    &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
-                    Some(&peer_addr.to_string()),
-                    None,
-                )
-                .await
-                .ok();
-                return Ok(());
-            }
-        };
+    let enroll_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_noise_frame(stream)).await;
 
-        // Decrypt the message
-        let mut enroll_buf = vec![0u8; 65535];
-        let plaintext_len = match transport.read_message(&ciphertext, &mut enroll_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(%peer_addr, error = %e, "enrollment decrypt failed");
-                return Ok(());
-            }
-        };
+    let ciphertext = match enroll_result {
+        Ok(Ok(ct)) => ct,
+        Ok(Err(e)) => {
+            warn!(%peer_addr, error = %e, "enrollment read error");
+            return Ok(AuthOutcome::Disconnect);
+        }
+        Err(_) => {
+            warn!(%peer_addr, pubkey_fp = %pubkey_fp, "enrollment timeout, disconnecting");
+            state.emit_audit(
+                "auth_rejected",
+                &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
+                Some(&peer_addr.to_string()),
+                None,
+            );
+            return Ok(AuthOutcome::Disconnect);
+        }
+    };
 
-        let msg: WorkerMessage = match serde_json::from_slice(&enroll_buf[..plaintext_len]) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(%peer_addr, error = %e, "invalid enrollment message");
-                return Ok(());
-            }
-        };
+    let mut enroll_buf = vec![0u8; 65535];
+    let plaintext_len = match transport.read_message(&ciphertext, &mut enroll_buf) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(%peer_addr, error = %e, "enrollment decrypt failed");
+            return Ok(AuthOutcome::Disconnect);
+        }
+    };
 
-        match msg {
-            WorkerMessage::Enroll { nonce, worker_name } => {
-                info!(%peer_addr, %worker_name, "received enrollment request");
+    let msg: WorkerMessage = match serde_json::from_slice(&enroll_buf[..plaintext_len]) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(%peer_addr, error = %e, "invalid enrollment message");
+            return Ok(AuthOutcome::Disconnect);
+        }
+    };
 
-                // Validate the nonce
-                let valid_name = db::validate_enrollment_nonce(&state.db, &nonce).await?;
-                match valid_name {
-                    Some(token_name) => {
-                        // Mark nonce as used, authorize the worker
-                        db::mark_nonce_used(&state.db, &nonce, &pubkey_b64).await?;
-                        db::authorize_worker(&state.db, &pubkey_b64, &token_name).await?;
+    match msg {
+        WorkerMessage::Enroll { nonce, worker_name } => {
+            info!(%peer_addr, %worker_name, "received enrollment request");
 
-                        db::insert_audit(
-                            &state.db,
-                            "worker_enrolled",
-                            &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
-                            Some(&peer_addr.to_string()),
-                            None,
-                        )
-                        .await
-                        .ok();
+            let valid_name = db::validate_enrollment_nonce(&state.db, &nonce).await?;
+            match valid_name {
+                Some(token_name) => {
+                    db::mark_nonce_used(&state.db, &nonce, pubkey_b64).await?;
+                    db::authorize_worker(&state.db, pubkey_b64, &token_name).await?;
 
-                        info!(%peer_addr, name = %token_name, "worker enrolled successfully via token");
-                        // Fall through to the normal message loop
-                    }
-                    None => {
-                        warn!(%peer_addr, "invalid or expired enrollment nonce");
-                        db::insert_audit(
-                            &state.db,
-                            "enroll_rejected",
-                            &format!(
-                                "Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"
-                            ),
-                            Some(&peer_addr.to_string()),
-                            None,
-                        )
-                        .await
-                        .ok();
-                        return Ok(());
-                    }
+                    state.emit_audit(
+                        "worker_enrolled",
+                        &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
+                        Some(&peer_addr.to_string()),
+                        None,
+                    );
+
+                    info!(%peer_addr, name = %token_name, "worker enrolled successfully via token");
+                    Ok(AuthOutcome::Authorized)
+                }
+                None => {
+                    warn!(%peer_addr, "invalid or expired enrollment nonce");
+                    state.emit_audit(
+                        "enroll_rejected",
+                        &format!("Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"),
+                        Some(&peer_addr.to_string()),
+                        None,
+                    );
+                    Ok(AuthOutcome::Disconnect)
                 }
             }
-            _ => {
-                warn!(%peer_addr, pubkey = %pubkey_b64, "unauthorized worker sent non-Enroll message, disconnecting");
-                db::insert_audit(
-                    &state.db,
-                    "auth_rejected",
-                    &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
-                    Some(&peer_addr.to_string()),
-                    None,
-                )
-                .await
-                .ok();
-                return Ok(());
-            }
+        }
+        _ => {
+            warn!(%peer_addr, pubkey_fp = %pubkey_fp, "unauthorized worker sent non-Enroll message, disconnecting");
+            state.emit_audit(
+                "auth_rejected",
+                &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
+                Some(&peer_addr.to_string()),
+                None,
+            );
+            Ok(AuthOutcome::Disconnect)
         }
     }
+}
 
-    // ── 2. Message loop ─────────────────────────────────────────────────
-
+/// Drive the encrypted message loop until the peer disconnects or a
+/// transport-level error pops. Returns the worker's id once it has
+/// `Register`'d, so the caller can pass it to `cleanup`.
+async fn run_message_loop(
+    state: &Arc<AppState>,
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    peer_addr: SocketAddr,
+    pubkey_b64: &str,
+) -> anyhow::Result<Option<String>> {
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<CoordMessage>(64);
 
-    // We track the worker_id once the Register message arrives.
     let mut worker_id: Option<String> = None;
 
-    // Track which files have been transferred to this worker so we don't re-send.
-    let mut transferred_files: HashSet<String> = HashSet::new();
+    // Per-connection sha allow-list (C11). A worker may only fetch files
+    // we've explicitly named to it via `AssignChunk`. Without this an
+    // authorized worker for campaign A could enumerate campaign B's
+    // files by guessing or copying their sha256s. Populated as
+    // `AssignChunk` messages flow out; checked on every
+    // `RequestFileRange`. The list grows monotonically for the
+    // connection's lifetime; reconnect resets it.
+    let mut assigned_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Reusable buffers.
     let mut read_buf = vec![0u8; 65535];
@@ -235,10 +296,10 @@ async fn run_connection(
                     state,
                     &msg,
                     &outbound_tx,
-                    &pubkey_b64,
+                    pubkey_b64,
                     peer_addr,
                     &mut worker_id,
-                    &mut transferred_files,
+                    &assigned_shas,
                 ).await {
                     error!(%peer_addr, error = %e, "error handling worker message");
                 }
@@ -246,6 +307,30 @@ async fn run_connection(
 
             // ── Outbound: send encrypted message to TCP ─────────────
             Some(coord_msg) = outbound_rx.recv() => {
+                // Sha allow-list maintenance (C11): record every file we
+                // name in an outbound `AssignChunk`. The agent is allowed
+                // to `RequestFileRange` only for shas it appears in this
+                // set.
+                if let CoordMessage::AssignChunk {
+                    hash_file_sha256,
+                    attack,
+                    ..
+                } = &coord_msg
+                {
+                    assigned_shas.insert(hash_file_sha256.clone());
+                    if let AssignChunkAttack::DictionaryByHash {
+                        wordlist_sha256,
+                        rules_sha256,
+                        ..
+                    } = attack
+                    {
+                        assigned_shas.insert(wordlist_sha256.clone());
+                        if let Some(rs) = rules_sha256 {
+                            assigned_shas.insert(rs.clone());
+                        }
+                    }
+                }
+
                 let json = match serde_json::to_vec(&coord_msg) {
                     Ok(j) => j,
                     Err(e) => {
@@ -279,11 +364,7 @@ async fn run_connection(
         }
     }
 
-    // ── 3. Cleanup on disconnect ────────────────────────────────────────
-
-    cleanup(state, worker_id.as_deref(), peer_addr).await;
-
-    Ok(())
+    Ok(worker_id)
 }
 
 // ── Wire framing ────────────────────────────────────────────────────────────
@@ -322,7 +403,7 @@ async fn handle_worker_message(
     pubkey_b64: &str,
     peer_addr: SocketAddr,
     worker_id: &mut Option<String>,
-    transferred_files: &mut HashSet<String>,
+    assigned_shas: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     match msg {
         WorkerMessage::Register {
@@ -341,50 +422,12 @@ async fn handle_worker_message(
                 os,
                 devices,
                 worker_id,
-                transferred_files,
             )
             .await
         }
 
         WorkerMessage::Heartbeat { cache_manifest } => {
-            if let Some(wid) = worker_id.as_deref() {
-                db::update_worker_last_seen(&state.db, wid).await?;
-                // Sync the coord's view of this worker's cache. Entries
-                // present here but missing from the DB are upserted;
-                // entries in the DB but missing from this manifest are
-                // removed (the agent evicted them locally since last tick).
-                if let Err(e) = db::sync_worker_cache_manifest(&state.db, wid, cache_manifest).await
-                {
-                    warn!(worker = %wid, error = %e, "failed to sync cache manifest");
-                }
-
-                // Drift-correction tick (issue #45). If the manifest carries
-                // a sha that is no longer active on the coord, tell the agent
-                // to evict it. Catches: missed `EvictFile` (mpsc backpressure
-                // / transient drop), post-coord-restart staleness, and any
-                // other cause of view divergence between coord and agent.
-                // Same-cycle double-fires (this PR's gc_pass fallback +
-                // heartbeat re-evict) are harmless: agent's `evict` is
-                // idempotent and no-ops a second call.
-                match db::list_active_file_shas(&state.db).await {
-                    Ok(active) => {
-                        let active: std::collections::HashSet<_> = active.into_iter().collect();
-                        for entry in cache_manifest {
-                            if !active.contains(&entry.sha256) {
-                                let _ = outbound_tx
-                                    .send(CoordMessage::EvictFile {
-                                        hash: entry.sha256.clone(),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(worker = %wid, error = %e, "drift-correction lookup failed")
-                    }
-                }
-            }
-            Ok(())
+            handle_heartbeat(state, outbound_tx, worker_id.as_deref(), cache_manifest).await
         }
 
         WorkerMessage::ChunkStarted { chunk_id } => {
@@ -399,8 +442,6 @@ async fn handle_worker_message(
             ..
         } => {
             db::update_chunk_progress(&state.db, *chunk_id, *progress_pct, *speed).await?;
-
-            // Look up the task_id for this chunk so we can emit the event.
             if let Some(chunk) = db::get_chunk(&state.db, *chunk_id).await? {
                 state.emit(AppEvent::ChunkProgress {
                     task_id: chunk.task_id,
@@ -417,88 +458,21 @@ async fn handle_worker_message(
             task_id,
             hash,
             plaintext,
-        } => {
-            let wid = worker_id.as_deref().unwrap_or("unknown");
-            info!(
-                task_id = %task_id,
-                hash = %hash,
-                worker_id = %wid,
-                "received HashCracked from worker"
-            );
-            let inserted =
-                db::insert_cracked_hash(&state.db, *task_id, hash, plaintext, wid).await?;
-
-            // Only increment the count and check completion if the hash was
-            // actually new (not a duplicate).
-            if !inserted {
-                debug!(task_id = %task_id, hash = %hash, "duplicate hash ignored");
-                return Ok(());
-            }
-
-            let new_count = db::increment_task_cracked_count(&state.db, *task_id, 1).await?;
-
-            state.emit(AppEvent::HashCracked {
-                task_id: *task_id,
-                hash: hash.clone(),
-            });
-
-            // Check if all hashes for this task have been cracked.
-            if let Some(task) = db::get_task(&state.db, *task_id).await? {
-                if new_count >= task.total_hashes {
-                    info!(task_id = %task_id, "all hashes cracked, completing task");
-                    db::update_task_status(&state.db, *task_id, TaskStatus::Completed).await?;
-
-                    state.emit(AppEvent::TaskCompleted { task_id: *task_id });
-
-                    // Abort all running chunks on this task across all workers.
-                    abort_task_chunks(state, *task_id).await?;
-
-                    // Advance campaign if this task is campaign-owned
-                    if task.campaign_id.is_some() {
-                        if let Err(e) = crate::campaign::on_task_completed(state, *task_id).await {
-                            error!(task_id = %task_id, error = %e, "campaign advance error");
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
+        } => handle_hash_cracked(state, worker_id.as_deref(), *task_id, hash, plaintext).await,
 
         WorkerMessage::ChunkCompleted {
             chunk_id,
             exit_code,
             total_cracked: _,
         } => {
-            let status = if *exit_code == 1 {
-                ChunkStatus::Exhausted
-            } else {
-                ChunkStatus::Completed
-            };
-
-            // Mark progress as 100% without clobbering the last-reported speed —
-            // for fast hashes, hashcat may finish before any status update is sent.
-            db::finalize_chunk_progress(&state.db, *chunk_id).await?;
-            db::update_chunk_status(&state.db, *chunk_id, status).await?;
-
-            let chunk = db::get_chunk(&state.db, *chunk_id).await?;
-            let task_id = chunk.as_ref().map(|c| c.task_id);
-
-            // Try to assign more work to this worker.
-            if let Some(wid) = worker_id.as_deref() {
-                if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
-                    send_attack_files(state, &task, outbound_tx, transferred_files).await?;
-                    let msg = build_assign_chunk_msg(state, &task, &new_chunk).await?;
-                    let _ = outbound_tx.send(msg).await;
-                } else {
-                    db::update_worker_status(&state.db, wid, WorkerStatus::Idle).await?;
-                }
-            }
-
-            // Check if all chunks for this task are done.
-            if let Some(tid) = task_id {
-                check_task_completion(state, tid).await?;
-            }
-            Ok(())
+            handle_chunk_completed(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                *chunk_id,
+                *exit_code,
+            )
+            .await
         }
 
         WorkerMessage::ChunkFailed {
@@ -506,39 +480,21 @@ async fn handle_worker_message(
             error: err_msg,
             exit_code,
         } => {
-            db::update_chunk_status(&state.db, *chunk_id, ChunkStatus::Failed).await?;
-
-            let wid = worker_id.as_deref().unwrap_or("unknown");
-            error!(
-                %chunk_id,
-                worker_id = %wid,
-                exit_code = ?exit_code,
-                error = %err_msg,
-                "chunk failed"
-            );
-
-            db::insert_audit(
-                &state.db,
-                "chunk_failed",
-                &format!("Chunk {chunk_id} failed: {err_msg}"),
-                None,
-                Some(wid),
+            handle_chunk_failed(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                *chunk_id,
+                err_msg,
+                *exit_code,
             )
-            .await?;
-
-            // Try to assign next work to keep the worker busy.
-            if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
-            }
-            Ok(())
+            .await
         }
 
         WorkerMessage::BenchmarkResult { hash_mode, speed } => {
             if let Some(wid) = worker_id.as_deref() {
-                db::upsert_benchmark(&state.db, wid, *hash_mode, *speed).await?;
-
-                // If the worker was idle, try to give it work now.
-                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
+                state.record_benchmark(wid, *hash_mode, *speed).await?;
+                try_assign_work(state, wid, outbound_tx).await?;
             }
             Ok(())
         }
@@ -564,8 +520,8 @@ async fn handle_worker_message(
         }
 
         WorkerMessage::Enroll { .. } => {
-            // Enrollment is handled before the message loop. If we get here,
-            // the worker is already authorized, so we just ignore it.
+            // Enrollment runs before the message loop. A second `Enroll`
+            // from an already-authorized worker is benign — drop it.
             debug!(%peer_addr, "ignoring Enroll message in message loop (already authorized)");
             Ok(())
         }
@@ -575,8 +531,16 @@ async fn handle_worker_message(
             offset,
             length,
         } => {
-            handle_request_file_range(state, outbound_tx, hash, *offset, *length).await?;
-            Ok(())
+            handle_request_file_range_msg(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                assigned_shas,
+                hash,
+                *offset,
+                *length,
+            )
+            .await
         }
 
         WorkerMessage::PullFailed {
@@ -584,57 +548,261 @@ async fn handle_worker_message(
             hash,
             reason,
         } => {
-            // The agent couldn't fetch a file required by this chunk
-            // (cache budget, disk full, etc.). Treat it like a chunk
-            // failure so the abandoned-chunk reassigner picks it up
-            // for a different worker.
-            db::update_chunk_status(&state.db, *chunk_id, ChunkStatus::Failed).await?;
-
-            let wid = worker_id.as_deref().unwrap_or("unknown");
-            warn!(
-                %chunk_id,
-                worker_id = %wid,
-                %hash,
-                %reason,
-                "pull failed: chunk will be reassigned"
-            );
-
-            db::insert_audit(
-                &state.db,
-                "pull_failed",
-                &format!("Worker {wid} couldn't fetch {hash} for chunk {chunk_id}: {reason}"),
-                None,
-                Some(wid),
+            handle_pull_failed(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                *chunk_id,
+                hash,
+                reason,
             )
-            .await?;
-
-            if let Some(wid) = worker_id.as_deref() {
-                try_assign_work(state, wid, outbound_tx, transferred_files).await?;
-            }
-            Ok(())
+            .await
         }
 
         WorkerMessage::CacheAck { kept, evicted } => {
-            // The agent has already evicted what we asked. Drop the
-            // evicted shas from our coord-side view immediately so the
-            // GC loop doesn't keep re-targeting this worker. The next
-            // heartbeat will deliver the full ground-truth manifest.
-            if let Some(wid) = worker_id.as_deref() {
-                for sha in evicted {
-                    if let Err(e) = db::remove_worker_cache_entry(&state.db, wid, sha).await {
-                        warn!(worker = %wid, %sha, error = %e, "remove_worker_cache_entry failed");
-                    }
-                }
-                debug!(
-                    worker = %wid,
-                    kept = kept.len(),
-                    evicted_count = evicted.len(),
-                    "received CacheAck"
-                );
-            }
-            Ok(())
+            handle_cache_ack(state, worker_id.as_deref(), kept, evicted).await
         }
     }
+}
+
+// ── Per-variant message handlers ─────────────────────────────────────────────
+
+async fn handle_heartbeat(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    cache_manifest: &[crack_common::protocol::CacheManifestEntry],
+) -> anyhow::Result<()> {
+    let Some(wid) = worker_id else {
+        return Ok(());
+    };
+
+    // Buffered: a background flusher persists every ~3s so the hot path
+    // does an in-memory HashMap insert, not a write.
+    state.note_heartbeat(wid).await;
+
+    if let Err(e) = db::sync_worker_cache_manifest(&state.db, wid, cache_manifest).await {
+        warn!(worker = %wid, error = %e, "failed to sync cache manifest");
+    }
+
+    // Drift-correction tick (issue #45): if the manifest carries a sha
+    // that's no longer active on the coord, tell the agent to evict it.
+    // Catches missed `EvictFile`s (mpsc backpressure / transient drop),
+    // post-coord-restart staleness, and any other cause of divergence.
+    // Agent's `evict` is idempotent so duplicate fires are harmless.
+    match state.get_active_shas().await {
+        Ok(active) => {
+            for entry in cache_manifest {
+                if !active.contains(&entry.sha256) {
+                    // try_send: the next heartbeat repeats drift correction,
+                    // so a full per-conn mpsc shouldn't block this hot path.
+                    let _ = outbound_tx.try_send(CoordMessage::EvictFile {
+                        hash: entry.sha256.clone(),
+                    });
+                }
+            }
+        }
+        Err(e) => warn!(worker = %wid, error = %e, "drift-correction lookup failed"),
+    }
+    Ok(())
+}
+
+async fn handle_hash_cracked(
+    state: &Arc<AppState>,
+    worker_id: Option<&str>,
+    task_id: Uuid,
+    hash: &str,
+    plaintext: &str,
+) -> anyhow::Result<()> {
+    let wid = worker_id.unwrap_or("unknown");
+    info!(
+        %task_id,
+        %hash,
+        worker_id = %wid,
+        "received HashCracked from worker"
+    );
+    let inserted = db::insert_cracked_hash(&state.db, task_id, hash, plaintext, wid).await?;
+    if !inserted {
+        debug!(%task_id, %hash, "duplicate hash ignored");
+        return Ok(());
+    }
+
+    let new_count = db::increment_task_cracked_count(&state.db, task_id, 1).await?;
+    state.emit(AppEvent::HashCracked {
+        task_id,
+        hash: hash.to_string(),
+    });
+
+    // Check task completion. If this was the last hash, mark complete and
+    // tear down running chunks across workers.
+    if let Some(task) = db::get_task(&state.db, task_id).await? {
+        if new_count >= task.total_hashes {
+            info!(%task_id, "all hashes cracked, completing task");
+            db::update_task_status(&state.db, task_id, TaskStatus::Completed).await?;
+            state.emit(AppEvent::TaskCompleted { task_id });
+            abort_task_chunks(state, task_id).await?;
+            if task.campaign_id.is_some() {
+                if let Err(e) = crate::campaign::on_task_completed(state, task_id).await {
+                    error!(%task_id, error = %e, "campaign advance error");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_chunk_completed(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    chunk_id: Uuid,
+    exit_code: i32,
+) -> anyhow::Result<()> {
+    let status = if exit_code == 1 {
+        ChunkStatus::Exhausted
+    } else {
+        ChunkStatus::Completed
+    };
+
+    // Mark progress as 100% without clobbering the last-reported speed —
+    // fast hashes can finish before any status update is sent.
+    db::finalize_chunk_progress(&state.db, chunk_id).await?;
+    db::update_chunk_status(&state.db, chunk_id, status).await?;
+
+    let chunk = db::get_chunk(&state.db, chunk_id).await?;
+    let task_id = chunk.as_ref().map(|c| c.task_id);
+
+    // Try to assign more work to this worker, otherwise mark it idle.
+    if let Some(wid) = worker_id {
+        if let Some((task, new_chunk)) = scheduler::assign_next_chunk(state, wid).await? {
+            let msg = build_assign_chunk_msg(state, &task, &new_chunk).await?;
+            let _ = outbound_tx.send(msg).await;
+        } else {
+            db::update_worker_status(&state.db, wid, WorkerStatus::Idle).await?;
+        }
+    }
+
+    if let Some(tid) = task_id {
+        check_task_completion(state, tid).await?;
+    }
+    Ok(())
+}
+
+async fn handle_chunk_failed(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    chunk_id: Uuid,
+    err_msg: &str,
+    exit_code: Option<i32>,
+) -> anyhow::Result<()> {
+    db::update_chunk_status(&state.db, chunk_id, ChunkStatus::Failed).await?;
+    let wid = worker_id.unwrap_or("unknown");
+    error!(
+        %chunk_id,
+        worker_id = %wid,
+        ?exit_code,
+        error = %err_msg,
+        "chunk failed"
+    );
+    state.emit_audit(
+        "chunk_failed",
+        &format!("Chunk {chunk_id} failed: {err_msg}"),
+        None,
+        Some(wid),
+    );
+    if let Some(wid) = worker_id {
+        try_assign_work(state, wid, outbound_tx).await?;
+    }
+    Ok(())
+}
+
+async fn handle_request_file_range_msg(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    assigned_shas: &std::collections::HashSet<String>,
+    hash: &str,
+    offset: u64,
+    length: u32,
+) -> anyhow::Result<()> {
+    // Per-session sha allow-list (C11). The worker can only ask for files
+    // we've explicitly named to it via `AssignChunk`.
+    if !assigned_shas.contains(hash) {
+        let wid = worker_id.unwrap_or("unauthenticated");
+        warn!(
+            worker_id = %wid,
+            %hash,
+            "rejecting RequestFileRange: sha not in this session's allow-list"
+        );
+        let _ = outbound_tx
+            .send(CoordMessage::FileError {
+                hash: hash.to_string(),
+                reason: "not authorized for this file in this session".to_string(),
+            })
+            .await;
+        return Ok(());
+    }
+    handle_request_file_range(state, outbound_tx, hash, offset, length).await
+}
+
+async fn handle_pull_failed(
+    state: &Arc<AppState>,
+    outbound_tx: &mpsc::Sender<CoordMessage>,
+    worker_id: Option<&str>,
+    chunk_id: Uuid,
+    hash: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    // The agent couldn't fetch a file required by this chunk (cache
+    // budget, disk full, etc.). Treat it like a chunk failure so the
+    // abandoned-chunk reassigner picks it up for a different worker.
+    db::update_chunk_status(&state.db, chunk_id, ChunkStatus::Failed).await?;
+    let wid = worker_id.unwrap_or("unknown");
+    warn!(
+        %chunk_id,
+        worker_id = %wid,
+        %hash,
+        %reason,
+        "pull failed: chunk will be reassigned"
+    );
+    state.emit_audit(
+        "pull_failed",
+        &format!("Worker {wid} couldn't fetch {hash} for chunk {chunk_id}: {reason}"),
+        None,
+        Some(wid),
+    );
+    if let Some(wid) = worker_id {
+        try_assign_work(state, wid, outbound_tx).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cache_ack(
+    state: &Arc<AppState>,
+    worker_id: Option<&str>,
+    kept: &[String],
+    evicted: &[String],
+) -> anyhow::Result<()> {
+    // Agent has already evicted what we asked. Drop the evicted shas from
+    // our coord-side view immediately so the GC loop doesn't keep
+    // re-targeting this worker. The next heartbeat delivers the full
+    // ground-truth manifest.
+    let Some(wid) = worker_id else {
+        return Ok(());
+    };
+    for sha in evicted {
+        if let Err(e) = db::remove_worker_cache_entry(&state.db, wid, sha).await {
+            warn!(worker = %wid, %sha, error = %e, "remove_worker_cache_entry failed");
+        }
+    }
+    debug!(
+        worker = %wid,
+        kept = kept.len(),
+        evicted_count = evicted.len(),
+        "received CacheAck"
+    );
+    Ok(())
 }
 
 /// Cap any single `RequestFileRange` response at this many raw bytes. Larger
@@ -761,7 +929,6 @@ async fn handle_register(
     os: &str,
     devices: &[DeviceInfo],
     worker_id: &mut Option<String>,
-    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     // Look up or create the worker record by public key.
     let worker = db::get_or_create_worker(&state.db, pubkey_b64, worker_name).await?;
@@ -808,22 +975,21 @@ async fn handle_register(
         "worker registered"
     );
 
-    db::insert_audit(
-        &state.db,
+    state.emit_audit(
         "worker_registered",
         &format!("Worker {worker_name} ({wid}) connected from {peer_addr}"),
         Some(&peer_addr.to_string()),
         Some(&wid),
-    )
-    .await?;
+    );
 
     // Cache reconciliation: tell the (re)connecting worker which sha256s
     // we still consider live. Anything in its cache that's not on this
     // list gets evicted (deferred if currently in use). Catches missed
     // EvictFile messages from prior sessions and any drift while the
     // agent was disconnected.
-    match db::list_active_file_shas(&state.db).await {
-        Ok(expected) => {
+    match state.get_active_shas().await {
+        Ok(active) => {
+            let expected: Vec<String> = active.iter().cloned().collect();
             let count = expected.len();
             if let Err(e) = outbound_tx
                 .send(CoordMessage::CacheReconcile { expected })
@@ -838,7 +1004,7 @@ async fn handle_register(
     }
 
     // Try to immediately assign work to the newly registered worker.
-    try_assign_work(state, &wid, outbound_tx, transferred_files).await?;
+    try_assign_work(state, &wid, outbound_tx).await?;
 
     Ok(())
 }
@@ -847,12 +1013,17 @@ async fn handle_register(
 
 /// Build a CoordMessage::AssignChunk with the hash file data embedded.
 ///
-/// For dictionary-based attacks, emits `DictionaryByHash` whenever we can
-/// look up the referenced file's sha256 + size (the common case). The
-/// agent then pulls the file from its content cache on demand. Falls
-/// back to the legacy `Dictionary` / `DictionaryWithRules` push path
-/// only if a file record is missing or has no sha — effectively never,
-/// for files uploaded via this coord.
+/// All dictionary-based attacks emit `DictionaryByHash` — the agent looks
+/// the referenced files up in its content-addressed cache and pulls on
+/// miss via `RequestFileRange`/`FileRange`. The pre-Slice-8 push paths
+/// (`TransferFileChunk` + `Dictionary` / `DictionaryWithRules` variants)
+/// were retired in PR5b after a one-shot sha256 backfill in `init_db`.
+///
+/// # Errors
+/// Returns an error if a referenced file row is missing or has no
+/// `sha256`. Both should be impossible after `backfill_empty_shas` has
+/// run; surfacing it as an error makes operator-noticeable rather than
+/// silently dispatching with broken metadata.
 pub(crate) async fn build_assign_chunk_msg(
     state: &AppState,
     task: &Task,
@@ -867,62 +1038,39 @@ pub(crate) async fn build_assign_chunk_msg(
             custom_charsets: custom_charsets.clone(),
         },
         AttackConfig::Dictionary { wordlist_file_id } => {
-            match file_ref(&state.db, wordlist_file_id).await? {
-                Some((sha, size)) => AssignChunkAttack::DictionaryByHash {
-                    wordlist_sha256: sha,
-                    wordlist_size: size,
-                    rules_sha256: None,
-                    rules_size: None,
-                },
-                None => {
-                    warn!(file_id = %wordlist_file_id, "no sha256 for wordlist, falling back to legacy Dictionary push");
-                    AssignChunkAttack::Dictionary {
-                        wordlist_file_id: wordlist_file_id.clone(),
-                    }
-                }
+            let (sha, size) = file_ref(&state.db, wordlist_file_id).await?;
+            AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: sha,
+                wordlist_size: size,
+                rules_sha256: None,
+                rules_size: None,
             }
         }
         AttackConfig::DictionaryWithRules {
             wordlist_file_id,
             rules_file_id,
         } => {
-            let wl = file_ref(&state.db, wordlist_file_id).await?;
-            let rl = file_ref(&state.db, rules_file_id).await?;
-            match (wl, rl) {
-                (Some((w_sha, w_size)), Some((r_sha, r_size))) => {
-                    AssignChunkAttack::DictionaryByHash {
-                        wordlist_sha256: w_sha,
-                        wordlist_size: w_size,
-                        rules_sha256: Some(r_sha),
-                        rules_size: Some(r_size),
-                    }
-                }
-                _ => {
-                    warn!(
-                        wordlist = %wordlist_file_id,
-                        rules = %rules_file_id,
-                        "no sha256 for wordlist/rules, falling back to legacy DictionaryWithRules push"
-                    );
-                    AssignChunkAttack::DictionaryWithRules {
-                        wordlist_file_id: wordlist_file_id.clone(),
-                        rules_file_id: rules_file_id.clone(),
-                    }
-                }
+            let (w_sha, w_size) = file_ref(&state.db, wordlist_file_id).await?;
+            let (r_sha, r_size) = file_ref(&state.db, rules_file_id).await?;
+            AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: w_sha,
+                wordlist_size: w_size,
+                rules_sha256: Some(r_sha),
+                rules_size: Some(r_size),
             }
         }
     };
 
-    // Read the hash file and base64-encode it for transfer over the Noise channel.
-    let file_data = files::read_file(&state.files_dir(), &task.hash_file_id)
-        .context("reading hash file for chunk assignment")?;
-    let hash_file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_data);
+    // Hash file is content-addressed exactly like wordlists/rules — the
+    // agent pulls it via `RequestFileRange`/`FileRange` on cache miss.
+    let (hash_file_sha256, hash_file_size) = file_ref(&state.db, &task.hash_file_id).await?;
 
     Ok(CoordMessage::AssignChunk {
         chunk_id: chunk.id,
         task_id: chunk.task_id,
         hash_mode: task.hash_mode,
-        hash_file_b64,
-        hash_file_id: task.hash_file_id.clone(),
+        hash_file_sha256,
+        hash_file_size,
         skip: chunk.skip,
         limit: chunk.limit,
         attack,
@@ -930,128 +1078,37 @@ pub(crate) async fn build_assign_chunk_msg(
     })
 }
 
-/// Look up a file's (sha256, size_bytes) by UUID. Returns None if the record
-/// is missing, or if sha256 is empty (would pollute the content cache).
-async fn file_ref(pool: &sqlx::SqlitePool, file_id: &str) -> anyhow::Result<Option<(String, u64)>> {
-    Ok(db::get_file_record(pool, file_id).await?.and_then(|r| {
-        if r.sha256.is_empty() || r.size_bytes < 0 {
-            None
-        } else {
-            Some((r.sha256, r.size_bytes as u64))
-        }
-    }))
-}
-
-/// Stream a file to a worker in ~40KB chunks via TransferFileChunk messages.
-///
-/// Skips sending if the file has already been transferred to this worker
-/// (tracked via `transferred_files`).
-async fn send_file_to_worker(
-    state: &AppState,
-    file_id: &str,
-    outbound_tx: &mpsc::Sender<CoordMessage>,
-    transferred_files: &mut HashSet<String>,
-) -> anyhow::Result<()> {
-    if transferred_files.contains(file_id) {
-        return Ok(());
+/// Look up a file's `(sha256, size_bytes)` by UUID. Errors if the record
+/// is missing or has no sha — both indicate a broken DB row that the
+/// startup backfill should have caught.
+async fn file_ref(pool: &sqlx::SqlitePool, file_id: &str) -> anyhow::Result<(String, u64)> {
+    let record = db::get_file_record(pool, file_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("file {file_id} not found"))?;
+    if record.sha256.is_empty() {
+        anyhow::bail!("file {file_id} has no sha256 (backfill may have skipped it)");
     }
-
-    let file_data = files::read_file(&state.files_dir(), file_id)
-        .with_context(|| format!("reading file {file_id} for transfer"))?;
-
-    // Look up the original filename from the DB (best-effort, fall back to file_id).
-    let filename = match db::get_file_record(&state.db, file_id).await? {
-        Some(record) => record.filename,
-        None => file_id.to_string(),
-    };
-
-    const CHUNK_SIZE: usize = 40 * 1024; // ~40 KB
-    let total_chunks = file_data.len().div_ceil(CHUNK_SIZE).max(1) as u32;
-
-    for (i, chunk_data) in file_data.chunks(CHUNK_SIZE).enumerate() {
-        let data_b64 = base64::engine::general_purpose::STANDARD.encode(chunk_data);
-        let msg = CoordMessage::TransferFileChunk {
-            file_id: file_id.to_string(),
-            filename: filename.clone(),
-            chunk_index: i as u32,
-            total_chunks,
-            data_b64,
-        };
-        outbound_tx
-            .send(msg)
-            .await
-            .context("sending file transfer chunk to worker")?;
+    if record.size_bytes < 0 {
+        anyhow::bail!(
+            "file {file_id} has invalid size_bytes={}",
+            record.size_bytes
+        );
     }
-
-    transferred_files.insert(file_id.to_string());
-    info!(file_id = %file_id, filename = %filename, size = file_data.len(), chunks = total_chunks, "transferred file to worker");
-    Ok(())
+    Ok((record.sha256, record.size_bytes as u64))
 }
 
 /// Try to assign the next pending chunk to a worker and send it via the
-/// outbound channel. Transfers any required files first.
+/// outbound channel.
 async fn try_assign_work(
     state: &Arc<AppState>,
     wid: &str,
     outbound_tx: &mpsc::Sender<CoordMessage>,
-    transferred_files: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     if let Some((task, chunk)) = scheduler::assign_next_chunk(state, wid).await? {
-        send_attack_files(state, &task, outbound_tx, transferred_files).await?;
         let msg = build_assign_chunk_msg(state, &task, &chunk).await?;
         let _ = outbound_tx.send(msg).await;
     }
     Ok(())
-}
-
-/// Transfer referenced attack files to the worker before dispatching a chunk.
-///
-/// When every file has a sha256 recorded, we skip the push entirely — the
-/// agent will pull on demand via the content-addressed cache when it sees
-/// `DictionaryByHash`. The eager `TransferFileChunk` path remains only for
-/// the legacy fallback where a file has no sha (pre-dedup rows).
-async fn send_attack_files(
-    state: &AppState,
-    task: &Task,
-    outbound_tx: &mpsc::Sender<CoordMessage>,
-    transferred_files: &mut HashSet<String>,
-) -> anyhow::Result<()> {
-    match &task.attack_config {
-        AttackConfig::Dictionary { wordlist_file_id } => {
-            if file_ref(&state.db, wordlist_file_id).await?.is_some() {
-                return Ok(());
-            }
-            send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
-        }
-        AttackConfig::DictionaryWithRules {
-            wordlist_file_id,
-            rules_file_id,
-        } => {
-            let both_hashed = file_ref(&state.db, wordlist_file_id).await?.is_some()
-                && file_ref(&state.db, rules_file_id).await?.is_some();
-            if both_hashed {
-                return Ok(());
-            }
-            send_file_to_worker(state, wordlist_file_id, outbound_tx, transferred_files).await?;
-            send_file_to_worker(state, rules_file_id, outbound_tx, transferred_files).await?;
-        }
-        AttackConfig::BruteForce { .. } => {
-            // No extra files needed for brute-force.
-        }
-    }
-    Ok(())
-}
-
-/// Transfer attack files (wordlist, rules) to a worker via a raw `Sender`.
-/// Used by the monitor which doesn't track per-worker transferred files.
-/// The agent caches files, so duplicate sends are harmless.
-pub(crate) async fn send_attack_files_via_tx(
-    state: &AppState,
-    task: &Task,
-    tx: &mpsc::Sender<CoordMessage>,
-) -> anyhow::Result<()> {
-    let mut dummy = HashSet::new();
-    send_attack_files(state, task, tx, &mut dummy).await
 }
 
 /// Send AbortChunk to every connected worker that has running chunks on the

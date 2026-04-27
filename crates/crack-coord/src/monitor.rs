@@ -186,7 +186,13 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
 
-        let elapsed = now - worker.last_seen_at;
+        // Heartbeat writes are buffered and flushed every ~3s. Consult the
+        // in-memory buffer too so a worker that pinged 1s ago doesn't get
+        // marked timed-out because the row hasn't flushed yet.
+        let last_seen = state
+            .effective_last_seen(&worker.id, worker.last_seen_at)
+            .await;
+        let elapsed = now - last_seen;
         if elapsed > timeout {
             warn!(
                 worker_id = %worker.id,
@@ -219,8 +225,7 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
                 worker_id: worker.id.clone(),
             });
 
-            db::insert_audit(
-                &state.db,
+            state.emit_audit(
                 "worker_timeout",
                 &format!(
                     "Worker {} timed out after {}s",
@@ -229,8 +234,7 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
                 ),
                 None,
                 Some(&worker.id),
-            )
-            .await?;
+            );
         }
     }
 
@@ -241,10 +245,8 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
     let abandoned = db::get_abandoned_chunks(&state.db, 45).await?;
 
     for chunk in abandoned {
-        // Calculate remaining work
-        let consumed = ((chunk.limit as f64) * (chunk.progress / 100.0)) as u64;
-        let new_skip = chunk.skip + consumed;
-        let new_limit = chunk.limit.saturating_sub(consumed);
+        let (new_skip, new_limit) =
+            remaining_after_progress(chunk.skip, chunk.limit, chunk.progress);
 
         if new_limit == 0 {
             // Chunk was effectively complete
@@ -277,23 +279,25 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
         );
     }
 
-    // Try to assign pending chunks to idle workers
+    // Try to assign pending chunks to idle workers.
+    //
+    // `assign_next_chunk` is transaction-safe — the read-modify-write on
+    // `tasks.next_skip` is wrapped in `try_dispatch_new_chunk` with an
+    // optimistic conditional UPDATE — so parallel fanout via
+    // `for_each_concurrent` is unblocked from a correctness standpoint.
+    // Keeping the loop sequential because the remaining latency sits in
+    // `build_assign_chunk_msg` (still re-reads the hash file every
+    // dispatch — see X2 in the audit roadmap). Acquire the
+    // connections-map read guard once instead of per-iteration so a slow
+    // `worker_connections.write()` (new-worker registration) doesn't
+    // serialize behind 8 dispatches.
     let idle_workers = crate::scheduler::assigner::find_idle_workers(state).await?;
+    let conns = state.worker_connections.read().await;
     for worker_id in idle_workers {
         if let Some((task, chunk)) =
             crate::scheduler::assigner::assign_next_chunk(state, &worker_id).await?
         {
-            // Send the chunk to the worker if connected
-            let conns = state.worker_connections.read().await;
             if let Some(conn) = conns.get(&worker_id) {
-                // Transfer wordlist/rules files before assigning the chunk
-                if let Err(e) =
-                    crate::transport::handler::send_attack_files_via_tx(state, &task, &conn.tx)
-                        .await
-                {
-                    error!(task_id = %task.id, error = %e, "failed to transfer attack files for dispatch");
-                    continue;
-                }
                 match crate::transport::handler::build_assign_chunk_msg(state, &task, &chunk).await
                 {
                     Ok(msg) => {
@@ -308,4 +312,77 @@ async fn reassign_abandoned_chunks(state: &AppState) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Returns `(new_skip, new_limit)` for restarting an abandoned chunk.
+///
+/// `progress` is the worker-reported percentage and may be untrusted —
+/// negative, NaN, Inf, or >100 — so it's clamped to `[0, 100]` before the
+/// `f64 → u64` cast (which is implementation-defined for non-finite inputs).
+/// The cast is also capped at `limit` so a slightly-over-100 progress can't
+/// produce `consumed > limit` and walk `new_skip` past the task's keyspace.
+fn remaining_after_progress(skip: u64, limit: u64, progress: f64) -> (u64, u64) {
+    let pct = if progress.is_finite() {
+        progress.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let consumed = ((limit as f64) * (pct / 100.0)).min(limit as f64) as u64;
+    (
+        skip.saturating_add(consumed),
+        limit.saturating_sub(consumed),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remaining_after_progress;
+
+    #[test]
+    fn normal_progress_splits_chunk() {
+        let (skip, rem) = remaining_after_progress(1000, 400, 25.0);
+        assert_eq!(skip, 1100);
+        assert_eq!(rem, 300);
+    }
+
+    #[test]
+    fn zero_progress_keeps_full_chunk() {
+        assert_eq!(remaining_after_progress(0, 100, 0.0), (0, 100));
+    }
+
+    #[test]
+    fn complete_progress_zeroes_remainder() {
+        assert_eq!(remaining_after_progress(0, 100, 100.0), (100, 0));
+    }
+
+    #[test]
+    fn negative_progress_treated_as_zero() {
+        assert_eq!(remaining_after_progress(0, 100, -5.0), (0, 100));
+    }
+
+    #[test]
+    fn over_one_hundred_caps_at_limit() {
+        assert_eq!(remaining_after_progress(0, 100, 999_999.0), (100, 0));
+    }
+
+    #[test]
+    fn nan_treated_as_zero() {
+        assert_eq!(remaining_after_progress(0, 100, f64::NAN), (0, 100));
+    }
+
+    #[test]
+    fn infinity_treated_as_zero() {
+        assert_eq!(remaining_after_progress(0, 100, f64::INFINITY), (0, 100));
+        assert_eq!(
+            remaining_after_progress(0, 100, f64::NEG_INFINITY),
+            (0, 100)
+        );
+    }
+
+    #[test]
+    fn near_max_skip_saturates() {
+        // skip + consumed must never overflow even with absurd inputs.
+        let (skip, _) = remaining_after_progress(u64::MAX - 5, 1000, 100.0);
+        assert_eq!(skip, u64::MAX);
+    }
 }

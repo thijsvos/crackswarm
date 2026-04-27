@@ -1,12 +1,36 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use crack_common::auth::Keypair;
+use crack_common::models::AuditEntry;
 use crack_common::protocol::CoordMessage;
 use sqlx::SqlitePool;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use uuid::Uuid;
+
+/// Buffer depth for the audit-log channel feeding the background flusher.
+/// Sized to absorb a reconnect storm (every connect emits an audit event)
+/// without blocking the producer; events drop with a `warn!` past this.
+const AUDIT_CHANNEL_CAPACITY: usize = 4096;
+
+/// How long an active-sha snapshot is reused before re-querying.
+/// 30s gives the heartbeat path a stable view across the typical 15s
+/// heartbeat cadence: the first heartbeat in a window rebuilds, the next
+/// few read from cache. Bounded staleness is acceptable here — at worst
+/// drift correction either sends an unnecessary `EvictFile` (the agent's
+/// `evict` is idempotent) or misses one for 30s (next heartbeat catches
+/// it).
+const ACTIVE_SHAS_TTL: Duration = Duration::from_secs(30);
+
+/// Cached snapshot of every sha256 currently considered "live"
+/// (`gc_state = 'active'` in the `files` table). See [`AppState::get_active_shas`].
+struct ActiveShasCache {
+    snapshot: Arc<HashSet<String>>,
+    loaded_at: Instant,
+}
 
 /// Shared application state accessible from REST API, transport handler, scheduler, and TUI.
 pub struct AppState {
@@ -29,6 +53,31 @@ pub struct AppState {
 
     /// Broadcast channel for TUI events.
     pub events: broadcast::Sender<AppEvent>,
+
+    /// Outbound side of the audit log channel. Drained by
+    /// `crate::audit::run_audit_flusher`, which batches inserts every
+    /// ~500ms or 64 events. Use [`Self::emit_audit`] to send.
+    pub audit_tx: mpsc::Sender<AuditEntry>,
+
+    /// `(worker_id, hash_mode) → speed (h/s)` cache, populated by
+    /// `record_benchmark` on every BenchmarkResult and on first read-through
+    /// from `worker_benchmarks`. Avoids hitting SQLite for the speed lookup
+    /// on every chunk dispatch — the assigner reads this on the hot path
+    /// per worker per chunk.
+    pub benchmark_cache: RwLock<HashMap<(String, u32), u64>>,
+
+    /// TTL-cached snapshot of the active-sha set. Invalidates passively after
+    /// [`ACTIVE_SHAS_TTL`]; see [`Self::get_active_shas`] for the exact
+    /// staleness contract. `None` until the first read repopulates.
+    active_shas: RwLock<Option<ActiveShasCache>>,
+
+    /// `worker_id → newest_heartbeat_seen` buffer flushed every ~3s by
+    /// [`crate::last_seen::run_last_seen_flusher`] in one transaction.
+    /// Heartbeats are by far the chattiest write the system performs;
+    /// collapsing N writes per 15s into ⌈N/15s × 3s⌉ ≈ N/5 writes makes
+    /// it cheap regardless of fleet size. Latest-write-wins, so per-key
+    /// updates are idempotent.
+    pub last_seen_buffer: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 #[allow(dead_code)]
@@ -86,15 +135,21 @@ pub enum AppEvent {
 }
 
 impl AppState {
+    /// Construct shared coord state and the audit-log receiver that the
+    /// caller hands to [`crate::audit::run_audit_flusher`] in a spawned
+    /// task. The receiver is returned (not owned by `AppState`) because
+    /// `Receiver` is single-consumer and threading it through `Arc`
+    /// would require interior mutability.
     pub fn new(
         db: SqlitePool,
         data_dir: PathBuf,
         keypair: Keypair,
         hashcat_path: String,
         bind_addr: String,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, mpsc::Receiver<AuditEntry>) {
         let (events, _) = broadcast::channel(1024);
-        Arc::new(Self {
+        let (audit_tx, audit_rx) = mpsc::channel(AUDIT_CHANNEL_CAPACITY);
+        let state = Arc::new(Self {
             db,
             data_dir,
             keypair,
@@ -103,13 +158,156 @@ impl AppState {
             worker_connections: RwLock::new(HashMap::new()),
             preparing_tasks: RwLock::new(HashSet::new()),
             events,
-        })
+            audit_tx,
+            benchmark_cache: RwLock::new(HashMap::new()),
+            active_shas: RwLock::new(None),
+            last_seen_buffer: Mutex::new(HashMap::new()),
+        });
+        (state, audit_rx)
     }
 
     /// Emit an event to the TUI broadcast channel.
     pub fn emit(&self, event: AppEvent) {
         // Ignore send errors (no TUI subscribers in headless mode)
         let _ = self.events.send(event);
+    }
+
+    /// Queue an audit-log entry for the background flusher.
+    ///
+    /// Best-effort: drops with a `warn!` if the channel buffer (4096 events)
+    /// is full. Audit is a side-channel — if we're sustained-overrunning a
+    /// 4k-deep buffer, the system has bigger problems than a few missing
+    /// audit rows.
+    pub fn emit_audit(
+        &self,
+        event_type: &str,
+        details: &str,
+        source_ip: Option<&str>,
+        worker_id: Option<&str>,
+    ) {
+        let entry = AuditEntry {
+            id: None,
+            event_type: event_type.to_string(),
+            details: details.to_string(),
+            source_ip: source_ip.map(String::from),
+            worker_id: worker_id.map(String::from),
+            created_at: Utc::now(),
+        };
+        if let Err(err) = self.audit_tx.try_send(entry) {
+            match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    tracing::warn!(event_type, "audit channel full, dropping event");
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    tracing::warn!(event_type, "audit channel closed, dropping event");
+                }
+            }
+        }
+    }
+
+    /// Read-through cache for the worker speed used in chunk-size sizing.
+    ///
+    /// Returns `Ok(None)` when the worker has never reported a benchmark
+    /// for this hash mode. The cache is populated on first hit so subsequent
+    /// dispatches skip the SELECT.
+    pub async fn get_worker_speed(
+        &self,
+        worker_id: &str,
+        hash_mode: u32,
+    ) -> anyhow::Result<Option<u64>> {
+        if let Some(&speed) = self
+            .benchmark_cache
+            .read()
+            .await
+            .get(&(worker_id.to_string(), hash_mode))
+        {
+            return Ok(Some(speed));
+        }
+        match crate::storage::db::get_benchmark(&self.db, worker_id, hash_mode).await? {
+            Some(b) => {
+                self.benchmark_cache
+                    .write()
+                    .await
+                    .insert((worker_id.to_string(), hash_mode), b.speed);
+                Ok(Some(b.speed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a freshly-reported benchmark and update the cache.
+    pub async fn record_benchmark(
+        &self,
+        worker_id: &str,
+        hash_mode: u32,
+        speed: u64,
+    ) -> anyhow::Result<()> {
+        crate::storage::db::upsert_benchmark(&self.db, worker_id, hash_mode, speed).await?;
+        self.benchmark_cache
+            .write()
+            .await
+            .insert((worker_id.to_string(), hash_mode), speed);
+        Ok(())
+    }
+
+    /// Record that `worker_id` just heartbeated. Buffered in-memory; the
+    /// background flusher persists the latest timestamp per worker every
+    /// ~3 seconds.
+    pub async fn note_heartbeat(&self, worker_id: &str) {
+        self.last_seen_buffer
+            .lock()
+            .await
+            .insert(worker_id.to_string(), Utc::now());
+    }
+
+    /// Like the `last_seen_at` column, but consults the in-memory buffer
+    /// first so the heartbeat-timeout check sees the freshest timestamp
+    /// even when it hasn't flushed to DB yet. Returns `db_ts` unchanged
+    /// if the buffer doesn't have a newer entry.
+    pub async fn effective_last_seen(
+        &self,
+        worker_id: &str,
+        db_ts: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        match self.last_seen_buffer.lock().await.get(worker_id) {
+            Some(&ts) if ts > db_ts => ts,
+            _ => db_ts,
+        }
+    }
+
+    /// Snapshot of every sha256 with `gc_state = 'active'` in `files`.
+    ///
+    /// Cached for [`ACTIVE_SHAS_TTL`]; the heartbeat handler hits this on
+    /// every drift-correction tick (per worker, every 15s) and the
+    /// register handler hits it on every connect. Without the cache that
+    /// was N × `SELECT DISTINCT sha256 FROM files` round-trips per 30s
+    /// window; with it, ~1.
+    ///
+    /// Returned `Arc` is a snapshot — callers can iterate without holding
+    /// any lock past this call.
+    pub async fn get_active_shas(&self) -> anyhow::Result<Arc<HashSet<String>>> {
+        // Fast path: read lock + freshness check.
+        if let Some(cache) = self.active_shas.read().await.as_ref() {
+            if cache.loaded_at.elapsed() < ACTIVE_SHAS_TTL {
+                return Ok(cache.snapshot.clone());
+            }
+        }
+
+        // Stale or empty: rebuild under write lock, re-checking in case
+        // another caller raced us to the rebuild.
+        let mut wguard = self.active_shas.write().await;
+        if let Some(cache) = wguard.as_ref() {
+            if cache.loaded_at.elapsed() < ACTIVE_SHAS_TTL {
+                return Ok(cache.snapshot.clone());
+            }
+        }
+        let list = crate::storage::db::list_active_file_shas(&self.db).await?;
+        let snap: Arc<HashSet<String>> = Arc::new(list.into_iter().collect());
+        *wguard = Some(ActiveShasCache {
+            snapshot: snap.clone(),
+            loaded_at: Instant::now(),
+        });
+        Ok(snap)
     }
 
     /// Get the files storage directory.

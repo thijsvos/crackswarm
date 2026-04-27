@@ -167,31 +167,29 @@ pub(crate) async fn dispatch_evict_for_sha(
 
     if fallback {
         for (worker_id, conn) in conns.iter() {
-            if conn
-                .tx
-                .send(CoordMessage::EvictFile {
-                    hash: sha.to_string(),
-                })
-                .await
-                .is_ok()
-            {
-                dispatched += 1;
-            } else {
-                debug!(%sha, %worker_id, "GC: fallback EvictFile send failed");
+            // try_send so a wedged worker (full mpsc buffer) can't park the
+            // GC loop. EvictFile is best-effort: the next heartbeat-driven
+            // drift-correction tick re-sends it, and the agent's evict is
+            // idempotent regardless.
+            match conn.tx.try_send(CoordMessage::EvictFile {
+                hash: sha.to_string(),
+            }) {
+                Ok(()) => dispatched += 1,
+                Err(e) => {
+                    debug!(%sha, %worker_id, error = %e, "GC: fallback EvictFile try_send failed")
+                }
             }
         }
     } else {
         for worker_id in targeted {
             if let Some(conn) = conns.get(worker_id) {
-                if conn
-                    .tx
-                    .send(CoordMessage::EvictFile {
-                        hash: sha.to_string(),
-                    })
-                    .await
-                    .is_ok()
-                {
-                    dispatched += 1;
+                match conn.tx.try_send(CoordMessage::EvictFile {
+                    hash: sha.to_string(),
+                }) {
+                    Ok(()) => dispatched += 1,
+                    Err(e) => {
+                        debug!(%sha, %worker_id, error = %e, "GC: targeted EvictFile try_send failed")
+                    }
                 }
             }
         }
@@ -286,5 +284,39 @@ mod tests {
         assert!(fallback);
         assert!(matches!(r1.try_recv(), Ok(CoordMessage::EvictFile { hash }) if hash == "sha-q"));
         assert!(matches!(r3.try_recv(), Ok(CoordMessage::EvictFile { hash }) if hash == "sha-q"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_evict_does_not_block_on_full_buffer() {
+        // Regression for C10: a wedged worker (full mpsc buffer)
+        // must not stall the GC loop. With `try_send`, the call is
+        // non-blocking and the failed-send is counted as a miss.
+        // Verified by allotting a tiny channel and pre-filling it.
+        let (tx, _rx_kept_alive) = mpsc::channel(1);
+        // Pre-fill the buffer to capacity.
+        tx.try_send(CoordMessage::EvictFile {
+            hash: "filler".into(),
+        })
+        .expect("buffer was empty");
+        let conn = WorkerConnection {
+            worker_id: "w-stuck".into(),
+            name: "w-stuck".into(),
+            tx,
+            peer_addr: "127.0.0.1:0".into(),
+        };
+        let mut conns = HashMap::new();
+        conns.insert("w-stuck".to_string(), conn);
+
+        let (dispatched, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            dispatch_evict_for_sha(&conns, "sha-extra", &["w-stuck".to_string()]),
+        )
+        .await
+        .expect("dispatch must not block on full buffer");
+
+        assert_eq!(
+            dispatched, 0,
+            "send into full buffer must be skipped, not awaited"
+        );
     }
 }

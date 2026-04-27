@@ -156,6 +156,24 @@ pub fn encode_public_key(key: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(key)
 }
 
+/// Short, stable identifier for a Curve25519 public key, suitable for
+/// log files. Returns the first 16 hex chars of `SHA-256(b64_pubkey)`.
+///
+/// Logs end up on disk under default umask; the full base64 pubkey is
+/// the unique correlator across log rotations and a stronger fingerprint
+/// than IP address. Persist the full key only in the audit_log table
+/// (access-controlled) and use this short form in tracing macros.
+pub fn pubkey_fingerprint(pubkey_b64: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(pubkey_b64.as_bytes());
+    let mut s = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
 /// Get the default data directory for the coordinator.
 pub fn coordinator_data_dir() -> PathBuf {
     dirs::data_dir()
@@ -242,6 +260,21 @@ pub fn build_initiator(keypair: &Keypair, remote_static: &[u8]) -> Result<snow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_is_stable_and_short() {
+        let fp = pubkey_fingerprint("AAAAAAAA");
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, pubkey_fingerprint("AAAAAAAA"));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_keys() {
+        let a = pubkey_fingerprint("AAAAAAAA");
+        let b = pubkey_fingerprint("BBBBBBBB");
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn test_keypair_generate_and_encode() {

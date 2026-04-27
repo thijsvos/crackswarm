@@ -180,164 +180,49 @@ impl HashcatRunner {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("hashcat stdout not captured"))?;
-
         let stderr = self
             .child
             .stderr
             .take()
             .ok_or_else(|| anyhow!("hashcat stderr not captured"))?;
 
-        let outfile = self.outfile_path.clone();
-        let tx_outfile = tx.clone();
-        let tx_stderr = tx.clone();
+        // Cracked hashes can arrive via stdout, the polling outfile
+        // watcher, or the final post-exit sweep. The dedup set funnels
+        // all three through one "have we already reported this?" check.
+        let seen = CrackedHashDedup::new();
 
-        // Shared set to deduplicate hashes across stdout, outfile watcher, and
-        // the final outfile read.
-        let seen_hashes: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let seen_outfile = Arc::clone(&seen_hashes);
+        // Concurrent helpers: outfile poller and stderr line drainer.
+        let outfile_handle = {
+            let outfile = self.outfile_path.clone();
+            let tx = tx.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                watch_outfile(&outfile, tx, seen.into_arc()).await;
+            })
+        };
+        let stderr_handle = tokio::spawn(drain_stderr_for_fatal(stderr, tx.clone()));
 
-        // Spawn a task to watch the outfile for new cracked hashes
-        let outfile_handle = tokio::spawn(async move {
-            watch_outfile(&outfile, tx_outfile, seen_outfile).await;
-        });
+        // Drive stdout on this task — parses status JSON + reports cracks
+        // hashcat prints to stdout. Returns when stdout EOFs (process exit).
+        monitor_stdout(stdout, &tx, &seen).await;
 
-        // Spawn a task to capture stderr
-        let stderr_handle = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim_end_matches('\r').to_string();
-                if !line.is_empty() {
-                    warn!(stderr = %line, "hashcat stderr");
-                    // Check for fatal errors
-                    if line.contains("No hashes loaded")
-                        || line.contains("Hashfile")
-                        || line.contains("ERROR")
-                    {
-                        let _ = tx_stderr
-                            .send(RunnerEvent::Failed {
-                                error: line.clone(),
-                            })
-                            .await;
-                    }
-                }
-            }
-        });
-
-        // Read stdout for status JSON
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim_end_matches('\r').to_string();
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Some(hc_status) = status::parse_status_line(&line) {
-                let speed = hc_status.total_speed();
-                let progress_pct = hc_status.progress_pct();
-                let est_remaining = match (&hc_status.estimated_stop, &hc_status.time_start) {
-                    (Some(stop), Some(start)) if *stop > *start => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(*stop);
-                        Some(stop.saturating_sub(now))
-                    }
-                    _ => None,
-                };
-
-                let _ = tx
-                    .send(RunnerEvent::StatusUpdate {
-                        progress_pct,
-                        speed,
-                        est_remaining,
-                    })
-                    .await;
-            } else if let Some((hash, plaintext)) = status::parse_outfile_line(&line) {
-                // hashcat prints cracked hashes to stdout as "hash\tplaintext".
-                // Filter out hashcat info lines (contain spaces/dots before separator,
-                // or the "hash" part is too short to be a real hash).
-                let is_info_line = hash.contains(' ') || hash.contains("...") || hash.len() < 16;
-                if !is_info_line {
-                    let is_new = seen_hashes.lock().unwrap().insert(hash.clone());
-                    if is_new {
-                        info!(hash = %hash, "hash cracked (stdout)");
-                        let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
-                    }
-                }
-            } else {
-                debug!(line = %line, "hashcat stdout (non-JSON)");
-            }
-        }
-
-        // Wait for hashcat to exit
+        // Reap hashcat.
         let exit_status = self
             .child
             .wait()
             .await
             .context("failed to wait for hashcat process")?;
-
         let code = exit_status.code().unwrap_or(-1);
 
-        // Stop the background watchers
+        // Stop helpers and reconcile the outfile one last time before
+        // cleanup wipes it. The poller runs every 2s; hashcat can finish
+        // in less than that, so a final sweep catches the tail of cracks.
         outfile_handle.abort();
         stderr_handle.abort();
+        final_outfile_sweep(&self.outfile_path, &tx, &seen, code).await;
 
-        // Final read of the outfile to catch any cracked hashes the watcher missed.
-        // The watcher polls every 2s, but hashcat can complete faster than that.
-        // Note: hashcat only creates the outfile when it cracks something,
-        // so a missing outfile on exit_code=1 (exhausted) is completely normal.
-        match tokio::fs::read(&self.outfile_path).await {
-            Ok(bytes) => {
-                let contents = String::from_utf8_lossy(&bytes);
-                for line in contents.lines() {
-                    if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
-                        let is_new = seen_hashes.lock().unwrap().insert(hash.clone());
-                        if is_new {
-                            info!(hash = %hash, plaintext = %plaintext, "hash cracked (final outfile read)");
-                            let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
-                        }
-                    }
-                }
-            }
-            Err(_) if code == 1 => {
-                // Expected: hashcat exhausted without cracking, no outfile created
-                debug!(outfile = %self.outfile_path.display(), "no outfile (exhausted)");
-            }
-            Err(e) => {
-                warn!(
-                    outfile = %self.outfile_path.display(),
-                    error = %e,
-                    "outfile could not be read"
-                );
-            }
-        }
-
-        // Clean up temporary files (outfile + potfile)
         self.cleanup_temp_files().await;
-
-        // Hashcat exit codes:
-        //   0 = cracked / exhausted successfully
-        //   1 = exhausted (no hashes cracked)
-        //  -1 = error
-        //  -2 = aborted by user
-        match code {
-            0 | 1 => {
-                info!(exit_code = code, "hashcat completed");
-                let _ = tx.send(RunnerEvent::Completed { exit_code: code }).await;
-            }
-            _ => {
-                warn!(exit_code = code, "hashcat exited with error");
-                let _ = tx
-                    .send(RunnerEvent::Failed {
-                        error: format!("hashcat exited with code {code}"),
-                    })
-                    .await;
-            }
-        }
-
+        report_exit(code, &tx).await;
         Ok(code)
     }
 
@@ -450,6 +335,177 @@ async fn watch_outfile(
         }
 
         last_size = size;
+    }
+}
+
+// ── Internal helpers for `HashcatRunner::monitor` ────────────────────────────
+
+/// Funnel for "have we already reported this hash?" across the three
+/// channels that emit cracks (stdout, outfile poller, final sweep).
+/// Cheap-to-clone wrapper around `Arc<Mutex<HashSet<String>>>`.
+#[derive(Clone)]
+struct CrackedHashDedup {
+    inner: Arc<Mutex<HashSet<String>>>,
+}
+
+impl CrackedHashDedup {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Returns true if this is the first time we've seen `hash`.
+    fn record(&self, hash: &str) -> bool {
+        self.inner.lock().unwrap().insert(hash.to_string())
+    }
+
+    /// Hand off to the polling outfile watcher, which still uses the
+    /// raw `Arc<Mutex<HashSet<String>>>` form.
+    fn into_arc(self) -> Arc<Mutex<HashSet<String>>> {
+        self.inner
+    }
+}
+
+/// Read hashcat's stdout line-by-line. Each line is either:
+/// - a `--status-json` payload → forward as `StatusUpdate`
+/// - a `hash\tplaintext` outfile line (hashcat occasionally double-prints
+///   to stdout) → forward as `HashCracked` if not already seen
+/// - free-form info/progress text → debug-log and drop
+///
+/// Returns when stdout EOFs, which happens when the child exits.
+async fn monitor_stdout(
+    stdout: tokio::process::ChildStdout,
+    tx: &mpsc::Sender<RunnerEvent>,
+    seen: &CrackedHashDedup,
+) {
+    let reader = BufReader::new(stdout);
+    let mut lines = reader.lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim_end_matches('\r').to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(hc_status) = status::parse_status_line(&line) {
+            let speed = hc_status.total_speed();
+            let progress_pct = hc_status.progress_pct();
+            let est_remaining = match (&hc_status.estimated_stop, &hc_status.time_start) {
+                (Some(stop), Some(start)) if *stop > *start => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(*stop);
+                    Some(stop.saturating_sub(now))
+                }
+                _ => None,
+            };
+            let _ = tx
+                .send(RunnerEvent::StatusUpdate {
+                    progress_pct,
+                    speed,
+                    est_remaining,
+                })
+                .await;
+        } else if let Some((hash, plaintext)) = status::parse_outfile_line(&line) {
+            // hashcat occasionally writes the outfile-format line to
+            // stdout. Filter out info noise (spaces / ellipses / too-short
+            // hash-side bytes) before treating as a crack.
+            let is_info_line = hash.contains(' ') || hash.contains("...") || hash.len() < 16;
+            if !is_info_line && seen.record(&hash) {
+                info!(hash = %hash, "hash cracked (stdout)");
+                let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
+            }
+        } else {
+            debug!(line = %line, "hashcat stdout (non-JSON)");
+        }
+    }
+}
+
+/// Drain hashcat's stderr line-by-line. Lines containing fatal markers
+/// (`No hashes loaded`, `Hashfile`, `ERROR`) emit a `Failed` event so
+/// the runner short-circuits the dispatch instead of silently exiting.
+async fn drain_stderr_for_fatal(
+    stderr: tokio::process::ChildStderr,
+    tx: mpsc::Sender<RunnerEvent>,
+) {
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim_end_matches('\r').to_string();
+        if line.is_empty() {
+            continue;
+        }
+        warn!(stderr = %line, "hashcat stderr");
+        if line.contains("No hashes loaded") || line.contains("Hashfile") || line.contains("ERROR")
+        {
+            let _ = tx
+                .send(RunnerEvent::Failed {
+                    error: line.clone(),
+                })
+                .await;
+        }
+    }
+}
+
+/// Race catch-up after hashcat exits. The outfile poller runs every 2 s,
+/// so a sub-second hashcat run can land cracks the poller never observed;
+/// reading the outfile once more before cleanup picks them up.
+///
+/// A missing outfile on `exit_code = 1` (exhausted, nothing cracked) is
+/// the expected case and logged at debug.
+async fn final_outfile_sweep(
+    path: &Path,
+    tx: &mpsc::Sender<RunnerEvent>,
+    seen: &CrackedHashDedup,
+    exit_code: i32,
+) {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let contents = String::from_utf8_lossy(&bytes);
+            for line in contents.lines() {
+                if let Some((hash, plaintext)) = status::parse_outfile_line(line) {
+                    if seen.record(&hash) {
+                        // Plaintext deliberately omitted from agent INFO logs —
+                        // see runner::HashcatRunner::monitor; coord persists
+                        // them in the access-controlled cracked_hashes table.
+                        info!(hash = %hash, "hash cracked (final outfile read)");
+                        let _ = tx.send(RunnerEvent::HashCracked { hash, plaintext }).await;
+                    }
+                }
+            }
+        }
+        Err(_) if exit_code == 1 => {
+            debug!(outfile = %path.display(), "no outfile (exhausted)");
+        }
+        Err(e) => {
+            warn!(outfile = %path.display(), error = %e, "outfile could not be read");
+        }
+    }
+}
+
+/// Translate a hashcat exit code into the corresponding `RunnerEvent`.
+///
+/// Exit codes:
+///   0 = cracked / exhausted successfully
+///   1 = exhausted (no hashes cracked)
+///  -1 = error
+///  -2 = aborted by user
+async fn report_exit(code: i32, tx: &mpsc::Sender<RunnerEvent>) {
+    match code {
+        0 | 1 => {
+            info!(exit_code = code, "hashcat completed");
+            let _ = tx.send(RunnerEvent::Completed { exit_code: code }).await;
+        }
+        _ => {
+            warn!(exit_code = code, "hashcat exited with error");
+            let _ = tx
+                .send(RunnerEvent::Failed {
+                    error: format!("hashcat exited with code {code}"),
+                })
+                .await;
+        }
     }
 }
 

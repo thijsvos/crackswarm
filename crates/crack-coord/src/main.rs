@@ -1,6 +1,9 @@
+mod admin_token;
 mod api;
+mod audit;
 mod campaign;
 mod config;
+mod last_seen;
 mod lifecycle;
 mod monitor;
 mod scheduler;
@@ -137,7 +140,7 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         .unwrap_or_else(|| "hashcat".to_string());
 
     // Create shared state
-    let state = state::AppState::new(
+    let (state, audit_rx) = state::AppState::new(
         db,
         data_dir.clone(),
         keypair,
@@ -145,15 +148,24 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         bind.clone(),
     );
 
-    // Audit log: coordinator started
-    let _ = storage::db::insert_audit(
-        &state.db,
+    // Spin up the audit-log batcher before we emit the first event.
+    let audit_pool = state.db.clone();
+    tokio::spawn(async move {
+        audit::run_audit_flusher(audit_pool, audit_rx).await;
+    });
+
+    // Background flusher for buffered heartbeat writes.
+    let last_seen_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        last_seen::run_last_seen_flusher(last_seen_state).await;
+    });
+
+    state.emit_audit(
         "coordinator_started",
         &format!("Coordinator started on {bind}"),
         None,
         None,
-    )
-    .await;
+    );
 
     // Start worker transport listener
     let transport_state = Arc::clone(&state);
@@ -164,11 +176,24 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Generate or load the REST admin token before starting the API
+    // listener so any client that races startup gets a 401 rather than
+    // an unauthenticated response.
+    let admin_token = Arc::new(
+        admin_token::AdminToken::load_or_create(&data_dir)
+            .expect("failed to load or generate REST admin token"),
+    );
+    info!(
+        "REST admin token at {} (chmod 600 on Unix)",
+        data_dir.join("admin.token").display()
+    );
+
     // Start REST API server
     let api_state = Arc::clone(&state);
+    let api_token = Arc::clone(&admin_token);
     let api_bind_addr = api_bind.clone();
     tokio::spawn(async move {
-        let router = api::create_router(api_state);
+        let router = api::create_router(api_state, api_token);
         let listener = tokio::net::TcpListener::bind(&api_bind_addr)
             .await
             .expect("failed to bind API listener");

@@ -16,6 +16,16 @@ use crate::storage::{db, files};
 
 use super::{ApiError, ApiResult};
 
+/// Hard cap on a single file upload, in bytes. The router intentionally
+/// disables `DefaultBodyLimit` so streamed multipart uploads can run, but
+/// the server still needs a ceiling — a runaway client (`crackctl file
+/// upload /dev/zero`) or a buggy script can fill the disk and break the
+/// GC loop, monitor, and Noise handler in turn.
+///
+/// 64 GiB is generous for hash files and wordlists; tune via constant if
+/// the deployment needs more.
+const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 pub async fn upload_file(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -52,6 +62,12 @@ pub async fn upload_file(
                                 writer.abort().await;
                                 return Err(ApiError::Internal(format!(
                                     "failed to write chunk: {e}"
+                                )));
+                            }
+                            if writer.size() > MAX_UPLOAD_BYTES {
+                                writer.abort().await;
+                                return Err(ApiError::PayloadTooLarge(format!(
+                                    "upload exceeded {MAX_UPLOAD_BYTES}-byte limit",
                                 )));
                             }
                         }
