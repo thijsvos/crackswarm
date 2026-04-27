@@ -74,8 +74,7 @@ impl AdminToken {
             let _ = write!(hex, "{b:02x}");
         }
 
-        write_token_file(&path, &hex)
-            .with_context(|| format!("writing {}", path.display()))?;
+        write_token_file(&path, &hex).with_context(|| format!("writing {}", path.display()))?;
 
         tracing::info!(path = %path.display(), "generated new REST admin token");
         Ok(Self { hex })
@@ -169,10 +168,8 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "crack-coord-token-{}",
-                uuid::Uuid::new_v4()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("crack-coord-token-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }

@@ -144,9 +144,6 @@ pub fn create_router(state: Arc<AppState>, token: Arc<AdminToken>) -> Router {
         // Bearer-token gate. Applied last so it runs first (axum middleware
         // evaluates outside-in); a missing or wrong token short-circuits
         // before any handler state is touched.
-        .layer(middleware::from_fn_with_state(
-            token,
-            require_admin_token,
-        ))
+        .layer(middleware::from_fn_with_state(token, require_admin_token))
         .with_state(state)
 }

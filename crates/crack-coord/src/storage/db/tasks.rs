@@ -9,7 +9,9 @@
 //! transitions release those refs and queue any orphan files for GC.
 
 use anyhow::{Context, Result};
-use crack_common::models::{AttackConfig, Chunk, CreateTaskRequest, Task, TaskStatus, WorkerStatus};
+use crack_common::models::{
+    AttackConfig, Chunk, CreateTaskRequest, Task, TaskStatus, WorkerStatus,
+};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -200,15 +202,14 @@ pub async fn try_dispatch_new_chunk(
     let new_skip = expected_next_skip.saturating_add(chunk.limit);
     let mut tx = pool.begin().await.context("begin dispatch tx")?;
 
-    let cursor_update = sqlx::query(
-        "UPDATE tasks SET next_skip = ?1 WHERE id = ?2 AND next_skip = ?3",
-    )
-    .bind(new_skip as i64)
-    .bind(task_id.to_string())
-    .bind(expected_next_skip as i64)
-    .execute(&mut *tx)
-    .await
-    .context("conditional cursor advance")?;
+    let cursor_update =
+        sqlx::query("UPDATE tasks SET next_skip = ?1 WHERE id = ?2 AND next_skip = ?3")
+            .bind(new_skip as i64)
+            .bind(task_id.to_string())
+            .bind(expected_next_skip as i64)
+            .execute(&mut *tx)
+            .await
+            .context("conditional cursor advance")?;
 
     if cursor_update.rows_affected() == 0 {
         // Lost the race; let the caller retry against the moved cursor.

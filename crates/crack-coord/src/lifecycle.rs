@@ -175,7 +175,9 @@ pub(crate) async fn dispatch_evict_for_sha(
                 hash: sha.to_string(),
             }) {
                 Ok(()) => dispatched += 1,
-                Err(e) => debug!(%sha, %worker_id, error = %e, "GC: fallback EvictFile try_send failed"),
+                Err(e) => {
+                    debug!(%sha, %worker_id, error = %e, "GC: fallback EvictFile try_send failed")
+                }
             }
         }
     } else {
@@ -305,11 +307,12 @@ mod tests {
         let mut conns = HashMap::new();
         conns.insert("w-stuck".to_string(), conn);
 
-        let (dispatched, _) =
-            tokio::time::timeout(std::time::Duration::from_millis(200),
-                dispatch_evict_for_sha(&conns, "sha-extra", &["w-stuck".to_string()]))
-                .await
-                .expect("dispatch must not block on full buffer");
+        let (dispatched, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            dispatch_evict_for_sha(&conns, "sha-extra", &["w-stuck".to_string()]),
+        )
+        .await
+        .expect("dispatch must not block on full buffer");
 
         assert_eq!(
             dispatched, 0,

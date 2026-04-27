@@ -93,14 +93,8 @@ pub async fn assign_next_chunk(
             cracked_count: 0,
         };
 
-        match db::try_dispatch_new_chunk(
-            &state.db,
-            task.id,
-            task.next_skip,
-            &chunk,
-            worker_id,
-        )
-        .await?
+        match db::try_dispatch_new_chunk(&state.db, task.id, task.next_skip, &chunk, worker_id)
+            .await?
         {
             DispatchOutcome::Dispatched => {
                 info!(

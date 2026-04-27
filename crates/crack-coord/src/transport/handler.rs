@@ -64,7 +64,16 @@ async fn run_connection(
         .context("failed to check worker authorization")?;
 
     if !authorized {
-        match await_enrollment_or_reject(state, stream, &mut transport, peer_addr, &pubkey_b64, &pubkey_fp).await? {
+        match await_enrollment_or_reject(
+            state,
+            stream,
+            &mut transport,
+            peer_addr,
+            &pubkey_b64,
+            &pubkey_fp,
+        )
+        .await?
+        {
             AuthOutcome::Authorized => {} // fall through to message loop
             AuthOutcome::Disconnect => return Ok(()),
         }
@@ -85,8 +94,7 @@ async fn perform_handshake(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
 ) -> anyhow::Result<HandshakeOutcome> {
-    let mut handshake =
-        build_responder(keypair).context("failed to build noise responder")?;
+    let mut handshake = build_responder(keypair).context("failed to build noise responder")?;
 
     // Read the initiator's first message (e, es, s, ss).
     let msg1 = read_noise_frame(stream)
@@ -248,8 +256,7 @@ async fn run_message_loop(
     // `AssignChunk` messages flow out; checked on every
     // `RequestFileRange`. The list grows monotonically for the
     // connection's lifetime; reconnect resets it.
-    let mut assigned_shas: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut assigned_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Reusable buffers.
     let mut read_buf = vec![0u8; 65535];
@@ -458,8 +465,14 @@ async fn handle_worker_message(
             exit_code,
             total_cracked: _,
         } => {
-            handle_chunk_completed(state, outbound_tx, worker_id.as_deref(), *chunk_id, *exit_code)
-                .await
+            handle_chunk_completed(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                *chunk_id,
+                *exit_code,
+            )
+            .await
         }
 
         WorkerMessage::ChunkFailed {
@@ -535,8 +548,15 @@ async fn handle_worker_message(
             hash,
             reason,
         } => {
-            handle_pull_failed(state, outbound_tx, worker_id.as_deref(), *chunk_id, hash, reason)
-                .await
+            handle_pull_failed(
+                state,
+                outbound_tx,
+                worker_id.as_deref(),
+                *chunk_id,
+                hash,
+                reason,
+            )
+            .await
         }
 
         WorkerMessage::CacheAck { kept, evicted } => {
@@ -1069,7 +1089,10 @@ async fn file_ref(pool: &sqlx::SqlitePool, file_id: &str) -> anyhow::Result<(Str
         anyhow::bail!("file {file_id} has no sha256 (backfill may have skipped it)");
     }
     if record.size_bytes < 0 {
-        anyhow::bail!("file {file_id} has invalid size_bytes={}", record.size_bytes);
+        anyhow::bail!(
+            "file {file_id} has invalid size_bytes={}",
+            record.size_bytes
+        );
     }
     Ok((record.sha256, record.size_bytes as u64))
 }

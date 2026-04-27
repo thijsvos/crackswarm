@@ -61,12 +61,10 @@ pub async fn sync_worker_cache_manifest(
         // bound-parameter cap (defaults to 999 on pre-3.32 builds, 32766 on
         // 3.32+). The temp table is connection-scoped, so we DROP it at the
         // end to avoid surprising the next heartbeat on a reused pool conn.
-        sqlx::query(
-            "CREATE TEMP TABLE IF NOT EXISTS _keep_shas (sha TEXT PRIMARY KEY)",
-        )
-        .execute(&mut *tx)
-        .await
-        .context("creating temp keep table")?;
+        sqlx::query("CREATE TEMP TABLE IF NOT EXISTS _keep_shas (sha TEXT PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await
+            .context("creating temp keep table")?;
         sqlx::query("DELETE FROM _keep_shas")
             .execute(&mut *tx)
             .await
@@ -85,9 +83,7 @@ pub async fn sync_worker_cache_manifest(
             for entry in batch {
                 q = q.bind(&entry.sha256);
             }
-            q.execute(&mut *tx)
-                .await
-                .context("populating keep set")?;
+            q.execute(&mut *tx).await.context("populating keep set")?;
         }
 
         sqlx::query(

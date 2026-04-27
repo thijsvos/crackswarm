@@ -102,8 +102,12 @@ mod tests {
             .unwrap();
 
         let mut snap = std::collections::HashMap::new();
-        let ts1 = "2026-04-25T10:00:00+00:00".parse::<DateTime<Utc>>().unwrap();
-        let ts2 = "2026-04-25T11:00:00+00:00".parse::<DateTime<Utc>>().unwrap();
+        let ts1 = "2026-04-25T10:00:00+00:00"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let ts2 = "2026-04-25T11:00:00+00:00"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
         snap.insert("w1".into(), ts1);
         snap.insert("w2".into(), ts2);
 
@@ -124,7 +128,9 @@ mod tests {
     #[tokio::test]
     async fn flush_with_empty_snapshot_is_noop() {
         let pool = mem_pool().await;
-        flush(&pool, &std::collections::HashMap::new()).await.unwrap();
+        flush(&pool, &std::collections::HashMap::new())
+            .await
+            .unwrap();
         // No panic, no rows touched.
     }
 }

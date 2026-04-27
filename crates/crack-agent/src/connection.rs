@@ -509,7 +509,9 @@ async fn connect_and_run(
                     // Release this chunk's cache holds. The state struct
                     // applies any pending_evictions whose in-use set just
                     // became empty.
-                    state.release_holds_for_chunk(chunk_id, &content_cache).await;
+                    state
+                        .release_holds_for_chunk(chunk_id, &content_cache)
+                        .await;
 
                     // Start the next queued chunk, if any.
                     if let Some(next) = state.pending_queue.pop_front() {
@@ -868,7 +870,10 @@ async fn connect_and_run(
                     }
 
                     CoordMessage::EvictFile { hash } => {
-                        match state.defer_or_apply_eviction(hash.clone(), &content_cache).await {
+                        match state
+                            .defer_or_apply_eviction(hash.clone(), &content_cache)
+                            .await
+                        {
                             Some(removed) => info!(%hash, removed, "EvictFile applied"),
                             None => info!(
                                 %hash,

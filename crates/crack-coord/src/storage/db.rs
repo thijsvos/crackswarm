@@ -278,17 +278,19 @@ async fn backfill_empty_shas(pool: &SqlitePool, files_dir: &Path) -> Result<()> 
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt as _;
 
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, filename FROM files WHERE sha256 = '' AND gc_state = 'active'",
-    )
-    .fetch_all(pool)
-    .await
-    .context("scanning files for empty sha")?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, filename FROM files WHERE sha256 = '' AND gc_state = 'active'")
+            .fetch_all(pool)
+            .await
+            .context("scanning files for empty sha")?;
 
     if rows.is_empty() {
         return Ok(());
     }
-    tracing::info!(count = rows.len(), "backfilling sha256 for legacy file rows");
+    tracing::info!(
+        count = rows.len(),
+        "backfilling sha256 for legacy file rows"
+    );
 
     let mut backfilled = 0usize;
     let mut skipped = 0usize;
@@ -788,7 +790,9 @@ mod tests {
     #[test]
     fn parse_dt_opt_handles_none_and_some() {
         assert!(parse_dt_opt(None).unwrap().is_none());
-        assert!(parse_dt_opt(Some("2026-04-25T10:00:00Z".into())).unwrap().is_some());
+        assert!(parse_dt_opt(Some("2026-04-25T10:00:00Z".into()))
+            .unwrap()
+            .is_some());
         assert!(parse_dt_opt(Some("garbage".into())).is_err());
     }
 
@@ -1186,8 +1190,14 @@ mod tests {
             .await
             .expect("second sync should succeed");
 
-        assert!(workers_with_file(&pool, "sha-0500").await.unwrap().is_empty());
-        assert!(workers_with_file(&pool, "sha-1000").await.unwrap().is_empty());
+        assert!(workers_with_file(&pool, "sha-0500")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(workers_with_file(&pool, "sha-1000")
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
             workers_with_file(&pool, "sha-0123").await.unwrap(),
             vec!["w".to_string()]
@@ -1465,8 +1475,12 @@ mod tests {
 
     async fn make_dispatchable_task(pool: &SqlitePool, hash_file_id: &str, keyspace: u64) -> Task {
         let task = make_task(pool, hash_file_id).await;
-        set_task_keyspace(pool, task.id, keyspace, 100).await.unwrap();
-        update_task_status(pool, task.id, TaskStatus::Running).await.unwrap();
+        set_task_keyspace(pool, task.id, keyspace, 100)
+            .await
+            .unwrap();
+        update_task_status(pool, task.id, TaskStatus::Running)
+            .await
+            .unwrap();
         get_task(pool, task.id).await.unwrap().unwrap()
     }
 
@@ -1494,8 +1508,9 @@ mod tests {
         let task = make_dispatchable_task(&pool, "hash-disp-1", 1_000_000).await;
         let chunk = sample_chunk(task.id, task.next_skip, 50_000, "w-1");
 
-        let outcome =
-            try_dispatch_new_chunk(&pool, task.id, task.next_skip, &chunk, "w-1").await.unwrap();
+        let outcome = try_dispatch_new_chunk(&pool, task.id, task.next_skip, &chunk, "w-1")
+            .await
+            .unwrap();
         assert!(matches!(outcome, DispatchOutcome::Dispatched));
 
         // Cursor advanced by limit.
@@ -1506,7 +1521,9 @@ mod tests {
         assert!(get_chunk(&pool, chunk.id).await.unwrap().is_some());
 
         // Worker flipped to working.
-        let workers = get_workers_by_status(&pool, WorkerStatus::Working).await.unwrap();
+        let workers = get_workers_by_status(&pool, WorkerStatus::Working)
+            .await
+            .unwrap();
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id, "w-1");
     }
@@ -1538,7 +1555,10 @@ mod tests {
         assert!(get_chunk(&pool, chunk.id).await.unwrap().is_none());
         // Worker not flipped.
         let task_after = get_task(&pool, task.id).await.unwrap().unwrap();
-        assert_eq!(task_after.next_skip, 123, "cursor must remain at competing value");
+        assert_eq!(
+            task_after.next_skip, 123,
+            "cursor must remain at competing value"
+        );
     }
 
     /// Scratch directory cleaned up on drop; backfill tests need real files
@@ -1549,7 +1569,8 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("crack-coord-backfill-{}", Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("crack-coord-backfill-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }

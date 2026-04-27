@@ -189,7 +189,9 @@ async fn check_worker_health(state: &AppState) -> anyhow::Result<()> {
         // Heartbeat writes are buffered and flushed every ~3s. Consult the
         // in-memory buffer too so a worker that pinged 1s ago doesn't get
         // marked timed-out because the row hasn't flushed yet.
-        let last_seen = state.effective_last_seen(&worker.id, worker.last_seen_at).await;
+        let last_seen = state
+            .effective_last_seen(&worker.id, worker.last_seen_at)
+            .await;
         let elapsed = now - last_seen;
         if elapsed > timeout {
             warn!(
@@ -326,7 +328,10 @@ fn remaining_after_progress(skip: u64, limit: u64, progress: f64) -> (u64, u64) 
         0.0
     };
     let consumed = ((limit as f64) * (pct / 100.0)).min(limit as f64) as u64;
-    (skip.saturating_add(consumed), limit.saturating_sub(consumed))
+    (
+        skip.saturating_add(consumed),
+        limit.saturating_sub(consumed),
+    )
 }
 
 #[cfg(test)]
@@ -368,7 +373,10 @@ mod tests {
     #[test]
     fn infinity_treated_as_zero() {
         assert_eq!(remaining_after_progress(0, 100, f64::INFINITY), (0, 100));
-        assert_eq!(remaining_after_progress(0, 100, f64::NEG_INFINITY), (0, 100));
+        assert_eq!(
+            remaining_after_progress(0, 100, f64::NEG_INFINITY),
+            (0, 100)
+        );
     }
 
     #[test]

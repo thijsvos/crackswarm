@@ -438,9 +438,7 @@ async fn drain_stderr_for_fatal(
             continue;
         }
         warn!(stderr = %line, "hashcat stderr");
-        if line.contains("No hashes loaded")
-            || line.contains("Hashfile")
-            || line.contains("ERROR")
+        if line.contains("No hashes loaded") || line.contains("Hashfile") || line.contains("ERROR")
         {
             let _ = tx
                 .send(RunnerEvent::Failed {
