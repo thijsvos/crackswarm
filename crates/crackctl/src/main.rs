@@ -1,3 +1,6 @@
+//! `crackctl` — operator CLI for the coordinator. Parses subcommands and calls
+//! the REST API via [`client`], rendering results with [`display`].
+
 mod client;
 mod display;
 

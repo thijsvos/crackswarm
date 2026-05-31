@@ -163,13 +163,20 @@ async fn evict_lru_for_budget(
     state: &ConnectionState,
 ) -> u64 {
     let budget = cache.cache_max_bytes();
-    let mut current = cache.total_size().await;
+
+    // One tree walk, not three. `lru_candidates` already returns every
+    // canonical entry with its size, so their sum is the current total — no
+    // separate `total_size()` passes before and after the loop (which used to
+    // walk the cas/ tree two extra times on every assignment needing room).
+    let candidates = cache.lru_candidates().await;
+    let mut current: u64 = candidates
+        .iter()
+        .fold(0u64, |acc, c| acc.saturating_add(c.size_bytes));
     let mut headroom = budget.saturating_sub(current);
     if headroom >= needed {
         return headroom;
     }
 
-    let candidates = cache.lru_candidates().await;
     for c in candidates {
         if headroom >= needed {
             break;
@@ -180,13 +187,11 @@ async fn evict_lru_for_budget(
             continue;
         }
         if cache.evict(&c.sha256).await {
-            // Recompute conservatively: a concurrent writer could have
-            // shifted total_size during eviction.
             current = current.saturating_sub(c.size_bytes);
             headroom = budget.saturating_sub(current);
         }
     }
-    budget.saturating_sub(cache.total_size().await)
+    headroom
 }
 
 /// Maximum Noise transport message (plaintext side). 64 KiB is well within
@@ -821,10 +826,19 @@ async fn connect_and_run(
                     CoordMessage::AbortChunk { chunk_id } => {
                         info!(chunk_id = %chunk_id, "aborting chunk");
                         if let Some(kill_tx) = state.active_chunks.remove(&chunk_id) {
+                            // Running chunk: signal it to stop. Its terminal
+                            // handler releases the cache holds once it exits.
                             let _ = kill_tx.send(());
+                        } else {
+                            // Queued but never started: no terminal event will
+                            // fire, so release its cache holds here. Otherwise
+                            // they leak and permanently defer coordinator
+                            // EvictFile requests for those shas (a deadlock).
+                            state.pending_queue.retain(|p| p.chunk_id != chunk_id);
+                            state
+                                .release_holds_for_chunk(chunk_id, &content_cache)
+                                .await;
                         }
-                        // Also remove from pending queue if queued but not yet started
-                        state.pending_queue.retain(|p| p.chunk_id != chunk_id);
                         state.chunk_task.remove(&chunk_id);
                     }
 

@@ -1,3 +1,7 @@
+//! Coordinator TUI state: active tab, focus, selection/scroll indices, and the
+//! cached snapshots the views render. Mutated by key handlers and refreshed
+//! from `AppState` each tick.
+
 use std::collections::VecDeque;
 use std::time::Instant;
 

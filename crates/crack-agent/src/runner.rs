@@ -265,6 +265,16 @@ fn is_dangerous_arg(arg: &str) -> bool {
         "--keyspace",
         "--stdout",
         "--separator",
+        // Would break the agent's `hash\tplaintext` outfile parsing:
+        "--outfile-format",
+        "--outfile-autohex",
+        // Write/read arbitrary paths outside the orchestrated flow:
+        "--debug-file",
+        "--induction-dir",
+        "--outfile-check-dir",
+        "--markov-hcstat2",
+        // Redirect work to an external brain server:
+        "--brain",
     ];
     let lower = arg.to_ascii_lowercase();
     BLOCKED_PREFIXES

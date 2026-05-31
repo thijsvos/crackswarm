@@ -14,6 +14,7 @@ mod tui;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use tracing::{error, info};
 
@@ -96,7 +97,7 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     } else {
         // When TUI is active, log to a file to avoid corrupting the terminal
         let log_file = std::fs::File::create(data_dir.join("crack-coord.log"))
-            .expect("failed to create log file");
+            .context("creating coordinator log file")?;
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -119,12 +120,11 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
         );
         let kp = Keypair::generate()?;
         kp.save_to_dir(&data_dir)?;
-        std::fs::create_dir_all(data_dir.join("files"))?;
         info!("Auto-initialized. Public key: {}", kp.public_key_b64());
         kp
     };
 
-    // Ensure files directory exists
+    // Ensure files directory exists (covers both the loaded and auto-init paths).
     std::fs::create_dir_all(data_dir.join("files"))?;
 
     info!("Coordinator public key: {}", keypair.public_key_b64());
@@ -181,7 +181,7 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     // an unauthenticated response.
     let admin_token = Arc::new(
         admin_token::AdminToken::load_or_create(&data_dir)
-            .expect("failed to load or generate REST admin token"),
+            .context("loading or generating REST admin token")?,
     );
     info!(
         "REST admin token at {} (chmod 600 on Unix)",
@@ -194,13 +194,20 @@ async fn cmd_run(config: RunConfig) -> anyhow::Result<()> {
     let api_bind_addr = api_bind.clone();
     tokio::spawn(async move {
         let router = api::create_router(api_state, api_token);
-        let listener = tokio::net::TcpListener::bind(&api_bind_addr)
-            .await
-            .expect("failed to bind API listener");
+        // A panic inside a spawned task is swallowed (the task just dies), so a
+        // bind failure would silently take the REST API down with no signal.
+        // Log and return instead so operators see the failure.
+        let listener = match tokio::net::TcpListener::bind(&api_bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("failed to bind REST API on {api_bind_addr}: {e}");
+                return;
+            }
+        };
         info!("REST API listening on {api_bind_addr}");
-        axum::serve(listener, router)
-            .await
-            .expect("API server error");
+        if let Err(e) = axum::serve(listener, router).await {
+            error!("REST API server error: {e}");
+        }
     });
 
     // Start health monitor

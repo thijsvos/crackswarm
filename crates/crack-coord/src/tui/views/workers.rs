@@ -1,3 +1,5 @@
+//! Workers tab: renders connected workers, their devices, and cache usage.
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},

@@ -26,6 +26,8 @@ use super::{ApiError, ApiResult};
 /// the deployment needs more.
 const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// `POST /api/v1/files` — stream a multipart upload to disk, deduplicating by
+/// sha256 and enforcing the upload size cap.
 pub async fn upload_file(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -44,6 +46,13 @@ pub async fn upload_file(
 
         match field_name.as_str() {
             "file" => {
+                // Reject a second 'file' field rather than silently overwriting
+                // (and orphaning) the first one already written to disk.
+                if saved.is_some() {
+                    return Err(ApiError::BadRequest(
+                        "only one 'file' field is allowed per upload".to_string(),
+                    ));
+                }
                 let filename = field.file_name().unwrap_or("upload").to_string();
 
                 // Stream the field straight to a `.partial` file while hashing
@@ -126,8 +135,8 @@ pub async fn upload_file(
         return Ok((StatusCode::OK, Json(existing)));
     }
 
-    // Build disk path for the record
-    let disk_path = files_dir.join(&file_id).to_string_lossy().to_string();
+    // Store the relative on-disk name so the file resolves in O(1) (no scan).
+    let disk_path = files::disk_name_for(&file_id, &filename);
 
     // Create DB record
     let record = FileRecord {
@@ -144,6 +153,7 @@ pub async fn upload_file(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
+/// `GET /api/v1/files` — list all active (non-tombstoned) file records.
 pub async fn list_files(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<FileRecord>>> {
     let records = db::list_file_records(&state.db).await?;
     Ok(Json(records))
@@ -171,6 +181,8 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<S
     }))
 }
 
+/// Body of `POST /api/v1/files/hardlink` — register a file already present on
+/// the coordinator's filesystem by hard-linking it into the store (no copy).
 #[derive(Deserialize)]
 pub struct HardlinkRequest {
     /// Absolute path on the coord's local filesystem.
@@ -194,16 +206,18 @@ pub async fn hardlink_file(
     tokio::fs::create_dir_all(&files_dir).await?;
 
     // Verify source is on the same device as files_dir (hard links can't
-    // cross filesystems), and that it's a regular file.
+    // cross filesystems), and that it's a regular file. Use `symlink_metadata`
+    // (lstat) rather than `metadata` (stat) so a symlink can't pass the
+    // "regular file" check and get its target hard-linked into the store.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let source_meta = tokio::fs::metadata(&source_path)
+        let source_meta = tokio::fs::symlink_metadata(&source_path)
             .await
             .map_err(|e| ApiError::BadRequest(format!("source not readable: {e}")))?;
-        if !source_meta.is_file() {
+        if !source_meta.file_type().is_file() {
             return Err(ApiError::BadRequest(
-                "source must be a regular file".to_string(),
+                "source must be a regular file (symlinks are rejected)".to_string(),
             ));
         }
         let files_meta = tokio::fs::metadata(&files_dir).await?;
@@ -245,7 +259,7 @@ pub async fn hardlink_file(
         return Ok((StatusCode::OK, Json(existing)));
     }
 
-    let disk_path = files_dir.join(&file_id).to_string_lossy().to_string();
+    let disk_path = files::disk_name_for(&file_id, &req.filename);
     let record = FileRecord {
         id: file_id,
         filename: req.filename,
@@ -311,10 +325,15 @@ pub async fn gc_now(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRe
     ))
 }
 
+/// Point-in-time cache summary for one worker (from the coord-side mirror of
+/// the worker's manifest). Excludes files marked for GC but not yet evicted.
 #[derive(Serialize)]
 pub struct WorkerCacheStatus {
+    /// Worker UUID.
     pub worker_id: String,
+    /// Number of files currently in the worker's on-disk cache.
     pub file_count: i64,
+    /// Total bytes occupied by those cached files.
     pub total_bytes: i64,
 }
 
@@ -344,8 +363,16 @@ pub async fn download_file(
         .ok_or_else(|| ApiError::NotFound(format!("file {id} not found")))?;
 
     let files_dir = state.files_dir();
-    let data = files::read_file(&files_dir, &record.id)
-        .map_err(|e| ApiError::Internal(format!("failed to read file: {e}")))?;
+    // Stream the file rather than reading it fully into memory: with a 64 GiB
+    // upload ceiling, `std::fs::read` would buffer the whole file in RAM and
+    // block the runtime, letting one large download starve every other request.
+    let path = files::resolve_record_path(&files_dir, &record.id, &record.disk_path)
+        .map_err(|e| ApiError::NotFound(format!("file not found: {e}")))?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to open file: {e}")))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
 
     // Sanitize filename to prevent header injection via quotes, newlines, or null bytes.
     let safe_filename = record
@@ -360,6 +387,6 @@ pub async fn download_file(
             ("content-type", "application/octet-stream".to_string()),
             ("content-disposition", content_disposition),
         ],
-        data,
+        body,
     ))
 }

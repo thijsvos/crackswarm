@@ -110,6 +110,10 @@ fn write_token_file(path: &Path, hex: &str) -> Result<()> {
             .mode(0o600)
             .open(path)?;
         f.write_all(hex.as_bytes())?;
+        // Durably persist before returning: a crash between write and close
+        // would otherwise leave an empty token file that fails validation on
+        // restart, losing the admin credential irrecoverably.
+        f.sync_all()?;
     }
     #[cfg(not(unix))]
     {
@@ -118,7 +122,14 @@ fn write_token_file(path: &Path, hex: &str) -> Result<()> {
     Ok(())
 }
 
-/// `a.len() == b.len()` AND every byte equal — no early-exit on mismatch.
+/// Constant-time equality for the admin bearer token.
+///
+/// Returns early only on a *length* mismatch. That leaks nothing secret: the
+/// stored token is a fixed 64-char hex string, so its length is public and an
+/// attacker learns only whether their own guess was the right length (which
+/// they already know). Once lengths match, all bytes are XOR-accumulated with
+/// no early-exit on the first differing byte — so timing does not depend on
+/// *where* a wrong guess diverges from the secret.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

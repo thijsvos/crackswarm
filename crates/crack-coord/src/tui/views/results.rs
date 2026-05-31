@@ -1,3 +1,5 @@
+//! Results tab: renders recently cracked hashes across all tasks.
+
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
@@ -10,6 +12,10 @@ use crate::tui::theme::Theme;
 
 /// Render the cracked results table.
 pub fn render_results(f: &mut Frame, area: Rect, state: &TuiState) {
+    // Index tasks by id once so the per-result name lookup is O(1), not
+    // O(tasks) — the table was previously O(results * tasks) per render.
+    let task_by_id: std::collections::HashMap<_, _> =
+        state.tasks.iter().map(|t| (t.id, t)).collect();
     let rows: Vec<Row> = state
         .results
         .iter()
@@ -20,13 +26,13 @@ pub fn render_results(f: &mut Frame, area: Rect, state: &TuiState) {
                 r.hash.clone()
             };
             let time = r.cracked_at.format("%Y-%m-%d %H:%M").to_string();
-            let task_name = state
-                .tasks
-                .iter()
-                .find(|t| t.id == r.task_id)
+            let task_name = task_by_id
+                .get(&r.task_id)
                 .map(|t| {
-                    if t.name.len() > 16 {
-                        format!("{}...", &t.name[..13])
+                    // Truncate by characters, not bytes — byte-slicing a name
+                    // with multi-byte UTF-8 at the cut point panics.
+                    if t.name.chars().count() > 16 {
+                        format!("{}...", t.name.chars().take(13).collect::<String>())
                     } else {
                         t.name.clone()
                     }

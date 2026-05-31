@@ -17,6 +17,18 @@ pub async fn insert_cracked_hash(
     plaintext: &str,
     worker_id: &str,
 ) -> Result<bool> {
+    // Reject implausibly large plaintexts before they reach the DB or the
+    // pattern analyzer. A real password plaintext is tiny; a malicious worker
+    // could otherwise report megabyte-scale "plaintexts" and force unbounded
+    // allocation when the analyzer derives masks across all cracked rows.
+    const MAX_PLAINTEXT_LEN: usize = 256;
+    if plaintext.len() > MAX_PLAINTEXT_LEN {
+        anyhow::bail!(
+            "cracked plaintext too long: {} bytes (max {MAX_PLAINTEXT_LEN})",
+            plaintext.len()
+        );
+    }
+
     let now = now_iso();
 
     let result = sqlx::query(
@@ -118,19 +130,6 @@ pub async fn get_recent_cracked(pool: &SqlitePool, limit: u32) -> Result<Vec<Cra
         .context("fetching recent cracked hashes")?;
 
     rows.iter().map(row_to_cracked).collect()
-}
-
-/// Export all cracked plaintexts as a list of strings.
-pub async fn get_all_plaintexts(pool: &SqlitePool) -> Result<Vec<String>> {
-    let rows = sqlx::query("SELECT DISTINCT plaintext FROM cracked_hashes ORDER BY plaintext ASC")
-        .fetch_all(pool)
-        .await
-        .context("fetching all plaintexts")?;
-
-    Ok(rows
-        .iter()
-        .map(|r| r.get::<String, _>("plaintext"))
-        .collect())
 }
 
 /// Every cracked hash for tasks belonging to the given campaign. Joins

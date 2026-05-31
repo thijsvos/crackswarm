@@ -1,3 +1,6 @@
+//! HTTP client for the coordinator's REST API: wraps `reqwest` with the admin
+//! bearer token and typed request/response helpers used by the CLI commands.
+
 use std::path::Path;
 
 use anyhow::{Context, Result};

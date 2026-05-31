@@ -37,6 +37,9 @@ use crate::storage::{db, files};
 
 const GC_INTERVAL: Duration = Duration::from_secs(60);
 const GC_MAX_ATTEMPTS: i64 = 5;
+/// Max GC-queue entries processed per pass — bounds memory/time so a huge queue
+/// (e.g. after a bulk delete) is drained across several passes, not all at once.
+const GC_QUEUE_BATCH: i64 = 100;
 
 /// Background task: drain the GC queue every `GC_INTERVAL`. Each pass
 /// re-checks each entry's ref count (race-safe: a task starting between
@@ -60,7 +63,7 @@ pub async fn run_gc_once(state: &AppState) -> Result<()> {
 }
 
 async fn gc_pass(state: &AppState) -> Result<()> {
-    let queued = db::list_gc_queue(&state.db).await?;
+    let queued = db::list_gc_queue(&state.db, GC_QUEUE_BATCH).await?;
     for (sha, attempts) in queued {
         if attempts >= GC_MAX_ATTEMPTS {
             warn!(%sha, attempts, "GC gave up after too many retries — leaving file in place");
@@ -121,16 +124,21 @@ async fn gc_pass(state: &AppState) -> Result<()> {
         // historical joins.
         let records = db::files_by_sha256(&state.db, &sha).await?;
         let files_dir = state.files_dir();
+        let mut deleted_ids: Vec<String> = Vec::with_capacity(records.len());
         for rec in &records {
-            if let Err(e) = files::delete_file(&files_dir, &rec.id) {
+            // Resolve via the stored disk_path (O(1)) instead of a directory
+            // scan per record.
+            if let Err(e) = files::delete_record(&files_dir, &rec.id, &rec.disk_path) {
                 debug!(
                     file_id = %rec.id,
                     error = %e,
                     "GC: file already absent on disk (continuing)"
                 );
             }
-            db::set_file_gc_state_deleted(&state.db, &rec.id).await?;
+            deleted_ids.push(rec.id.clone());
         }
+        // One soft-delete UPDATE for every row sharing this sha.
+        db::set_files_gc_state_deleted(&state.db, &deleted_ids).await?;
 
         db::remove_from_gc_queue(&state.db, &sha).await?;
         info!(

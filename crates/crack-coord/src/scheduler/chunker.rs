@@ -21,6 +21,10 @@ use crate::storage::{db, files};
 /// that hashcat uses for `--skip`/`--limit`. This accounts for hashcat's
 /// optimizer which may merge multiple trailing mask positions into the
 /// amplifier, resulting in a smaller base keyspace than a naive calculation.
+///
+/// # Errors
+/// Returns an error if the hashcat process can't be spawned or its
+/// `--keyspace` output can't be parsed into a number.
 pub async fn compute_keyspace(
     pool: &SqlitePool,
     hashcat_path: &str,

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use base64::Engine;
 use crack_common::auth::{build_responder, encode_public_key, pubkey_fingerprint};
 use crack_common::models::*;
-use crack_common::protocol::{AssignChunkAttack, CoordMessage, WorkerMessage, MAX_MESSAGE_SIZE};
+use crack_common::protocol::{AssignChunkAttack, CoordMessage, WorkerMessage};
 
 use crate::scheduler;
 use crate::state::{AppEvent, AppState, WorkerConnection};
@@ -20,6 +20,13 @@ use crate::storage::{db, files};
 /// Maximum Noise transport message payload (just under the 65535 limit to
 /// leave room for the 16-byte AEAD tag that snow appends).
 const NOISE_MAX_PLAINTEXT: usize = 65535 - 16;
+
+/// Maximum length of a single Noise transport frame on the wire. A frame is an
+/// AEAD ciphertext, so it is at most the plaintext limit plus snow's 16-byte
+/// tag (i.e. 65535). Rejecting anything larger *before* allocating the read
+/// buffer closes a per-connection memory-exhaustion DoS — the previous bound
+/// (`MAX_MESSAGE_SIZE`, 16 MiB) let a peer force a 16 MiB allocation per frame.
+const MAX_NOISE_FRAME_SIZE: usize = NOISE_MAX_PLAINTEXT + 16;
 
 /// Handle a single worker connection end-to-end: handshake, auth check,
 /// message loop, and cleanup.
@@ -48,6 +55,9 @@ struct HandshakeOutcome {
     pubkey_fp: String,
 }
 
+/// Run one worker connection end-to-end after TCP accept: Noise handshake,
+/// authentication/enrollment, the encrypted message loop, then cleanup.
+/// Private; the entry point is [`handle_connection`].
 async fn run_connection(
     state: &Arc<AppState>,
     stream: &mut TcpStream,
@@ -165,7 +175,7 @@ async fn await_enrollment_or_reject(
             warn!(%peer_addr, pubkey_fp = %pubkey_fp, "enrollment timeout, disconnecting");
             state.emit_audit(
                 "auth_rejected",
-                &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (enrollment timeout)"),
+                &format!("Unauthorized connection from {peer_addr} with key fingerprint {pubkey_fp} (enrollment timeout)"),
                 Some(&peer_addr.to_string()),
                 None,
             );
@@ -197,12 +207,24 @@ async fn await_enrollment_or_reject(
             let valid_name = db::validate_enrollment_nonce(&state.db, &nonce).await?;
             match valid_name {
                 Some(token_name) => {
-                    db::mark_nonce_used(&state.db, &nonce, pubkey_b64).await?;
+                    // Atomically consume the one-shot nonce. If we lost the race
+                    // (or it was used between the check above and here), reject:
+                    // a single enrollment token must never enroll two workers.
+                    if !db::mark_nonce_used(&state.db, &nonce, pubkey_b64).await? {
+                        warn!(%peer_addr, "enrollment nonce already consumed (race), rejecting");
+                        state.emit_audit(
+                            "enroll_rejected",
+                            &format!("Enrollment nonce already used (race) from {peer_addr} with key fingerprint {pubkey_fp}"),
+                            Some(&peer_addr.to_string()),
+                            None,
+                        );
+                        return Ok(AuthOutcome::Disconnect);
+                    }
                     db::authorize_worker(&state.db, pubkey_b64, &token_name).await?;
 
                     state.emit_audit(
                         "worker_enrolled",
-                        &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key {pubkey_b64}"),
+                        &format!("Worker '{token_name}' enrolled via token from {peer_addr} with key fingerprint {pubkey_fp}"),
                         Some(&peer_addr.to_string()),
                         None,
                     );
@@ -214,7 +236,7 @@ async fn await_enrollment_or_reject(
                     warn!(%peer_addr, "invalid or expired enrollment nonce");
                     state.emit_audit(
                         "enroll_rejected",
-                        &format!("Invalid enrollment nonce from {peer_addr} with key {pubkey_b64}"),
+                        &format!("Invalid enrollment nonce from {peer_addr} with key fingerprint {pubkey_fp}"),
                         Some(&peer_addr.to_string()),
                         None,
                     );
@@ -226,7 +248,7 @@ async fn await_enrollment_or_reject(
             warn!(%peer_addr, pubkey_fp = %pubkey_fp, "unauthorized worker sent non-Enroll message, disconnecting");
             state.emit_audit(
                 "auth_rejected",
-                &format!("Unauthorized connection from {peer_addr} with key {pubkey_b64} (no enrollment)"),
+                &format!("Unauthorized connection from {peer_addr} with key fingerprint {pubkey_fp} (no enrollment)"),
                 Some(&peer_addr.to_string()),
                 None,
             );
@@ -376,8 +398,8 @@ async fn read_noise_frame(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    if len > MAX_MESSAGE_SIZE {
-        bail!("frame too large: {len} bytes (max {MAX_MESSAGE_SIZE})");
+    if len > MAX_NOISE_FRAME_SIZE {
+        bail!("frame too large: {len} bytes (max {MAX_NOISE_FRAME_SIZE})");
     }
 
     let mut payload = vec![0u8; len];
@@ -791,10 +813,8 @@ async fn handle_cache_ack(
     let Some(wid) = worker_id else {
         return Ok(());
     };
-    for sha in evicted {
-        if let Err(e) = db::remove_worker_cache_entry(&state.db, wid, sha).await {
-            warn!(worker = %wid, %sha, error = %e, "remove_worker_cache_entry failed");
-        }
+    if let Err(e) = db::remove_worker_cache_entries(&state.db, wid, evicted).await {
+        warn!(worker = %wid, error = %e, "remove_worker_cache_entries failed");
     }
     debug!(
         worker = %wid,
@@ -805,11 +825,16 @@ async fn handle_cache_ack(
     Ok(())
 }
 
-/// Cap any single `RequestFileRange` response at this many raw bytes. Larger
-/// caps bloat the Noise frame (MAX_MESSAGE_SIZE = 16 MiB, base64 adds 33%),
-/// so we keep a safe margin. The worker decides how fast to pull by issuing
-/// the next request after each response arrives.
-const FILE_RANGE_MAX_BYTES: u32 = 2 * 1024 * 1024;
+/// Cap any single `RequestFileRange` response at this many raw bytes. The
+/// response is base64-encoded (+33%) and wrapped in a JSON `FileRange` message,
+/// and the whole frame must fit inside one Noise transport message
+/// (`NOISE_MAX_PLAINTEXT` = 65519 bytes). 48 KB of raw data encodes to ~64 KB
+/// which, plus the small JSON envelope, stays under that limit. The worker
+/// paces the transfer by issuing the next request after each response.
+///
+/// (Previously 2 MiB — ~2.67 MiB once encoded, far over the frame limit, so a
+/// max-size request produced a frame the send path silently dropped.)
+const FILE_RANGE_MAX_BYTES: u32 = 48_000;
 
 async fn handle_request_file_range(
     state: &Arc<AppState>,
@@ -832,7 +857,7 @@ async fn handle_request_file_range(
         }
     };
 
-    let path = match files::resolve_file_path(&state.files_dir(), &record.id) {
+    let path = match files::resolve_record_path(&state.files_dir(), &record.id, &record.disk_path) {
         Ok(p) => p,
         Err(e) => {
             outbound_tx
@@ -1029,41 +1054,13 @@ pub(crate) async fn build_assign_chunk_msg(
     task: &Task,
     chunk: &Chunk,
 ) -> anyhow::Result<CoordMessage> {
-    let attack = match &task.attack_config {
-        AttackConfig::BruteForce {
-            mask,
-            custom_charsets,
-        } => AssignChunkAttack::BruteForce {
-            mask: mask.clone(),
-            custom_charsets: custom_charsets.clone(),
-        },
-        AttackConfig::Dictionary { wordlist_file_id } => {
-            let (sha, size) = file_ref(&state.db, wordlist_file_id).await?;
-            AssignChunkAttack::DictionaryByHash {
-                wordlist_sha256: sha,
-                wordlist_size: size,
-                rules_sha256: None,
-                rules_size: None,
-            }
-        }
-        AttackConfig::DictionaryWithRules {
-            wordlist_file_id,
-            rules_file_id,
-        } => {
-            let (w_sha, w_size) = file_ref(&state.db, wordlist_file_id).await?;
-            let (r_sha, r_size) = file_ref(&state.db, rules_file_id).await?;
-            AssignChunkAttack::DictionaryByHash {
-                wordlist_sha256: w_sha,
-                wordlist_size: w_size,
-                rules_sha256: Some(r_sha),
-                rules_size: Some(r_size),
-            }
-        }
-    };
-
-    // Hash file is content-addressed exactly like wordlists/rules — the
-    // agent pulls it via `RequestFileRange`/`FileRange` on cache miss.
-    let (hash_file_sha256, hash_file_size) = file_ref(&state.db, &task.hash_file_id).await?;
+    // Resolve the hash file concurrently with the attack-config file refs
+    // (the hash file is content-addressed exactly like wordlists/rules — the
+    // agent pulls it via `RequestFileRange`/`FileRange` on cache miss).
+    let (attack, (hash_file_sha256, hash_file_size)) = tokio::try_join!(
+        build_assign_attack(&state.db, &task.attack_config),
+        file_ref(&state.db, &task.hash_file_id),
+    )?;
 
     Ok(CoordMessage::AssignChunk {
         chunk_id: chunk.id,
@@ -1075,6 +1072,47 @@ pub(crate) async fn build_assign_chunk_msg(
         limit: chunk.limit,
         attack,
         extra_args: task.extra_args.clone(),
+    })
+}
+
+/// Build the per-chunk attack descriptor, resolving any content-addressed
+/// wordlist/rules file refs (wordlist and rules concurrently).
+async fn build_assign_attack(
+    pool: &sqlx::SqlitePool,
+    config: &AttackConfig,
+) -> anyhow::Result<AssignChunkAttack> {
+    Ok(match config {
+        AttackConfig::BruteForce {
+            mask,
+            custom_charsets,
+        } => AssignChunkAttack::BruteForce {
+            mask: mask.clone(),
+            custom_charsets: custom_charsets.clone(),
+        },
+        AttackConfig::Dictionary { wordlist_file_id } => {
+            let (sha, size) = file_ref(pool, wordlist_file_id).await?;
+            AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: sha,
+                wordlist_size: size,
+                rules_sha256: None,
+                rules_size: None,
+            }
+        }
+        AttackConfig::DictionaryWithRules {
+            wordlist_file_id,
+            rules_file_id,
+        } => {
+            let ((w_sha, w_size), (r_sha, r_size)) = tokio::try_join!(
+                file_ref(pool, wordlist_file_id),
+                file_ref(pool, rules_file_id),
+            )?;
+            AssignChunkAttack::DictionaryByHash {
+                wordlist_sha256: w_sha,
+                wordlist_size: w_size,
+                rules_sha256: Some(r_sha),
+                rules_size: Some(r_size),
+            }
+        }
     })
 }
 
@@ -1114,18 +1152,15 @@ async fn try_assign_work(
 /// Send AbortChunk to every connected worker that has running chunks on the
 /// given task.
 async fn abort_task_chunks(state: &Arc<AppState>, task_id: Uuid) -> anyhow::Result<()> {
-    let chunks = db::get_chunks_for_task(&state.db, task_id).await?;
+    // Only dispatched/running chunks can be aborted — query just those instead
+    // of fetching every chunk row for the task and filtering in memory.
+    let active = db::get_active_chunks_for_task(&state.db, task_id).await?;
     let conns = state.worker_connections.read().await;
 
-    for chunk in chunks {
-        if chunk.status == ChunkStatus::Running || chunk.status == ChunkStatus::Dispatched {
-            if let Some(ref assigned) = chunk.assigned_worker {
-                if let Some(conn) = conns.get(assigned) {
-                    let _ = conn
-                        .tx
-                        .send(CoordMessage::AbortChunk { chunk_id: chunk.id })
-                        .await;
-                }
+    for (chunk_id, assigned) in active {
+        if let Some(ref worker) = assigned {
+            if let Some(conn) = conns.get(worker) {
+                let _ = conn.tx.send(CoordMessage::AbortChunk { chunk_id }).await;
             }
         }
     }
@@ -1135,17 +1170,10 @@ async fn abort_task_chunks(state: &Arc<AppState>, task_id: Uuid) -> anyhow::Resu
 /// Check whether all chunks for a task are terminal (Completed, Exhausted, or
 /// Failed). If so, mark the task as Completed and emit an event.
 async fn check_task_completion(state: &Arc<AppState>, task_id: Uuid) -> anyhow::Result<()> {
-    let chunks = db::get_chunks_for_task(&state.db, task_id).await?;
-    let all_done = !chunks.is_empty()
-        && chunks.iter().all(|c| {
-            matches!(
-                c.status,
-                ChunkStatus::Completed
-                    | ChunkStatus::Exhausted
-                    | ChunkStatus::Failed
-                    | ChunkStatus::Abandoned
-            )
-        });
+    // Count instead of fetching every chunk row: a task is done once it has at
+    // least one chunk and none are still unfinished.
+    let (total, unfinished) = db::chunk_completion_counts(&state.db, task_id).await?;
+    let all_done = total > 0 && unfinished == 0;
 
     if all_done {
         db::update_task_status(&state.db, task_id, TaskStatus::Completed).await?;
