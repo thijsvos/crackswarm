@@ -116,12 +116,21 @@ pub async fn maybe_mark_orphan_for_gc(pool: &SqlitePool, sha: &str) -> Result<()
     Ok(())
 }
 
-/// Drain the GC queue: returns every (sha256, attempts) currently enqueued.
-pub async fn list_gc_queue(pool: &SqlitePool) -> Result<Vec<(String, i64)>> {
-    let rows = sqlx::query("SELECT file_sha256, attempts FROM gc_queue ORDER BY queued_at ASC")
-        .fetch_all(pool)
-        .await
-        .context("listing gc_queue")?;
+/// Up to `limit` oldest GC-queue entries as `(sha256, attempts)`.
+///
+/// Bounded so a GC pass over a queue swollen by a bulk delete can't load tens
+/// of thousands of rows into memory and monopolize the GC interval — the next
+/// pass picks up where this one left off.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_gc_queue(pool: &SqlitePool, limit: i64) -> Result<Vec<(String, i64)>> {
+    let rows =
+        sqlx::query("SELECT file_sha256, attempts FROM gc_queue ORDER BY queued_at ASC LIMIT ?1")
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .context("listing gc_queue")?;
     rows.iter()
         .map(|r| {
             Ok((
@@ -145,7 +154,7 @@ pub async fn remove_from_gc_queue(pool: &SqlitePool, sha256: &str) -> Result<()>
 
 /// Increment the attempt counter for a stuck GC entry (called when a pass
 /// couldn't finish — e.g. file still open elsewhere). Currently
-/// vestigial: soft-delete via `set_file_gc_state_deleted` always
+/// vestigial: soft-delete via `set_files_gc_state_deleted` always
 /// succeeds, so the GC pass no longer needs to retry. Kept as a
 /// primitive for future transient-failure modes (disk I/O hiccups
 /// during the on-disk file delete, SQLite contention, etc.).
@@ -170,18 +179,34 @@ pub async fn set_gc_state_deleting(pool: &SqlitePool, sha256: &str) -> Result<()
     Ok(())
 }
 
-/// Soft-delete a file row: the disk file has been reclaimed but the row
-/// stays as a tombstone because FK constraints from completed
-/// `tasks.hash_file_id` / `campaigns.*` block hard deletion. The row is
-/// filtered out of `find_file_by_sha256` and `get_file_record` so dedup
-/// never returns a row whose content is gone, while historical joins
-/// (audit log, finished tasks listing past hash files) still resolve.
-pub async fn set_file_gc_state_deleted(pool: &SqlitePool, file_id: &str) -> Result<()> {
-    sqlx::query("UPDATE files SET gc_state = 'deleted' WHERE id = ?1")
-        .bind(file_id)
-        .execute(pool)
-        .await
-        .context("transitioning file to deleted")?;
+/// Soft-delete several file rows in one statement: their disk files have been
+/// reclaimed but the rows stay as tombstones because FK constraints from
+/// completed `tasks.hash_file_id` / `campaigns.*` block hard deletion. A
+/// tombstoned row is filtered out of `find_file_by_sha256` and
+/// `get_file_record` so dedup never returns a row whose content is gone, while
+/// historical joins (audit log, finished tasks listing past hash files) still
+/// resolve. Batched (vs one UPDATE per file) for the GC loop.
+///
+/// # Errors
+/// Returns an error if a batched update fails.
+pub async fn set_files_gc_state_deleted(pool: &SqlitePool, file_ids: &[String]) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    const BATCH: usize = 400;
+    for batch in file_ids.chunks(BATCH) {
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("UPDATE files SET gc_state = 'deleted' WHERE id IN ({placeholders})");
+        let mut q = sqlx::query(&sql);
+        for id in batch {
+            q = q.bind(id);
+        }
+        q.execute(pool)
+            .await
+            .context("transitioning files to deleted")?;
+    }
     Ok(())
 }
 

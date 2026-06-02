@@ -102,23 +102,46 @@ pub async fn sync_worker_cache_manifest(
             .context("dropping temp keep table")?;
     }
 
-    // Upsert each entry in the new manifest.
+    // Upsert the new manifest in batched multi-row INSERTs rather than one
+    // round-trip per entry. A worker with thousands of cached files used to
+    // issue thousands of statements per heartbeat (every ~15s), stalling the
+    // dispatcher/monitor loops; this collapses that to a handful of batches.
+    //
+    // De-duplicate by sha first (last-wins): a multi-row UPSERT may not target
+    // the same row twice in one statement, and a manifest could (maliciously or
+    // otherwise) repeat a sha. The per-entry loop tolerated repeats implicitly.
+    let mut latest: std::collections::HashMap<&str, &crack_common::protocol::CacheManifestEntry> =
+        std::collections::HashMap::with_capacity(manifest.len());
     for entry in manifest {
-        sqlx::query(
+        latest.insert(entry.sha256.as_str(), entry);
+    }
+    let deduped: Vec<&crack_common::protocol::CacheManifestEntry> = latest.into_values().collect();
+
+    // Each row binds 4 params; keep batches well under SQLite's 999 ceiling.
+    const UPSERT_BATCH: usize = 200;
+    for batch in deduped.chunks(UPSERT_BATCH) {
+        let placeholders = std::iter::repeat_n("(?, ?, ?, ?)", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
             "INSERT INTO worker_cache_entries \
              (worker_id, file_sha256, size_bytes, last_used_at) \
-             VALUES (?1, ?2, ?3, ?4) \
+             VALUES {placeholders} \
              ON CONFLICT(worker_id, file_sha256) DO UPDATE SET \
              size_bytes = excluded.size_bytes, \
-             last_used_at = excluded.last_used_at",
-        )
-        .bind(worker_id)
-        .bind(&entry.sha256)
-        .bind(entry.size_bytes as i64)
-        .bind(&entry.last_used_at)
-        .execute(&mut *tx)
-        .await
-        .context("upserting worker cache entry")?;
+             last_used_at = excluded.last_used_at"
+        );
+        let mut q = sqlx::query(&sql);
+        for entry in batch {
+            q = q
+                .bind(worker_id)
+                .bind(&entry.sha256)
+                .bind(entry.size_bytes as i64)
+                .bind(&entry.last_used_at);
+        }
+        q.execute(&mut *tx)
+            .await
+            .context("upserting worker cache entries")?;
     }
 
     tx.commit().await.context("commit sync tx")?;
@@ -137,19 +160,37 @@ pub async fn workers_with_file(pool: &SqlitePool, sha256: &str) -> Result<Vec<St
     Ok(rows)
 }
 
-/// Remove a single worker/sha pair. Called by the `CacheAck` handler to
-/// flush stale rows the agent has told us it no longer has; also handy
-/// for explicit cache-drop operator actions.
-pub async fn remove_worker_cache_entry(
+/// Remove worker/sha pairs in one statement (batched), instead of a round-trip
+/// per sha. Called by the `CacheAck` handler to flush the rows an agent has told
+/// us it no longer holds; a one-element slice covers single-entry drops.
+///
+/// # Errors
+/// Returns an error if a batched delete fails.
+pub async fn remove_worker_cache_entries(
     pool: &SqlitePool,
     worker_id: &str,
-    sha256: &str,
+    shas: &[String],
 ) -> Result<()> {
-    sqlx::query("DELETE FROM worker_cache_entries WHERE worker_id = ?1 AND file_sha256 = ?2")
-        .bind(worker_id)
-        .bind(sha256)
-        .execute(pool)
-        .await
-        .context("deleting worker cache entry")?;
+    if shas.is_empty() {
+        return Ok(());
+    }
+    // Each row binds one sha (+1 for worker_id); stay under SQLite's param cap.
+    const BATCH: usize = 400;
+    for batch in shas.chunks(BATCH) {
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM worker_cache_entries \
+             WHERE worker_id = ? AND file_sha256 IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(worker_id);
+        for sha in batch {
+            q = q.bind(sha);
+        }
+        q.execute(pool)
+            .await
+            .context("removing worker cache entries")?;
+    }
     Ok(())
 }

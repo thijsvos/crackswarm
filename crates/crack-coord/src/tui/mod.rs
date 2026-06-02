@@ -1,3 +1,6 @@
+//! Coordinator ratatui dashboard: terminal setup, the event/render loop, and
+//! the per-tab views (tasks, workers, results, campaigns, audit, help).
+
 pub mod app;
 pub mod event;
 pub mod keys;

@@ -136,6 +136,20 @@ async fn cmd_enroll(
         }
     };
 
+    // Validate host:port shape up front so a malformed token/flag fails with a
+    // clear message rather than an opaque connect error later. (The coordinator
+    // is still authenticated separately via coord_pubkey below.)
+    {
+        let (host, port) = server
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("server address must be host:port, got {server:?}"))?;
+        if host.is_empty() {
+            anyhow::bail!("server address is missing a host: {server:?}");
+        }
+        port.parse::<u16>()
+            .with_context(|| format!("server address has an invalid port: {server:?}"))?;
+    }
+
     info!(worker_name = %token.worker_name, server = %server, "enrolling with coordinator");
 
     // 3. Save coordinator public key

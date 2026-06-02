@@ -8,8 +8,9 @@ pub mod modes {
     pub const NTLM: u32 = 1000;
     pub const NET_NTLMV1: u32 = 5500;
     pub const NET_NTLMV2: u32 = 5600;
-    pub const WPA_PMKID: u32 = 22000;
-    pub const WPA_EAPOL: u32 = 22000;
+    /// WPA/WPA2 PMKID + EAPOL — hashcat's single combined mode 22000 covers
+    /// both capture types (there is no separate EAPOL-only mode number).
+    pub const WPA_PMKID_EAPOL: u32 = 22000;
     pub const BCRYPT: u32 = 3200;
     pub const KERBEROS_TGS_REP: u32 = 13100;
     pub const KERBEROS_AS_REP: u32 = 18200;
@@ -53,6 +54,8 @@ pub struct GuessInfo {
     pub guess_mode: Option<u32>,
 }
 
+/// Per-device status parsed from hashcat's `--status-json` output: speed,
+/// temperature, and utilization for a single compute device.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DeviceStatus {
     pub device_id: Option<u32>,

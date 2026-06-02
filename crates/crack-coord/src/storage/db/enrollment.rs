@@ -44,14 +44,29 @@ pub async fn validate_enrollment_nonce(pool: &SqlitePool, nonce: &str) -> Result
     Ok(row.map(|r| r.get("worker_name")))
 }
 
-pub async fn mark_nonce_used(pool: &SqlitePool, nonce: &str, pubkey: &str) -> Result<()> {
+/// Atomically consume a one-shot enrollment nonce.
+///
+/// The `WHERE ... AND used_at IS NULL` clause makes the check-and-mark a single
+/// atomic statement, closing the TOCTOU window where two concurrent handshakes
+/// could both validate (and enroll under different pubkeys) from one token.
+///
+/// Returns `Ok(true)` only if this call transitioned the nonce from unused to
+/// used (i.e. it won the race). `Ok(false)` means the nonce was already
+/// consumed — the caller MUST reject the worker.
+///
+/// # Errors
+/// Returns an error if the database update fails.
+pub async fn mark_nonce_used(pool: &SqlitePool, nonce: &str, pubkey: &str) -> Result<bool> {
     let now = now_iso();
-    sqlx::query("UPDATE enrollment_tokens SET used_at = ?1, used_by_pubkey = ?2 WHERE nonce = ?3")
-        .bind(&now)
-        .bind(pubkey)
-        .bind(nonce)
-        .execute(pool)
-        .await
-        .context("marking enrollment nonce as used")?;
-    Ok(())
+    let result = sqlx::query(
+        "UPDATE enrollment_tokens SET used_at = ?1, used_by_pubkey = ?2
+         WHERE nonce = ?3 AND used_at IS NULL",
+    )
+    .bind(&now)
+    .bind(pubkey)
+    .bind(nonce)
+    .execute(pool)
+    .await
+    .context("marking enrollment nonce as used")?;
+    Ok(result.rows_affected() > 0)
 }

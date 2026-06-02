@@ -1,3 +1,7 @@
+//! Agent-side terminal dashboard: renders connection status, current-chunk
+//! progress, recent cracks, and lifetime stats. Driven by [`AgentEvent`]s the
+//! connection/runner loop sends over a channel.
+
 use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
@@ -37,6 +41,7 @@ const TEAL: Color = Color::Rgb(148, 226, 213);
 
 // ── Events from the connection loop ──
 
+/// An event from the agent's connection/runner loop, rendered by the TUI.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Connected {
@@ -71,6 +76,7 @@ pub enum AgentEvent {
 
 // ── Connection status ──
 
+/// Connection state shown in the dashboard header.
 #[derive(Debug, Clone)]
 pub enum ConnectionStatus {
     Connecting,
@@ -114,6 +120,7 @@ struct ChunkWork {
 
 // ── TUI state ──
 
+/// Mutable dashboard state, updated from [`AgentEvent`]s each tick.
 pub struct AgentTuiState {
     worker_name: String,
     server_addr: String,
@@ -199,8 +206,8 @@ impl AgentTuiState {
                     chunk.cracked_this_chunk += 1;
                 }
                 self.total_cracked += 1;
-                let hash_short = if hash.len() > 12 {
-                    format!("{}...", &hash[..12])
+                let hash_short = if hash.chars().count() > 12 {
+                    format!("{}...", hash.chars().take(12).collect::<String>())
                 } else {
                     hash
                 };
@@ -245,6 +252,11 @@ fn spawn_event_reader(tick_rate: Duration) -> mpsc::UnboundedReceiver<TermEvent>
 
 // ── Public entry point ──
 
+/// Run the agent dashboard: enter the alternate screen, render until the user
+/// quits, then restore the terminal. Consumes [`AgentEvent`]s from `event_rx`.
+///
+/// # Errors
+/// Returns an error if entering/leaving raw mode or drawing to the terminal fails.
 pub async fn run_tui(
     worker_name: &str,
     server_addr: &str,

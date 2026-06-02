@@ -301,7 +301,16 @@ impl ContentCache {
                     file.write_all(&data)
                         .await
                         .with_context(|| format!("writing to {}", partial_path.display()))?;
-                    offset += data.len() as u64;
+                    offset = offset.saturating_add(data.len() as u64);
+                    // Bound the write to the declared size: a buggy or
+                    // compromised coordinator streaming more than `size` bytes
+                    // would otherwise fill the agent's disk before the final
+                    // size check below ever fires.
+                    if offset > size {
+                        anyhow::bail!(
+                            "coord sent more than the expected {size} bytes (got {offset})"
+                        );
+                    }
                     if eof {
                         break;
                     }
@@ -459,15 +468,14 @@ impl ContentCache {
     /// "is older than" — the agent's main loop walks this list, skipping
     /// any sha currently in use, evicting until enough room is free.
     pub async fn lru_candidates(&self) -> Vec<LruCandidate> {
-        let ledger = self.ledger.lock().await;
-        let ledger_snapshot: HashMap<String, String> = ledger.entries.clone();
-        drop(ledger);
-
         let cas_root = self.root.join("cas");
-        let mut out = Vec::new();
+
+        // Walk the cas/ tree first WITHOUT holding the ledger lock, collecting
+        // the raw (sha, size, file-mtime) for every canonical entry.
+        let mut raw: Vec<(String, u64, Option<DateTime<Utc>>)> = Vec::new();
         let mut shards = match tokio::fs::read_dir(&cas_root).await {
             Ok(d) => d,
-            Err(_) => return out,
+            Err(_) => return Vec::new(),
         };
         while let Ok(Some(shard)) = shards.next_entry().await {
             let p = shard.path();
@@ -494,29 +502,38 @@ impl ContentCache {
                 if !meta.is_file() {
                     continue;
                 }
-                let last_used_at = ledger_snapshot
-                    .get(name_str)
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|d| d.with_timezone(&Utc))
-                    .or_else(|| {
-                        meta.modified()
-                            .ok()
-                            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                            .and_then(|d| {
-                                DateTime::<Utc>::from_timestamp(
-                                    d.as_secs() as i64,
-                                    d.subsec_nanos(),
-                                )
-                            })
-                    })
-                    .unwrap_or_else(Utc::now);
-                out.push(LruCandidate {
-                    sha256: name_str.to_string(),
-                    size_bytes: meta.len(),
-                    last_used_at,
-                });
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| {
+                        DateTime::<Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                    });
+                raw.push((name_str.to_string(), meta.len(), mtime));
             }
         }
+
+        // Annotate last_used_at from the ledger under a single short lock — no
+        // full-map clone, just point lookups (no .await while the lock is held).
+        let mut out: Vec<LruCandidate> = {
+            let ledger = self.ledger.lock().await;
+            raw.into_iter()
+                .map(|(sha256, size_bytes, mtime)| {
+                    let last_used_at = ledger
+                        .entries
+                        .get(&sha256)
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|d| d.with_timezone(&Utc))
+                        .or(mtime)
+                        .unwrap_or_else(Utc::now);
+                    LruCandidate {
+                        sha256,
+                        size_bytes,
+                        last_used_at,
+                    }
+                })
+                .collect()
+        };
         out.sort_by_key(|c| c.last_used_at);
         out
     }

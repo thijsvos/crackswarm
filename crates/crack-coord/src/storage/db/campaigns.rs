@@ -126,21 +126,6 @@ pub async fn delete_campaign(pool: &SqlitePool, id: Uuid) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_campaigns_by_status(
-    pool: &SqlitePool,
-    status: CampaignStatus,
-) -> Result<Vec<Campaign>> {
-    let rows = sqlx::query(
-        "SELECT * FROM campaigns WHERE status = ?1 ORDER BY priority DESC, created_at ASC",
-    )
-    .bind(status.to_string())
-    .fetch_all(pool)
-    .await
-    .context("fetching campaigns by status")?;
-
-    rows.iter().map(row_to_campaign).collect()
-}
-
 pub async fn advance_campaign_phase(
     pool: &SqlitePool,
     campaign_id: Uuid,
@@ -159,23 +144,73 @@ pub async fn advance_campaign_phase(
 /// JOIN. Called after any task in the campaign reports a new cracked
 /// hash so the TUI / API see the current total.
 pub async fn sync_campaign_cracked_count(pool: &SqlitePool, campaign_id: Uuid) -> Result<u32> {
-    let row = sqlx::query(
-        "SELECT COUNT(*) as cnt FROM cracked_hashes ch
-         JOIN tasks t ON t.id = ch.task_id
-         WHERE t.campaign_id = ?1",
+    // Recompute and persist in a single atomic UPDATE (was a SELECT then a
+    // separate UPDATE — the count could go stale between the two). Aggregate
+    // results are i64 in SQLite, so read the written value back as i64.
+    sqlx::query(
+        "UPDATE campaigns
+         SET cracked_count = (
+             SELECT COUNT(*) FROM cracked_hashes ch
+             JOIN tasks t ON t.id = ch.task_id
+             WHERE t.campaign_id = ?1
+         )
+         WHERE id = ?1",
     )
     .bind(campaign_id.to_string())
-    .fetch_one(pool)
+    .execute(pool)
     .await
     .context("syncing campaign cracked count")?;
 
-    let count = row.get::<i32, _>("cnt") as u32;
-    sqlx::query("UPDATE campaigns SET cracked_count = ?1 WHERE id = ?2")
-        .bind(count as i32)
+    let row = sqlx::query("SELECT cracked_count FROM campaigns WHERE id = ?1")
         .bind(campaign_id.to_string())
-        .execute(pool)
+        .fetch_one(pool)
         .await
-        .context("updating campaign cracked_count")?;
+        .context("reading campaign cracked_count")?;
+    Ok(row.get::<i64, _>("cracked_count") as u32)
+}
 
-    Ok(count)
+/// Recompute `cracked_count` for every running campaign in a single UPDATE,
+/// instead of one query per campaign on each monitor tick.
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn sync_all_running_campaign_cracked_counts(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "UPDATE campaigns
+         SET cracked_count = (
+             SELECT COUNT(*) FROM cracked_hashes ch
+             JOIN tasks t ON t.id = ch.task_id
+             WHERE t.campaign_id = campaigns.id
+         )
+         WHERE status = 'running'",
+    )
+    .execute(pool)
+    .await
+    .context("syncing running campaign cracked counts")?;
+    Ok(())
+}
+
+/// Task IDs of every running campaign whose active phase is `running` and whose
+/// task has reached a terminal state — i.e. the campaigns that need advancing.
+/// Replaces a per-campaign active-phase + task lookup with one JOIN.
+///
+/// # Errors
+/// Returns an error if the query fails or a stored id can't be parsed.
+pub async fn running_campaigns_terminal_tasks(pool: &SqlitePool) -> Result<Vec<Uuid>> {
+    let rows = sqlx::query(
+        "SELECT t.id AS task_id
+         FROM campaigns c
+         JOIN campaign_phases cp
+           ON cp.campaign_id = c.id AND cp.phase_index = c.active_phase_index
+         JOIN tasks t ON t.id = cp.task_id
+         WHERE c.status = 'running'
+           AND cp.status = 'running'
+           AND t.status IN ('completed', 'failed', 'cancelled')",
+    )
+    .fetch_all(pool)
+    .await
+    .context("finding running campaigns with terminal tasks")?;
+    rows.iter()
+        .map(|r| Ok(Uuid::parse_str(r.get::<&str, _>("task_id"))?))
+        .collect()
 }

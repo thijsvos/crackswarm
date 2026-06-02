@@ -106,8 +106,10 @@ pub async fn assign_next_chunk(
                     attempt,
                     "assigned chunk to worker"
                 );
-                let mut task = task;
-                task.next_skip = task.next_skip.saturating_add(limit);
+                // The authoritative cursor advance happens atomically inside
+                // try_dispatch_new_chunk; the returned task is only used to
+                // build the assign message (which reads chunk.skip/limit), so
+                // no in-memory next_skip mutation is needed here.
                 return Ok(Some((task, chunk)));
             }
             DispatchOutcome::CursorMoved => {
@@ -133,6 +135,9 @@ pub async fn assign_next_chunk(
 ///
 /// The original chunk's progress is used to compute how much work has already been done.
 /// A new `Pending` chunk is created covering only the unfinished portion.
+///
+/// # Errors
+/// Returns an error if creating the replacement chunk in the database fails.
 #[allow(dead_code)]
 pub async fn reassign_chunk(state: &AppState, chunk: &Chunk) -> anyhow::Result<Chunk> {
     // Calculate how much of the chunk was already completed based on progress percentage.

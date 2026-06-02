@@ -1,3 +1,5 @@
+//! Tasks tab: renders the task table and the selected task's chunk detail.
+
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
@@ -14,6 +16,8 @@ use crack_common::models::{AttackConfig, ChunkStatus};
 
 /// Render the task list in the left panel.
 pub fn render_task_list(f: &mut Frame, area: Rect, state: &TuiState) {
+    // Resolve the selected task id once instead of re-looking it up per row.
+    let selected_id = state.tasks.get(state.task_list_index).map(|t| t.id);
     let items: Vec<ListItem> = state
         .tasks
         .iter()
@@ -29,7 +33,7 @@ pub fn render_task_list(f: &mut Frame, area: Rect, state: &TuiState) {
                 Span::styled(
                     format!(
                         " {} ",
-                        if state.tasks.get(state.task_list_index).map(|t| t.id) == Some(task.id) {
+                        if selected_id == Some(task.id) {
                             "▶"
                         } else {
                             " "

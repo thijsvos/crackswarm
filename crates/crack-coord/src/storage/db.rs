@@ -635,47 +635,28 @@ pub use worker_cache::*;
 // ════════════════════════════════════════════════════════════════════════════
 
 pub async fn get_system_status(pool: &SqlitePool) -> Result<SystemStatus> {
-    let tasks_row = sqlx::query(
+    // One round-trip via scalar subqueries instead of four separate queries
+    // (this runs on every TUI/status refresh). SQLite aggregates are i64.
+    let row = sqlx::query(
         "SELECT
-           COUNT(*) as total_tasks,
-           COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) as running_tasks
-         FROM tasks",
+           (SELECT COUNT(*) FROM tasks) AS total_tasks,
+           (SELECT COUNT(*) FROM tasks WHERE status = 'running') AS running_tasks,
+           (SELECT COUNT(*) FROM workers) AS total_workers,
+           (SELECT COUNT(*) FROM workers WHERE status != 'disconnected') AS connected_workers,
+           (SELECT COUNT(*) FROM cracked_hashes) AS total_cracked,
+           (SELECT COALESCE(SUM(speed), 0) FROM chunks WHERE status = 'running') AS aggregate_speed",
     )
     .fetch_one(pool)
     .await
-    .context("fetching task counts")?;
-
-    let workers_row = sqlx::query(
-        "SELECT
-           COUNT(*) as total_workers,
-           COALESCE(SUM(CASE WHEN status != 'disconnected' THEN 1 ELSE 0 END), 0) as connected_workers
-         FROM workers"
-    )
-    .fetch_one(pool)
-    .await
-    .context("fetching worker counts")?;
-
-    let cracked_row = sqlx::query("SELECT COUNT(*) as cnt FROM cracked_hashes")
-        .fetch_one(pool)
-        .await
-        .context("fetching cracked count")?;
-
-    let speed_row = sqlx::query(
-        "SELECT COALESCE(SUM(speed), 0) as aggregate_speed
-         FROM chunks
-         WHERE status = 'running'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("fetching aggregate speed")?;
+    .context("fetching system status")?;
 
     Ok(SystemStatus {
-        total_tasks: tasks_row.get::<i32, _>("total_tasks") as u32,
-        running_tasks: tasks_row.get::<i32, _>("running_tasks") as u32,
-        total_workers: workers_row.get::<i32, _>("total_workers") as u32,
-        connected_workers: workers_row.get::<i32, _>("connected_workers") as u32,
-        total_cracked: cracked_row.get::<i64, _>("cnt") as u64,
-        aggregate_speed: speed_row.get::<i64, _>("aggregate_speed") as u64,
+        total_tasks: row.get::<i64, _>("total_tasks") as u32,
+        running_tasks: row.get::<i64, _>("running_tasks") as u32,
+        total_workers: row.get::<i64, _>("total_workers") as u32,
+        connected_workers: row.get::<i64, _>("connected_workers") as u32,
+        total_cracked: row.get::<i64, _>("total_cracked") as u64,
+        aggregate_speed: row.get::<i64, _>("aggregate_speed") as u64,
     })
 }
 
@@ -693,9 +674,15 @@ pub(super) fn row_to_campaign(row: &sqlx::sqlite::SqliteRow) -> Result<Campaign>
         hash_mode: row.get::<u32, _>("hash_mode"),
         original_hash_file_id: row.get("original_hash_file_id"),
         status: CampaignStatus::from_str(&status_str).map_err(|e| anyhow::anyhow!(e))?,
-        active_phase_index: row
-            .get::<Option<i32>, _>("active_phase_index")
-            .map(|v| v as u32),
+        active_phase_index: match row.get::<Option<i32>, _>("active_phase_index") {
+            Some(v) if v < 0 => {
+                return Err(anyhow::anyhow!(
+                    "active_phase_index must be non-negative, got {v}"
+                ))
+            }
+            Some(v) => Some(v as u32),
+            None => None,
+        },
         total_phases: row.get::<i32, _>("total_phases") as u32,
         total_hashes: row.get::<i32, _>("total_hashes") as u32,
         cracked_count: row.get::<i32, _>("cracked_count") as u32,
@@ -919,7 +906,9 @@ mod tests {
         let pool = mem_pool().await;
         let rec = sample_file_record("tomb-1", "tombsha", Utc::now());
         insert_file_record(&pool, &rec).await.unwrap();
-        set_file_gc_state_deleted(&pool, "tomb-1").await.unwrap();
+        set_files_gc_state_deleted(&pool, &["tomb-1".to_string()])
+            .await
+            .unwrap();
 
         let found = find_file_by_sha256(&pool, "tombsha").await.unwrap();
         assert!(
@@ -933,7 +922,9 @@ mod tests {
         let pool = mem_pool().await;
         let rec = sample_file_record("tomb-2", "tombsha2", Utc::now());
         insert_file_record(&pool, &rec).await.unwrap();
-        set_file_gc_state_deleted(&pool, "tomb-2").await.unwrap();
+        set_files_gc_state_deleted(&pool, &["tomb-2".to_string()])
+            .await
+            .unwrap();
 
         let found = get_file_record(&pool, "tomb-2").await.unwrap();
         assert!(
@@ -947,8 +938,12 @@ mod tests {
         let pool = mem_pool().await;
         let rec = sample_file_record("tomb-3", "tombsha3", Utc::now());
         insert_file_record(&pool, &rec).await.unwrap();
-        set_file_gc_state_deleted(&pool, "tomb-3").await.unwrap();
-        set_file_gc_state_deleted(&pool, "tomb-3").await.unwrap();
+        set_files_gc_state_deleted(&pool, &["tomb-3".to_string()])
+            .await
+            .unwrap();
+        set_files_gc_state_deleted(&pool, &["tomb-3".to_string()])
+            .await
+            .unwrap();
         // Second call must not error and the row stays tombstoned.
         let found = get_file_record(&pool, "tomb-3").await.unwrap();
         assert!(found.is_none());
@@ -1029,7 +1024,7 @@ mod tests {
 
         // Ref released, file queued for GC.
         assert_eq!(count_refs_for_sha(&pool, "sha-orphan").await.unwrap(), 0);
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].0, "sha-orphan");
     }
@@ -1051,7 +1046,7 @@ mod tests {
 
         // One still active, so the file must not be queued for GC.
         assert_eq!(count_refs_for_sha(&pool, "sha-shared").await.unwrap(), 1);
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert!(
             queue.is_empty(),
             "expected empty GC queue while other task still references the file"
@@ -1074,7 +1069,7 @@ mod tests {
             .unwrap();
 
         assert!(is_sha_pinned(&pool, "sha-pinned").await.unwrap());
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert!(queue.is_empty(), "pinned file should not enter GC queue");
     }
 
@@ -1094,7 +1089,7 @@ mod tests {
             .await
             .unwrap();
 
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert_eq!(queue.len(), 2);
     }
 
@@ -1104,7 +1099,7 @@ mod tests {
         seed_file(&pool, "hash-008", "sha-idem").await;
         mark_for_gc(&pool, "sha-idem").await.unwrap();
         mark_for_gc(&pool, "sha-idem").await.unwrap();
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert_eq!(queue.len(), 1, "duplicate mark should not duplicate queue");
     }
 
@@ -1278,12 +1273,12 @@ mod tests {
         // Pre-unpin baseline: no refs, pinned, queue empty.
         assert_eq!(count_refs_for_sha(&pool, "sha-44a").await.unwrap(), 0);
         assert!(is_sha_pinned(&pool, "sha-44a").await.unwrap());
-        assert!(list_gc_queue(&pool).await.unwrap().is_empty());
+        assert!(list_gc_queue(&pool, 10_000).await.unwrap().is_empty());
 
         // Unpin — must re-evaluate and queue the now-orphan file.
         assert!(set_file_pinned(&pool, "hash-44a", false).await.unwrap());
 
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert_eq!(queue.len(), 1, "unpin must requeue an orphan file");
         assert_eq!(queue[0].0, "sha-44a");
     }
@@ -1301,7 +1296,7 @@ mod tests {
         assert!(set_file_pinned(&pool, "hash-44b", false).await.unwrap());
 
         assert!(
-            list_gc_queue(&pool).await.unwrap().is_empty(),
+            list_gc_queue(&pool, 10_000).await.unwrap().is_empty(),
             "file with live refs must not be queued for GC even after unpin"
         );
     }
@@ -1317,7 +1312,7 @@ mod tests {
 
         assert!(set_file_pinned(&pool, "hash-44c", false).await.unwrap());
 
-        let queue = list_gc_queue(&pool).await.unwrap();
+        let queue = list_gc_queue(&pool, 10_000).await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].0, "sha-44c");
     }
@@ -1327,7 +1322,7 @@ mod tests {
         // Missing file id must not panic, must not queue anything.
         let pool = mem_pool().await;
         assert!(!set_file_pinned(&pool, "no-such-id", false).await.unwrap());
-        assert!(list_gc_queue(&pool).await.unwrap().is_empty());
+        assert!(list_gc_queue(&pool, 10_000).await.unwrap().is_empty());
     }
 
     async fn seed_worker(pool: &SqlitePool, id: &str, name: &str) {
@@ -1412,7 +1407,7 @@ mod tests {
             .await
             .unwrap();
 
-        remove_worker_cache_entry(&pool, "w-a", "shared")
+        remove_worker_cache_entries(&pool, "w-a", &["shared".to_string()])
             .await
             .unwrap();
 
@@ -1680,5 +1675,142 @@ mod tests {
         ] {
             assert!(names.contains(required), "missing index: {required}");
         }
+    }
+
+    #[tokio::test]
+    async fn enrollment_nonce_is_single_use() {
+        // A one-shot enrollment token must consume atomically: the first
+        // mark_nonce_used wins, a second (a racing/duplicate enrollment under a
+        // different pubkey) loses, and the nonce no longer validates.
+        let pool = mem_pool().await;
+        // enrollment_tokens lives in init_db's migrations, not INIT_SQL.
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS enrollment_tokens (
+                nonce TEXT PRIMARY KEY,
+                worker_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                used_by_pubkey TEXT
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        create_enrollment_token(&pool, "nonce-123", "alice", "2999-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_enrollment_nonce(&pool, "nonce-123").await.unwrap(),
+            Some("alice".to_string())
+        );
+
+        assert!(
+            mark_nonce_used(&pool, "nonce-123", "pubkey-A")
+                .await
+                .unwrap(),
+            "first consume should win"
+        );
+        assert!(
+            !mark_nonce_used(&pool, "nonce-123", "pubkey-B")
+                .await
+                .unwrap(),
+            "second consume must lose (single-use)"
+        );
+        assert_eq!(
+            validate_enrollment_nonce(&pool, "nonce-123").await.unwrap(),
+            None,
+            "consumed nonce must no longer validate"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_cracked_hash_rejects_oversized_plaintext() {
+        // A malicious worker reporting a huge "plaintext" is rejected before it
+        // can be stored or amplify the analyzer. (The guard runs before any DB
+        // access, so no cracked_hashes/tasks rows are needed.)
+        let pool = mem_pool().await;
+        let huge = "a".repeat(1024);
+        let err = insert_cracked_hash(&pool, uuid::Uuid::new_v4(), "deadbeef", &huge, "worker-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cracked_hash_insert_dedups_per_task() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "f1", "sha1").await;
+        let task = make_task(&pool, "f1").await;
+
+        assert!(insert_cracked_hash(&pool, task.id, "AAA", "pw-a", "w1")
+            .await
+            .unwrap());
+        // Same (task_id, hash) is ignored (INSERT OR IGNORE).
+        assert!(!insert_cracked_hash(&pool, task.id, "AAA", "pw-a", "w1")
+            .await
+            .unwrap());
+        assert!(insert_cracked_hash(&pool, task.id, "BBB", "pw-b", "w1")
+            .await
+            .unwrap());
+
+        let rows = get_cracked_for_task(&pool, task.id).await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_worker_status_refreshes_last_seen() {
+        let pool = mem_pool().await;
+        let w = authorize_worker(&pool, "pk-1", "alice").await.unwrap();
+        // Force a stale heartbeat, then a status-only update must refresh it.
+        sqlx::query("UPDATE workers SET last_seen_at = '2000-01-01T00:00:00+00:00' WHERE id = ?1")
+            .bind(&w.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        update_worker_status(&pool, &w.id, WorkerStatus::Working)
+            .await
+            .unwrap();
+        let seen: String = sqlx::query_scalar("SELECT last_seen_at FROM workers WHERE id = ?1")
+            .bind(&w.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(seen, "2000-01-01T00:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn chunk_completion_counts_and_active_chunks() {
+        let pool = mem_pool().await;
+        seed_file(&pool, "f1", "sha1").await;
+        let task = make_task(&pool, "f1").await;
+        let c1 = create_chunk(&pool, task.id, 0, 10).await.unwrap();
+        let c2 = create_chunk(&pool, task.id, 10, 10).await.unwrap();
+        let _c3 = create_chunk(&pool, task.id, 20, 10).await.unwrap(); // stays pending
+
+        update_chunk_status(&pool, c1.id, ChunkStatus::Running)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chunks SET assigned_worker = 'w-1' WHERE id = ?1")
+            .bind(c1.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        update_chunk_status(&pool, c2.id, ChunkStatus::Completed)
+            .await
+            .unwrap();
+
+        let (total, unfinished) = chunk_completion_counts(&pool, task.id).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(unfinished, 2); // c1 running + c3 pending; c2 terminal
+
+        let active = get_active_chunks_for_task(&pool, task.id).await.unwrap();
+        assert_eq!(active.len(), 1); // only the running chunk
+        assert_eq!(active[0].0, c1.id);
+        assert_eq!(active[0].1, Some("w-1".to_string()));
     }
 }

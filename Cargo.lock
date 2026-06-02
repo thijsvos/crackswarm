@@ -630,6 +630,7 @@ dependencies = [
  "crack-common",
  "crossterm",
  "dirs",
+ "futures-util",
  "hkdf 0.13.0",
  "rand 0.10.1",
  "ratatui",

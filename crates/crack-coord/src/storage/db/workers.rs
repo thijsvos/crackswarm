@@ -9,6 +9,11 @@ use sqlx::{Row, SqlitePool};
 
 use super::{now_iso, row_to_worker};
 
+/// Insert a worker, or update its mutable fields if the public key already
+/// exists. Refreshes `last_seen_at` either way.
+///
+/// # Errors
+/// Returns an error if the upsert query fails.
 #[allow(dead_code)]
 pub async fn create_or_update_worker(pool: &SqlitePool, worker: &Worker) -> Result<()> {
     let now = now_iso();
@@ -41,19 +46,6 @@ pub async fn create_or_update_worker(pool: &SqlitePool, worker: &Worker) -> Resu
     Ok(())
 }
 
-pub async fn get_worker(pool: &SqlitePool, id: &str) -> Result<Option<Worker>> {
-    let row = sqlx::query("SELECT * FROM workers WHERE id = ?1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .context("fetching worker")?;
-
-    match row {
-        Some(ref r) => Ok(Some(row_to_worker(r)?)),
-        None => Ok(None),
-    }
-}
-
 pub async fn list_workers(pool: &SqlitePool) -> Result<Vec<Worker>> {
     let rows = sqlx::query("SELECT * FROM workers ORDER BY name ASC")
         .fetch_all(pool)
@@ -65,9 +57,14 @@ pub async fn list_workers(pool: &SqlitePool) -> Result<Vec<Worker>> {
 
 pub async fn update_worker_status(pool: &SqlitePool, id: &str, status: WorkerStatus) -> Result<()> {
     let status_str = status.to_string();
+    let now = now_iso();
 
-    sqlx::query("UPDATE workers SET status = ?1 WHERE id = ?2")
+    // Refresh last_seen_at alongside status so a status-only update still counts
+    // as a heartbeat (matching create_or_update_worker / update_worker_info);
+    // otherwise heartbeat-timeout logic can misfire.
+    sqlx::query("UPDATE workers SET status = ?1, last_seen_at = ?2 WHERE id = ?3")
         .bind(&status_str)
+        .bind(&now)
         .bind(id)
         .execute(pool)
         .await
@@ -149,8 +146,12 @@ pub async fn get_or_create_worker(
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
 
+    // INSERT OR IGNORE so a concurrent enrollment of the same pubkey doesn't
+    // fail the UNIQUE(public_key) constraint and surface as an unhandled error.
+    // We then read back by pubkey — not by our locally-generated `id`, which
+    // may have been the one ignored when a racing insert won.
     sqlx::query(
-        "INSERT INTO workers (id, name, public_key, status, created_at, last_seen_at)
+        "INSERT OR IGNORE INTO workers (id, name, public_key, status, created_at, last_seen_at)
          VALUES (?1, ?2, ?3, 'idle', ?4, ?4)",
     )
     .bind(&id)
@@ -161,7 +162,7 @@ pub async fn get_or_create_worker(
     .await
     .context("creating worker")?;
 
-    get_worker(pool, &id)
+    get_worker_by_pubkey(pool, pubkey_b64)
         .await?
         .ok_or_else(|| anyhow::anyhow!("worker not found after insert"))
 }

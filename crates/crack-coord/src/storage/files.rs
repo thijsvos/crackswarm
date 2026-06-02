@@ -22,7 +22,10 @@ fn safe_disk_ext(filename: &str) -> Option<String> {
     Some(ext.to_string())
 }
 
-fn disk_name_for(file_id: &str, filename: &str) -> String {
+/// The on-disk filename for a stored file: `<file_id>.<safe_ext>`, or the bare
+/// `file_id` when the original extension isn't disk-safe. Stored in the DB's
+/// `disk_path` so files can be resolved in O(1) without a directory scan.
+pub fn disk_name_for(file_id: &str, filename: &str) -> String {
     match safe_disk_ext(filename) {
         Some(ext) => format!("{file_id}.{ext}"),
         None => file_id.to_string(),
@@ -71,6 +74,11 @@ impl FileWriter {
         })
     }
 
+    /// Append `bytes` to the partial file, updating the rolling SHA-256 and
+    /// byte count.
+    ///
+    /// # Errors
+    /// Returns an error if writing to the partial file fails.
     pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
         self.file
             .write_all(bytes)
@@ -188,8 +196,13 @@ pub async fn hard_link_from(
 
 /// Save file data to disk with a UUID-based filename.
 ///
-/// Returns `(file_id, sha256_hex)` where `file_id` is the UUID used as the on-disk filename.
-pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(String, String)> {
+/// Returns `(file_id, sha256_hex, size_bytes)`, matching the shape returned by
+/// [`FileWriter::finalize`] and [`hard_link_from`] so callers don't recompute
+/// the size separately.
+///
+/// # Errors
+/// Returns an error if the files directory can't be created or the write fails.
+pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(String, String, u64)> {
     std::fs::create_dir_all(files_dir)
         .with_context(|| format!("creating files directory: {}", files_dir.display()))?;
 
@@ -200,18 +213,9 @@ pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(Strin
     hasher.update(data);
     let sha256 = format!("{:x}", hasher.finalize());
 
-    // Preserve the original extension for convenience (e.g. .txt, .hash)
-    let ext = Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-
-    let disk_name = if ext.is_empty() {
-        file_id.clone()
-    } else {
-        format!("{file_id}.{ext}")
-    };
-
+    // Use the same disk-safe naming as the streaming/hardlink paths so the
+    // on-disk name matches what callers store in `disk_path`.
+    let disk_name = disk_name_for(&file_id, filename);
     let disk_path = files_dir.join(&disk_name);
 
     std::fs::write(&disk_path, data)
@@ -225,7 +229,7 @@ pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(Strin
         "Saved file to disk"
     );
 
-    Ok((file_id, sha256))
+    Ok((file_id, sha256, data.len() as u64))
 }
 
 /// Resolve a `file_id` to the actual path on disk.
@@ -243,23 +247,81 @@ pub fn save_file(files_dir: &Path, filename: &str, data: &[u8]) -> Result<(Strin
 /// still O(files_count) per call and a clean candidate for retirement
 /// once the upload path stores the full disk path in DB.
 pub(crate) fn locate_existing(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
+    // Defense in depth: `file_id` is used directly as a path component, so
+    // reject anything that could escape `files_dir`. Legitimate ids are UUIDs.
+    if file_id.is_empty()
+        || file_id.contains('/')
+        || file_id.contains('\\')
+        || file_id.contains("..")
+        || file_id.contains('\0')
+    {
+        anyhow::bail!("invalid file id: {file_id:?}");
+    }
+
     let exact = files_dir.join(file_id);
-    if exact.is_file() {
+    if is_regular_file(&exact) {
         return Ok(exact);
     }
 
     let prefix = format!("{file_id}.");
-    if let Ok(entries) = std::fs::read_dir(files_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
-                    return Ok(entry.path());
+    // Surface read errors instead of masking them as "not found" — a transient
+    // FS failure should not look identical to a missing file.
+    let entries = std::fs::read_dir(files_dir)
+        .with_context(|| format!("reading files directory: {}", files_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in {}", files_dir.display()))?;
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with(&prefix) {
+                let path = entry.path();
+                if is_regular_file(&path) {
+                    return Ok(path);
                 }
             }
         }
     }
 
     anyhow::bail!("file not found: {file_id} in {}", files_dir.display())
+}
+
+/// True if `name` is a single safe path component (non-empty, no separators,
+/// parent refs, or NUL) — gates a stored `disk_path` before it is joined.
+fn disk_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('\0')
+}
+
+/// Resolve a file's on-disk path, preferring the stored `disk_path` (an O(1)
+/// join) and falling back to a directory scan for legacy rows whose stored
+/// value predates the relative-name fix.
+///
+/// `disk_path` is trusted only when it is a single safe component pointing at a
+/// real regular file; legacy absolute paths (which contain separators) and
+/// stale values fall through to [`locate_existing`].
+///
+/// # Errors
+/// Returns an error if neither the stored path nor the scan locates the file.
+pub fn resolve_record_path(files_dir: &Path, file_id: &str, disk_path: &str) -> Result<PathBuf> {
+    if disk_name_is_safe(disk_path) {
+        let candidate = files_dir.join(disk_path);
+        if is_regular_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    locate_existing(files_dir, file_id)
+}
+
+/// True only if `path` is a *regular* file and not a symlink.
+///
+/// Uses `symlink_metadata` (lstat), so a symlink planted in `files_dir` by
+/// another local user cannot redirect a read to an arbitrary target such as
+/// `/etc/passwd` — `is_file()` on lstat metadata is false for symlinks.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
 }
 
 /// Read a file from disk by its file_id.
@@ -276,6 +338,18 @@ pub fn resolve_file_path(files_dir: &Path, file_id: &str) -> Result<PathBuf> {
 /// Delete a file from disk by its file_id.
 pub fn delete_file(files_dir: &Path, file_id: &str) -> Result<()> {
     let path = locate_existing(files_dir, file_id)
+        .with_context(|| format!("file not found for deletion: {file_id}"))?;
+    std::fs::remove_file(&path).with_context(|| format!("deleting file {}", path.display()))
+}
+
+/// Delete a file from disk, resolving via the stored `disk_path` (O(1)) with a
+/// directory-scan fallback for legacy rows — avoids a scan per delete in the
+/// GC loop.
+///
+/// # Errors
+/// Returns an error if the file can't be located or removed.
+pub fn delete_record(files_dir: &Path, file_id: &str, disk_path: &str) -> Result<()> {
+    let path = resolve_record_path(files_dir, file_id, disk_path)
         .with_context(|| format!("file not found for deletion: {file_id}"))?;
     std::fs::remove_file(&path).with_context(|| format!("deleting file {}", path.display()))
 }
@@ -347,6 +421,64 @@ mod tests {
     fn disk_name_collapses_unsafe_extensions() {
         assert_eq!(disk_name_for("uuid", "x.foo/bar"), "uuid");
         assert_eq!(disk_name_for("uuid", "x.txt"), "uuid.txt");
+    }
+
+    #[test]
+    fn locate_existing_finds_regular_file_with_ext() {
+        let dir = TempDir::new();
+        let id = "22222222-2222-2222-2222-222222222222";
+        std::fs::write(dir.path.join(format!("{id}.hash")), b"data").unwrap();
+        let p = locate_existing(&dir.path, id).unwrap();
+        assert!(p.ends_with(format!("{id}.hash")));
+    }
+
+    #[test]
+    fn locate_existing_rejects_path_escape_ids() {
+        let dir = TempDir::new();
+        for bad in ["../etc/passwd", "a/b", "..", "with\0null", ""] {
+            assert!(
+                locate_existing(&dir.path, bad).is_err(),
+                "must reject id {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_record_path_prefers_disk_path_then_falls_back() {
+        let dir = TempDir::new();
+        let id = "33333333-3333-3333-3333-333333333333";
+        let disk_name = format!("{id}.txt");
+        std::fs::write(dir.path.join(&disk_name), b"data").unwrap();
+
+        // Stored disk_path → O(1) resolution, no scan.
+        let p = resolve_record_path(&dir.path, id, &disk_name).unwrap();
+        assert!(p.ends_with(&disk_name));
+
+        // Legacy/empty disk_path → falls back to the directory scan.
+        let p2 = resolve_record_path(&dir.path, id, "").unwrap();
+        assert!(p2.ends_with(&disk_name));
+
+        // A path-traversal disk_path is rejected and falls back to the scan.
+        let p3 = resolve_record_path(&dir.path, id, "../../etc/passwd").unwrap();
+        assert!(p3.ends_with(&disk_name));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_existing_rejects_symlink_entries() {
+        // A symlink planted in files_dir (e.g. by another local user) must not
+        // be returned — otherwise read_file would follow it to an arbitrary
+        // target such as /etc/passwd.
+        let dir = TempDir::new();
+        let secret = dir.path.join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        std::os::unix::fs::symlink(&secret, dir.path.join(format!("{id}.txt"))).unwrap();
+
+        assert!(
+            locate_existing(&dir.path, id).is_err(),
+            "symlinked entry must not be located"
+        );
     }
 
     #[tokio::test]

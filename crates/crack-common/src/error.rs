@@ -1,5 +1,11 @@
+//! Shared structured error type for `crack-common` library code.
+//!
+//! The coordinator and agent binaries use `anyhow` at their top level; this
+//! enum is the error surface for the reusable library functions they call.
+
 use thiserror::Error;
 
+/// Errors surfaced by `crack-common` helpers (IO, serialization, protocol, …).
 #[derive(Error, Debug)]
 pub enum CrackError {
     #[error("IO error: {0}")]

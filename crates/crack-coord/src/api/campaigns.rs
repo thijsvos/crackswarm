@@ -17,6 +17,7 @@ use super::{ApiError, ApiResult};
 
 // ── Response types ──
 
+/// A campaign plus its phases — body of `GET /api/v1/campaigns/:id`.
 #[derive(Serialize)]
 pub struct CampaignDetailResponse {
     #[serde(flatten)]
@@ -26,6 +27,8 @@ pub struct CampaignDetailResponse {
 
 // ── Handlers ──
 
+/// `POST /api/v1/campaigns` — create a multi-phase campaign (inline phases or
+/// a named template) and start its first phase.
 pub async fn create_campaign(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCampaignRequest>,

@@ -16,12 +16,14 @@ use super::ApiResult;
 
 // ── Request types ──
 
+/// Body of `POST /api/v1/workers` — directly authorize a worker by public key.
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeWorkerRequest {
     pub public_key: String,
     pub name: String,
 }
 
+/// Body of `POST /api/v1/workers/enroll` — mint a one-shot enrollment token.
 #[derive(Debug, Deserialize)]
 pub struct EnrollWorkerRequest {
     pub name: String,
@@ -33,6 +35,8 @@ fn default_expires_minutes() -> u64 {
     60
 }
 
+/// Response for a worker-enroll request: the base64 token blob to hand to the
+/// agent, plus a human-readable message.
 #[derive(Debug, Serialize)]
 pub struct EnrollWorkerResponse {
     pub token: String,
@@ -65,8 +69,13 @@ pub async fn enroll_worker(
     let nonce_bytes: [u8; 16] = rand::random();
     let nonce: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
-    // Compute expires_at
-    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(req.expires_minutes as i64);
+    // Compute expires_at. Clamp the requested lifetime to a sane upper bound
+    // (100 years) before the u64 -> i64 cast: an oversized value would wrap to
+    // a negative Duration (minting an already-expired token) or overflow
+    // chrono's Duration arithmetic.
+    const MAX_EXPIRES_MINUTES: u64 = 100 * 365 * 24 * 60;
+    let expires_minutes = req.expires_minutes.min(MAX_EXPIRES_MINUTES) as i64;
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(expires_minutes);
     let expires_at_str = expires_at.to_rfc3339();
 
     // Store in DB

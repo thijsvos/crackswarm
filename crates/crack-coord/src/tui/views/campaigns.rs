@@ -1,3 +1,6 @@
+//! Campaigns tab: renders the campaign list and the selected campaign's phase
+//! breakdown.
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -183,10 +186,36 @@ pub fn render_campaign_detail(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(paragraph, area);
 }
 
+/// Truncate `s` to at most `max` characters, appending `...` when shortened.
+///
+/// Counts and slices by `char`, not bytes: byte-indexing a multi-byte UTF-8
+/// string at an arbitrary boundary panics.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let take = max.saturating_sub(3);
+        format!("{}...", s.chars().take(take).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_handles_multibyte_without_panic() {
+        // Byte-slicing used to panic when a multi-byte char straddled the cut.
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 8), "hello...");
+
+        // Multi-byte input must not panic and must stay on char boundaries.
+        let out = truncate("Пароль123", 6);
+        assert!(out.ends_with("..."));
+        assert!(out.chars().count() <= 6);
+
+        // Pure-emoji and a tiny max must also be panic-free.
+        let _ = truncate("😀😀😀😀", 4);
+        let _ = truncate("😀😀😀😀", 2);
     }
 }

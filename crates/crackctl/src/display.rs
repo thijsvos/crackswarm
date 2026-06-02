@@ -1,3 +1,6 @@
+//! Terminal output helpers for `crackctl`: human-readable sizes/speeds, id
+//! shortening, UTF-8-safe truncation, and table formatting.
+
 use chrono::{DateTime, Utc};
 use crack_common::models::*;
 

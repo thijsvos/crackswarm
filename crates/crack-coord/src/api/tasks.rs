@@ -16,6 +16,7 @@ use super::{ApiError, ApiResult};
 
 // ── Response types ──
 
+/// A task plus its chunks — body of `GET /api/v1/tasks/:id`.
 #[derive(Serialize)]
 pub struct TaskDetailResponse {
     #[serde(flatten)]
@@ -23,6 +24,7 @@ pub struct TaskDetailResponse {
     pub chunks: Vec<Chunk>,
 }
 
+/// Aggregate potfile counters — body of `GET /api/v1/potfile/stats`.
 #[derive(Serialize)]
 pub struct PotfileStats {
     pub total_cracked: u64,
@@ -32,6 +34,7 @@ pub struct PotfileStats {
 
 // ── Handlers ──
 
+/// `POST /api/v1/tasks` — create a task and prepare it (hash count + keyspace).
 pub async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskRequest>,
@@ -158,12 +161,45 @@ pub async fn potfile_stats(State(state): State<Arc<AppState>>) -> ApiResult<Json
 pub async fn potfile_plaintexts(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<impl IntoResponse> {
-    let plaintexts = db::get_all_plaintexts(&state.db).await?;
-    let body = plaintexts.join("\n");
+    use axum::body::{Body, Bytes};
+    use futures_util::TryStreamExt;
+    use sqlx::Row;
 
+    // Stream rows from SQLite straight to the response instead of loading every
+    // plaintext into a Vec and re-allocating via join — a huge potfile would
+    // otherwise spike coordinator memory. Errors propagate as a broken body
+    // (the client sees a failed transfer) rather than silent truncation.
+    let pool = state.db.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let mut rows =
+            sqlx::query("SELECT DISTINCT plaintext FROM cracked_hashes ORDER BY plaintext ASC")
+                .fetch(&pool);
+        loop {
+            match rows.try_next().await {
+                Ok(Some(row)) => {
+                    let mut line: String = match row.try_get("plaintext") {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    line.push('\n');
+                    if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                        break; // client hung up
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
     Ok((
         StatusCode::OK,
         [("content-type", "text/plain; charset=utf-8")],
-        body,
+        Body::from_stream(stream),
     ))
 }

@@ -16,8 +16,8 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use super::{
-    delete_refs_by_ref, get_file_record, insert_file_ref, maybe_mark_orphan_for_gc, now_iso,
-    row_to_task, set_lifecycle_status, LifecycleStatus,
+    delete_refs_by_ref, insert_file_ref, maybe_mark_orphan_for_gc, now_iso, row_to_task,
+    set_lifecycle_status, LifecycleStatus,
 };
 
 pub async fn create_task(pool: &SqlitePool, req: &CreateTaskRequest) -> Result<Task> {
@@ -75,10 +75,34 @@ pub(super) async fn acquire_task_refs_inline(
         }
     }
     let task_id_str = task_id.to_string();
-    for file_id in file_ids {
-        if let Some(rec) = get_file_record(pool, file_id).await? {
-            if !rec.sha256.is_empty() {
-                insert_file_ref(pool, &rec.sha256, "task", &task_id_str).await?;
+
+    // One SELECT for every referenced file (active rows only, matching
+    // get_file_record) instead of a query per file. We still iterate
+    // `file_ids` to insert refs so per-id semantics (order, duplicate ids)
+    // are unchanged.
+    let placeholders = std::iter::repeat_n("?", file_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, sha256 FROM files WHERE gc_state = 'active' AND id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&sql);
+    for file_id in &file_ids {
+        q = q.bind(*file_id);
+    }
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .context("looking up task file shas")?;
+    let sha_by_id: std::collections::HashMap<String, String> = rows
+        .iter()
+        .map(|r| (r.get::<String, _>("id"), r.get::<String, _>("sha256")))
+        .collect();
+
+    for file_id in &file_ids {
+        if let Some(sha) = sha_by_id.get(*file_id) {
+            if !sha.is_empty() {
+                insert_file_ref(pool, sha, "task", &task_id_str).await?;
             }
         }
     }
